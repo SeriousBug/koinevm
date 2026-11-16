@@ -11,8 +11,19 @@ to wasm, AOT and/or JIT. Reference product: CheerpX (x86 → wasm).
 Closed source and proprietary — `leaningtech/cheerpx-meta` holds only docs and examples, and the CTO
 states CheerpX "is proprietary" while WebVM is FOSS
 ([HN](https://news.ycombinator.com/item?id=42135204)). Shipped as a JS blob from
-`cxrtnc.leaningtech.com`; free under a Community License for personal/FOSS/eval, commercial licence
-for business use, redistribution, OEM and self-hosting ([licensing](https://cheerpx.io/docs/licensing)).
+`cxrtnc.leaningtech.com`.
+
+Licensing, verbatim from [licensing](https://cheerpx.io/docs/licensing): the Community License is
+free for *individuals* (explicitly including one-person companies and revenue-generating personal
+projects), *FOSS projects* and *technical evaluations*, against credit; it "allows unlimited,
+unmetered use of CheerpX from the `cxrtnc.leaningtech.com` domain", and self-hosting is a Commercial
+License feature. A commercial licence is required for "any *business use* (with exception of
+one-person companies), *redistribution* and *OEM use*". So: not open core, not source-available, no
+self-host tier, no vendoring. The licence trigger is headcount — a solo founder may ship a commercial
+product on the Community License, the second employee makes it a commercial use. The open-source
+asset in Leaning Tech's stack is the Cheerp C++→JS compiler; both VMs (CheerpX, CheerpJ) are
+proprietary. Consequence for testing: a shipped test suite or benchmark cannot use CheerpX as an
+oracle, since that would depend on their CDN and their terms.
 
 | Aspect | As publicly described |
 |---|---|
