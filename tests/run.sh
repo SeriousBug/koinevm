@@ -6,7 +6,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-GUESTS=${GUESTS:-"hello call"}
+GUESTS=${GUESTS:-"hello call flags"}
 OPTS=${OPTS:-"-O0 -O1 -O2 -O3 -Os"}
 MODES=${MODES:-"check trust"}
 
@@ -64,11 +64,13 @@ for opt in $OPTS; do
     done
 done
 
-dyn_out=$(MODES="$MODES" bash tests/dyn.sh)
-dyn_code=$?
-[ -n "$dyn_out" ] && echo "$dyn_out"
-pass=$((pass + $(echo "$dyn_out" | grep -c '^ok ')))
-[ "$dyn_code" -eq 0 ] || fail=$((fail + 1))
+for extra in dyn mem; do
+    extra_out=$(MODES="$MODES" bash "tests/$extra.sh")
+    extra_code=$?
+    [ -n "$extra_out" ] && echo "$extra_out"
+    pass=$((pass + $(echo "$extra_out" | grep -c '^ok ')))
+    [ "$extra_code" -eq 0 ] || fail=$((fail + 1))
+done
 
 echo
 echo "$pass passed, $fail failed"

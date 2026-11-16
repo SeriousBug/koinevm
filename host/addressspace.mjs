@@ -1,0 +1,143 @@
+// The guest's address space, from the kernel's side.
+//
+// The map is real: one byte per 4 KiB page in the guest's own linear memory (the translator puts the
+// page table there), and this class is what maintains it when the guest asks for memory. Guest
+// virtual addresses are linear-memory offsets, so mapping a range is bookkeeping plus the bytes the
+// range starts with.
+
+export const PAGE = 4096;
+
+export const PTE = {
+  MAPPED: 1,
+  WRITABLE: 2,
+  EXECUTABLE: 4,
+  TRANSLATED: 8,
+};
+
+export const PROT = { READ: 1, WRITE: 2, EXEC: 4 };
+export const MAP = { SHARED: 0x01, PRIVATE: 0x02, FIXED: 0x10, ANONYMOUS: 0x20, POPULATE: 0x8000 };
+
+export const EINVAL = 22;
+export const ENOMEM = 12;
+export const EFAULT = 14;
+
+const roundUp = (x, a) => (x + a - 1) & ~(a - 1);
+
+export class AddressSpace {
+  constructor(memory, map) {
+    this.memory = memory;
+    this.pteBase = map.pte_base;
+    this.brkBase = map.heap_base;
+    this.brkLimit = map.heap_limit;
+    this.brk = map.heap_base;
+    // Everything from mmap_base to the stack is available for mmap. Freed ranges go back here.
+    this.free = [{ lo: map.mmap_base, hi: map.stack_floor }];
+    this.ptes = new Uint8Array(memory.buffer, this.pteBase, 1 << 20);
+  }
+
+  bytes(addr, len) {
+    return new Uint8Array(this.memory.buffer, Number(addr), len);
+  }
+
+  protBits(prot) {
+    let bits = PTE.MAPPED;
+    if (prot & PROT.WRITE) bits |= PTE.WRITABLE;
+    if (prot & PROT.EXEC) bits |= PTE.EXECUTABLE;
+    return bits;
+  }
+
+  setPtes(lo, hi, bits) {
+    for (let p = lo >> 12; p < roundUp(hi, PAGE) >> 12; p++) this.ptes[p] |= bits;
+  }
+
+  clearPtes(lo, hi) {
+    for (let p = lo >> 12; p < roundUp(hi, PAGE) >> 12; p++) this.ptes[p] = 0;
+  }
+
+  /// Take `len` bytes of the free list, at `addr` when it is fixed, else as low as it fits.
+  reserve(len, addr, fixed) {
+    if (addr !== 0 && fixed) {
+      const i = this.free.findIndex((s) => s.lo <= addr && addr + len <= s.hi);
+      if (i < 0) return -EINVAL;
+      const span = this.free[i];
+      const rest = [];
+      if (span.lo < addr) rest.push({ lo: span.lo, hi: addr });
+      if (span.hi > addr + len) rest.push({ lo: addr + len, hi: span.hi });
+      this.free.splice(i, 1, ...rest);
+      return addr;
+    }
+    let best = -1;
+    for (let i = 0; i < this.free.length; i++) {
+      const s = this.free[i];
+      if (s.hi - s.lo < len) continue;
+      // Honour the hint when it fits there, otherwise take the lowest span that fits.
+      if (addr !== 0 && s.lo <= addr && addr + len <= s.hi) {
+        best = i;
+        break;
+      }
+      if (best < 0 || s.hi - s.lo < this.free[best].hi - this.free[best].lo) best = i;
+    }
+    if (best < 0) return -ENOMEM;
+    const span = this.free[best];
+    const at = addr !== 0 && span.lo <= addr && addr + len <= span.hi ? addr : span.lo;
+    const rest = [];
+    if (span.lo < at) rest.push({ lo: span.lo, hi: at });
+    if (span.hi > at + len) rest.push({ lo: at + len, hi: span.hi });
+    this.free.splice(best, 1, ...rest);
+    return at;
+  }
+
+  /// mmap(2) with eager contents: a file-backed mapping reads its range in now rather than on fault.
+  mmap({ addr = 0, len, prot = PROT.READ | PROT.WRITE, flags = 0, contents = null }) {
+    len = roundUp(len, PAGE);
+    if (len <= 0) return -EINVAL;
+    const at = this.reserve(len, addr, flags & MAP.FIXED);
+    if (at < 0) return at;
+    const view = this.bytes(at, len);
+    view.fill(0);
+    if (contents) view.set(contents.subarray(0, Math.min(contents.length, len)));
+    this.setPtes(at, at + len, this.protBits(prot));
+    return at;
+  }
+
+  munmap(addr, len) {
+    if (addr % PAGE !== 0) return -EINVAL;
+    len = roundUp(len, PAGE);
+    this.clearPtes(addr, addr + len);
+    this.free.push({ lo: addr, hi: addr + len });
+    this.free.sort((a, b) => a.lo - b.lo);
+    const merged = [];
+    for (const s of this.free) {
+      const last = merged[merged.length - 1];
+      if (last && s.lo <= last.hi) last.hi = Math.max(last.hi, s.hi);
+      else merged.push({ ...s });
+    }
+    this.free = merged;
+    return 0;
+  }
+
+  mprotect(addr, len, prot) {
+    if (addr % PAGE !== 0) return -EINVAL;
+    len = roundUp(len, PAGE);
+    for (let p = addr >> 12; p < (addr + len) >> 12; p++) {
+      if (!(this.ptes[p] & PTE.MAPPED)) return -ENOMEM;
+    }
+    // Translations are not dropped: they are AOT and read-only, so a protection change cannot
+    // invalidate one yet. Self-modifying code is what will need that, and it is not supported.
+    for (let p = addr >> 12; p < (addr + len) >> 12; p++) {
+      this.ptes[p] = (this.ptes[p] & PTE.TRANSLATED) | this.protBits(prot);
+    }
+    return 0;
+  }
+
+  /// brk(2): the break is a byte address, not a page address, and moving it maps or unmaps pages.
+  setBrk(want) {
+    if (want === 0) return this.brk;
+    if (want < this.brkBase || want > this.brkLimit) return this.brk;
+    const old = this.brk;
+    if (want > old) this.setPtes(old, want, PTE.MAPPED | PTE.WRITABLE);
+    else if (want < old) this.clearPtes(want, old);
+    this.brk = want;
+    return want;
+  }
+}

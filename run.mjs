@@ -1,14 +1,12 @@
-// Host side of the armjit PoC: loads a translated module, provides the syscall boundary, runs.
+// Host side of the armjit PoC: loads a translated module, provides the kernel the guest talks to,
+// runs it.
 //
-// The Linux ABI contract this file implements: the guest puts the syscall number in x8 and
-// arguments in x0-x5, and gets a result (or -errno) in x0. Everything else about the guest state is
-// the translator's business. Syscalls the PoC does not implement answer -ENOSYS, never a trap.
+// The Linux ABI contract lives in host/syscall.mjs. Everything here is the process boundary: read
+// the metadata the translator wrote next to the module, instantiate, run from the entry with the
+// initial stack, and report how the run ended.
 
 import fs from "node:fs";
-
-const ENOSYS = 38n;
-const EBADF = 9n;
-const EFAULT = 14n;
+import { Kernel } from "./host/syscall.mjs";
 
 const wasmPath = process.argv[2];
 if (!wasmPath) {
@@ -20,44 +18,7 @@ const meta = JSON.parse(fs.readFileSync(`${wasmPath}.json`, "utf8"));
 const bytes = fs.readFileSync(wasmPath);
 
 let memory = null;
-let exited = null;
-
-function memRead(addr, len) {
-  const a = Number(addr);
-  if (a < 0 || a + len > memory.buffer.byteLength) return null;
-  return new Uint8Array(memory.buffer, a, len).slice();
-}
-
-function memWrite(addr, src) {
-  const a = Number(addr);
-  if (a < 0 || a + src.length > memory.buffer.byteLength) return false;
-  new Uint8Array(memory.buffer, a, src.length).set(src);
-  return true;
-}
-
-// (result, stop) per syscall: stop tells the translated code the process is finished.
-function syscall(nr, a0, a1, a2, a3, a4, a5) {
-  switch (Number(nr)) {
-    case 64: { // write
-      const fd = Number(a0);
-      if (fd !== 1 && fd !== 2) return [-EBADF, 0];
-      const count = Math.min(Number(a2), 0x7ffff000);
-      const buf = memRead(a1, count);
-      if (buf === null) return [-EFAULT, 0];
-      const stream = fd === 1 ? process.stdout : process.stderr;
-      stream.write(buf);
-      return [BigInt(buf.length), 0];
-    }
-    case 63: // read
-      return [0n, 0]; // stdin is closed for now
-    case 93: // exit
-    case 94: // exit_group
-      exited = Number(a0) & 0xff;
-      return [0n, 1];
-    default:
-      return [-ENOSYS, 0];
-  }
-}
+let kernel = null;
 
 function trap(kind, addr, at) {
   if (recent.length) {
@@ -77,21 +38,34 @@ function trap(kind, addr, at) {
   }
   throw new Error(
     `guest pc trail: ${trail.join(" -> ")}\n` +
-    `guest trap ${Number(kind)} at address 0x${Number(addr).toString(16)} from 0x${(at >>> 0).toString(16)}\n` +
+      `guest trap ${Number(kind)} at address 0x${Number(addr).toString(16)} from 0x${(at >>> 0).toString(16)}\n` +
       `  pc=0x${pc.toString(16)} sp=0x${sp} nzcv=0x${nzcv}\n` +
       `  ${regs.map((v, i) => `x${i}=0x${v}`).join(" ")}`,
   );
 }
 
 const recent = [];
+// ARMJIT_TRACE_PRINT prints the state *before* each instruction, which is what the translator wrote
+// to the shadow: pc, packed NZCV and the registers named in ARMJIT_TRACE_REGS.
+const traceRegs = (process.env.ARMJIT_TRACE_REGS || "8").split(",").map(Number);
 function trace2(pc, sp) {
   recent.push([pc >>> 0, BigInt.asUintN(64, sp)]);
   if (recent.length > 64) recent.shift();
+  if (!process.env.ARMJIT_TRACE_PRINT) return;
+  const view = new DataView(memory.buffer);
+  const regs = traceRegs.map((r) => `x${r}=0x${view.getBigUint64(r * 8, true).toString(16)}`);
+  const nzcv = view.getBigUint64(0x100, true);
+  console.log(`0x${(pc >>> 0).toString(16)} nzcv=0x${nzcv.toString(16)} sp=0x${BigInt.asUintN(64, sp).toString(16)} ${regs.join(" ")}`);
+}
+
+function syscall(nr, a0, a1, a2, a3, a4, a5) {
+  return kernel.call(nr, a0, a1, a2, a3, a4, a5);
 }
 
 const module = new WebAssembly.Module(bytes);
 const instance = new WebAssembly.Instance(module, { env: { syscall, trap, trace2 } });
 memory = instance.exports.mem;
+kernel = new Kernel(memory, meta);
 
 const started = process.hrtime.bigint();
 const status = instance.exports.run(meta.entry, BigInt(meta.sp));
@@ -111,4 +85,4 @@ if (status !== 0) {
   process.exit(1);
 }
 
-process.exit(exited ?? 0);
+process.exit(kernel.exited ?? 0);

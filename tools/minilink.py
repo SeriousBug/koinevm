@@ -200,7 +200,7 @@ def emit_elf(text, rodata, entry, symbols=(), etype=2, text_base=TEXT_VADDR,
                            link, info, align, entsize)
 
     out += struct.pack("<IIQQQQIIQQ", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)  # SHN_UNDEF
-    out += sh(".text", 1, 0x6, text_base + text_off, 0, text_off + len(text))
+    out += sh(".text", 1, 0x6, text_base + text_off, text_off, len(text))
     out += sh(".rodata", 1, 0x2, rodata_base, rodata_off, len(rodata))
     out += sh(".symtab", 2, 0, 0, symtab_off, len(symtab), link=4, info=1, align=8, entsize=24)
     out += sh(".strtab", 3, 0, 0, strtab_off, len(strtab))

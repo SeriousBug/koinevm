@@ -112,6 +112,18 @@ pub struct Output {
     pub code_lo: u64,
     pub code_hi: u64,
     pub unsupported: Vec<(u64, String)>,
+    /// The map the host has to maintain: where the page table is, where the heap and `mmap` areas
+    /// start, and where the stack ends. The host reports these rather than assuming them.
+    pub map: MapInfo,
+}
+
+pub struct MapInfo {
+    pub pte_base: u64,
+    pub heap_base: u64,
+    /// Where the heap has to stop: the loader, if there is one, sits above it.
+    pub heap_limit: u64,
+    pub mmap_base: u64,
+    pub stack_floor: u64,
 }
 
 fn is_terminator(i: &Insn) -> bool {
@@ -439,6 +451,13 @@ pub fn translate(
         code_hi,
         unsupported,
         wasm,
+        map: MapInfo {
+            pte_base: PTE_BASE,
+            heap_base,
+            heap_limit: if images.interp.is_some() { INTERP_BASE } else { MMAP_BASE },
+            mmap_base: MMAP_BASE,
+            stack_floor,
+        },
     })
 }
 

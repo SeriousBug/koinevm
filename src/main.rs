@@ -106,8 +106,21 @@ fn run(args: &[String]) -> Result<(), String> {
 
             std::fs::write(&out_path, &res.wasm).map_err(|e| format!("{out_path}: {e}"))?;
             let meta = format!(
-                "{{\"entry\":{},\"sp\":{},\"mem_pages\":{},\"code_lo\":{},\"code_hi\":{}}}\n",
-                res.entry, res.sp, res.mem_pages, res.code_lo, res.code_hi
+                concat!(
+                    "{{\"entry\":{},\"sp\":{},\"mem_pages\":{},\"code_lo\":{},\"code_hi\":{},",
+                    "\"pte_base\":{},\"heap_base\":{},\"heap_limit\":{},\"mmap_base\":{},",
+                    "\"stack_floor\":{}}}\n"
+                ),
+                res.entry,
+                res.sp,
+                res.mem_pages,
+                res.code_lo,
+                res.code_hi,
+                res.map.pte_base,
+                res.map.heap_base,
+                res.map.heap_limit,
+                res.map.mmap_base,
+                res.map.stack_floor
             );
             let meta_path = format!("{out_path}.json");
             let mut f = std::fs::File::create(&meta_path).map_err(|e| e.to_string())?;

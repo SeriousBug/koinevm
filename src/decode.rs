@@ -314,7 +314,8 @@ fn decode_dp_reg(w: u32, sf: bool, rd: u32, rn: u32, rm: u32) -> Insn {
                 rd,
             },
             0b0010 => {
-                let reg = (w >> 10) & 1 == 0;
+                // Bit 11 picks the form: set means an immediate in bits 20:16, clear means Rm there.
+                let reg = (w >> 11) & 1 == 0;
                 Insn::CondCompare {
                     sf,
                     sub: (w >> 30) & 1 != 0,
