@@ -43,6 +43,10 @@ def read_elf(buf):
     for s in secs:
         end = shstr.find(b"\0", s["name_off"])
         s["name"] = shstr[s["name_off"]:end].decode()
+        if s["type"] == 8:  # SHT_NOBITS: reserved space, contents are zero
+            s["data"] = b"\0" * s["size"]
+        elif len(s["data"]) < s["size"]:
+            s["data"] = s["data"] + b"\0" * (s["size"] - len(s["data"]))
     return secs
 
 
@@ -61,15 +65,18 @@ def patch32(buf, off, value):
     struct.pack_into("<I", buf, off, value & 0xFFFFFFFF)
 
 
-def apply_relocs(secs, text, section_vaddr, syms):
-    """Patch relocated instruction words in `text` (a bytearray)."""
+def apply_relocs(secs, blobs, section_vaddr, syms, blob_base):
+    """Patch relocated words in every allocatable section, not just .text: a pointer table in
+    .rodata needs its ABS64 relocations applied or the guest dereferences zeroes."""
     for s in secs:
         if s["type"] != 4:  # SHT_RELA
             continue
         target = secs[s["info"]]
-        if target["name"] != ".text":
+        if target["name"] not in blobs:
             continue
+        text = blobs[target["name"]]
         base = section_vaddr[target["name"]]
+        r_offset_bias = 0
         for off in range(0, s["size"], 24):
             r_offset, r_info, r_addend = struct.unpack_from("<QQq", s["data"], off)
             rtype, rsym = r_info & 0xFFFFFFFF, r_info >> 32
@@ -121,17 +128,36 @@ def apply_relocs(secs, text, section_vaddr, syms):
                 raise SystemExit(f"unhandled relocation type {rtype} in {s['name']}")
 
 
-def emit_elf(text, rodata, entry):
+def emit_elf(text, rodata, entry, symbols=()):
     nph = 2
     hdr_size = 64 + nph * 56  # e_phoff is 64, so ELF header and phdrs are the segment head
     rodata_off = (hdr_size + len(text) + 0xFFF) & ~0xFFF
+    payload_end = rodata_off + len(rodata)
 
     ehdr = bytearray(64)
     ehdr[0:4] = b"\x7fELF"
     ehdr[4], ehdr[5], ehdr[6] = 2, 1, 1  # ELF64, LE, version
+
+    # .symtab so the translator can see function boundaries, as it would in a real binary
+    strtab = bytearray(b"\0")
+    symtab = bytearray(24)  # first symbol is the null symbol
+    for name, value, size, info in symbols:
+        name_off = len(strtab)
+        strtab += name.encode() + b"\0"
+        symtab += struct.pack("<IBBHQQ", name_off, info, 0, 1, value, size)
+    symtab_off = payload_end
+    strtab_off = symtab_off + len(symtab)
+    shstr_off = strtab_off + len(strtab)
+    shstr = bytearray(b"\0")
+    names = {}
+    for n in (".text", ".rodata", ".symtab", ".strtab", ".shstrtab"):
+        names[n] = len(shstr)
+        shstr += n.encode() + b"\0"
+    shoff = (shstr_off + len(shstr) + 7) & ~7
+
     struct.pack_into("<HHI", ehdr, 16, 2, 0xB7, 1)  # ET_EXEC, EM_AARCH64, version
-    struct.pack_into("<QQQ", ehdr, 24, entry, 64, 0)  # entry, phoff, shoff
-    struct.pack_into("<IHHHHHH", ehdr, 48, 0, 64, 56, nph, 64, 0, 0)  # flags, ehsize, phentsize
+    struct.pack_into("<QQQ", ehdr, 24, entry, 64, shoff)  # entry, phoff, shoff
+    struct.pack_into("<IHHHHHH", ehdr, 48, 0, 64, 56, nph, 64, 6, 5)  # flags, ehsize, shnum, shstrndx
 
     ph = bytearray()
     # first segment starts at file offset 0 so the program headers are mapped, as real
@@ -145,6 +171,21 @@ def emit_elf(text, rodata, entry):
     out += text
     out += b"\0" * (rodata_off - len(out))
     out += rodata
+    out += symtab
+    out += strtab
+    out += shstr
+    out += b"\0" * (shoff - len(out))
+
+    def sh(name, typ, flags, addr, off, size, link=0, info=0, align=1, entsize=0):
+        return struct.pack("<IIQQQQIIQQ", names[name], typ, flags, addr, off, size,
+                           link, info, align, entsize)
+
+    out += struct.pack("<IIQQQQIIQQ", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)  # SHN_UNDEF
+    out += sh(".text", 1, 0x6, TEXT_VADDR, 0, hdr_size + len(text))
+    out += sh(".rodata", 1, 0x2, RODATA_VADDR, rodata_off, len(rodata))
+    out += sh(".symtab", 2, 0, 0, symtab_off, len(symtab), link=4, info=1, align=8, entsize=24)
+    out += sh(".strtab", 3, 0, 0, strtab_off, len(strtab))
+    out += sh(".shstrtab", 3, 0, 0, shstr_off, len(shstr))
     return bytes(out)
 
 
@@ -156,27 +197,47 @@ def main():
     symtab = next(s for s in secs if s["type"] == 2)
     syms = read_syms(buf, secs, symtab)
 
+    # Lay out allocatable sections: .text in the executable segment, everything else packed after it.
+    # vaddrs and the output blobs must be built in the same pass, or a relocation would be applied
+    # at a different address than the one the code was linked against.
     section_vaddr = {}
+    blobs = {}
     rodata_blobs = bytearray()
+    text_vaddr = TEXT_VADDR + 64 + 2 * 56
     for s in secs:
-        if not (s["flags"] & 0x2) or s["size"] == 0:  # SHF_ALLOC
+        if not (s["flags"] & 0x2):  # SHF_ALLOC
             continue
+        blobs[s["name"]] = bytearray(s["data"])
         if s["name"] == ".text":
-            section_vaddr[s["name"]] = TEXT_VADDR + 64 + 2 * 56
+            section_vaddr[s["name"]] = text_vaddr
         elif s["name"].startswith(".text"):
-            section_vaddr[s["name"]] = TEXT_VADDR + 64 + 2 * 56 + len(secs_by_name(secs, ".text")["data"])
+            section_vaddr[s["name"]] = text_vaddr + len(blobs[".text"])
         else:
             section_vaddr[s["name"]] = RODATA_VADDR + len(rodata_blobs)
-            rodata_blobs += s["data"]
+            rodata_blobs += blobs[s["name"]]
             rodata_blobs += b"\0" * ((-len(rodata_blobs)) % 8)
 
-    text = bytearray(secs_by_name(secs, ".text")["data"])
-    apply_relocs(secs, text, section_vaddr, syms)
+    text = blobs[".text"]
+    apply_relocs(secs, blobs, section_vaddr, syms, {})
+    rodata_blobs = bytearray()
+    for s in secs:
+        if s["name"] in section_vaddr and s["name"] != ".text":
+            rodata_blobs += blobs[s["name"]]
+            rodata_blobs += b"\0" * ((-len(rodata_blobs)) % 8)
 
     entry_sym = next(s for s in syms if s["name"] == entry_name)
     entry = section_vaddr[secs[entry_sym["shndx"]]["name"]] + entry_sym["value"]
 
-    open(dst, "wb").write(emit_elf(bytes(text), bytes(rodata_blobs), entry))
+    out_syms = []
+    for sym in syms:
+        if sym["shndx"] == 0 or sym["info"] & 0xF != 2:
+            continue
+        sec = secs[sym["shndx"]]["name"]
+        if sec not in section_vaddr:
+            continue
+        out_syms.append((sym["name"], section_vaddr[sec] + sym["value"], sym["size"], sym["info"]))
+
+    open(dst, "wb").write(emit_elf(bytes(text), bytes(rodata_blobs), entry, out_syms))
     print(f"{dst}: entry=0x{entry:x} text={len(text)}B rodata={len(rodata_blobs)}B")
 
 

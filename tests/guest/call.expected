@@ -1,0 +1,4 @@
+fib(20)=6765
+apply(table[0],111)=12321
+apply(table[1],111)=211
+divloop(1000)=70929

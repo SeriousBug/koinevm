@@ -2,8 +2,6 @@
 
 pub const I32: u8 = 0x7f;
 pub const I64: u8 = 0x7e;
-pub const F32: u8 = 0x7d;
-pub const F64: u8 = 0x7c;
 
 pub fn uleb(out: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -30,10 +28,8 @@ pub fn sleb(out: &mut Vec<u8>, mut v: i64) {
     }
 }
 
-// opcodes
 pub mod op {
     pub const UNREACHABLE: u8 = 0x00;
-    pub const NOP: u8 = 0x01;
     pub const BLOCK: u8 = 0x02;
     pub const LOOP: u8 = 0x03;
     pub const IF: u8 = 0x04;
@@ -50,12 +46,8 @@ pub mod op {
     pub const LOCAL_GET: u8 = 0x20;
     pub const LOCAL_SET: u8 = 0x21;
     pub const LOCAL_TEE: u8 = 0x22;
-    pub const GLOBAL_GET: u8 = 0x23;
-    pub const GLOBAL_SET: u8 = 0x24;
     pub const I32_LOAD: u8 = 0x28;
     pub const I64_LOAD: u8 = 0x29;
-    pub const F32_LOAD: u8 = 0x2a;
-    pub const F64_LOAD: u8 = 0x2b;
     pub const I32_LOAD8_S: u8 = 0x2c;
     pub const I32_LOAD8_U: u8 = 0x2d;
     pub const I32_LOAD16_S: u8 = 0x2e;
@@ -68,8 +60,6 @@ pub mod op {
     pub const I64_LOAD32_U: u8 = 0x35;
     pub const I32_STORE: u8 = 0x36;
     pub const I64_STORE: u8 = 0x37;
-    pub const F32_STORE: u8 = 0x38;
-    pub const F64_STORE: u8 = 0x39;
     pub const I32_STORE8: u8 = 0x3a;
     pub const I32_STORE16: u8 = 0x3b;
     pub const I64_STORE8: u8 = 0x3c;
@@ -77,7 +67,6 @@ pub mod op {
     pub const I64_STORE32: u8 = 0x3e;
     pub const I32_CONST: u8 = 0x41;
     pub const I64_CONST: u8 = 0x42;
-    pub const F64_CONST: u8 = 0x44;
 
     pub const I32_EQZ: u8 = 0x45;
     pub const I32_EQ: u8 = 0x46;
@@ -103,13 +92,6 @@ pub mod op {
     pub const I64_GE_S: u8 = 0x59;
     pub const I64_GE_U: u8 = 0x5a;
 
-    pub const F64_EQ: u8 = 0x61;
-    pub const F64_NE: u8 = 0x62;
-    pub const F64_LT: u8 = 0x63;
-    pub const F64_GT: u8 = 0x64;
-    pub const F64_LE: u8 = 0x65;
-    pub const F64_GE: u8 = 0x66;
-
     pub const I32_CLZ: u8 = 0x67;
     pub const I32_CTZ: u8 = 0x68;
     pub const I32_POPCNT: u8 = 0x69;
@@ -118,8 +100,6 @@ pub mod op {
     pub const I32_MUL: u8 = 0x6c;
     pub const I32_DIV_S: u8 = 0x6d;
     pub const I32_DIV_U: u8 = 0x6e;
-    pub const I32_REM_S: u8 = 0x6f;
-    pub const I32_REM_U: u8 = 0x70;
     pub const I32_AND: u8 = 0x71;
     pub const I32_OR: u8 = 0x72;
     pub const I32_XOR: u8 = 0x73;
@@ -137,8 +117,6 @@ pub mod op {
     pub const I64_MUL: u8 = 0x7e;
     pub const I64_DIV_S: u8 = 0x7f;
     pub const I64_DIV_U: u8 = 0x80;
-    pub const I64_REM_S: u8 = 0x81;
-    pub const I64_REM_U: u8 = 0x82;
     pub const I64_AND: u8 = 0x83;
     pub const I64_OR: u8 = 0x84;
     pub const I64_XOR: u8 = 0x85;
@@ -148,21 +126,9 @@ pub mod op {
     pub const I64_ROTL: u8 = 0x89;
     pub const I64_ROTR: u8 = 0x8a;
 
-    pub const F64_ABS: u8 = 0x99;
-    pub const F64_NEG: u8 = 0x9a;
-    pub const F64_SQRT: u8 = 0x9f;
-    pub const F64_ADD: u8 = 0xa0;
-    pub const F64_SUB: u8 = 0xa1;
-    pub const F64_MUL: u8 = 0xa2;
-    pub const F64_DIV: u8 = 0xa3;
-
     pub const I32_WRAP_I64: u8 = 0xa7;
     pub const I64_EXTEND_I32_S: u8 = 0xac;
     pub const I64_EXTEND_I32_U: u8 = 0xad;
-    pub const F64_CONVERT_I64_S: u8 = 0xb9;
-    pub const F64_CONVERT_I64_U: u8 = 0xba;
-    pub const I64_REINTERPRET_F64: u8 = 0xbd;
-    pub const F64_REINTERPRET_I64: u8 = 0xbf;
     pub const I64_EXTEND8_S: u8 = 0xc2;
     pub const I64_EXTEND16_S: u8 = 0xc3;
     pub const I64_EXTEND32_S: u8 = 0xc4;
@@ -171,7 +137,6 @@ pub mod op {
 #[derive(Default)]
 pub struct Func {
     pub ty: u32,
-    /// value type of each declared local (excluding params)
     pub locals: Vec<u8>,
     pub body: Vec<u8>,
 }
@@ -179,11 +144,6 @@ pub struct Func {
 impl Func {
     pub fn new(ty: u32) -> Self {
         Func { ty, locals: Vec::new(), body: Vec::new() }
-    }
-    pub fn local(&mut self, t: u8) -> u32 {
-        self.locals.push(t);
-        // index 0..nparams unknown here; the caller patches by absolute index
-        self.locals.len() as u32
     }
     pub fn op(&mut self, o: u8) -> &mut Self {
         self.body.push(o);
@@ -216,9 +176,9 @@ impl Func {
     pub fn call(&mut self, f: u32) -> &mut Self {
         self.idx(op::CALL, f)
     }
-    pub fn block(&mut self, bt: u8) -> &mut Self {
+    pub fn block(&mut self) -> &mut Self {
         self.body.push(op::BLOCK);
-        self.body.push(bt);
+        self.body.push(0x40);
         self
     }
     pub fn loop_(&mut self) -> &mut Self {
@@ -242,9 +202,6 @@ impl Func {
     pub fn br(&mut self, l: u32) -> &mut Self {
         self.idx(op::BR, l)
     }
-    pub fn br_if(&mut self, l: u32) -> &mut Self {
-        self.idx(op::BR_IF, l)
-    }
     pub fn br_table(&mut self, labels: &[u32], default: u32) -> &mut Self {
         self.body.push(op::BR_TABLE);
         uleb(&mut self.body, labels.len() as u64);
@@ -258,35 +215,50 @@ impl Func {
         self.body.push(op::RETURN);
         self
     }
-    pub fn mem(&mut self, o: u8, align_log2: u32, offset: u32) -> &mut Self {
+    pub fn mem(&mut self, o: u8, align_log2: u32, offset: u64) -> &mut Self {
         self.body.push(o);
         uleb(&mut self.body, align_log2 as u64);
-        uleb(&mut self.body, offset as u64);
+        uleb(&mut self.body, offset);
         self
     }
-    /// i64 local -> i32 local, truncating (for guest W-register ops)
     pub fn wrap_i64(&mut self) -> &mut Self {
         self.op(op::I32_WRAP_I64)
     }
     pub fn extend_i32_u(&mut self) -> &mut Self {
         self.op(op::I64_EXTEND_I32_U)
     }
-    pub fn extend_i32_s(&mut self) -> &mut Self {
-        self.op(op::I64_EXTEND_I32_S)
-    }
+}
+
+pub struct Import {
+    pub module: String,
+    pub name: String,
+    pub ty: u32,
 }
 
 pub struct Module {
     pub types: Vec<(Vec<u8>, Vec<u8>)>,
+    pub imports: Vec<Import>,
     pub funcs: Vec<Func>,
-    pub exports: Vec<(String, u32)>,
+    pub table_min: u32,
+    pub elems: Vec<(u32, Vec<u32>)>,
+    /// (name, kind, index): kind 0 = func, 2 = memory
+    pub exports: Vec<(String, u8, u32)>,
     pub mem_pages: u32,
-    pub data: Vec<(u32, Vec<u8>)>,
+    pub data: Vec<(u64, Vec<u8>)>,
 }
 
 impl Module {
     pub fn new() -> Self {
-        Module { types: Vec::new(), funcs: Vec::new(), exports: Vec::new(), mem_pages: 0, data: Vec::new() }
+        Module {
+            types: Vec::new(),
+            imports: Vec::new(),
+            funcs: Vec::new(),
+            table_min: 0,
+            elems: Vec::new(),
+            exports: Vec::new(),
+            mem_pages: 0,
+            data: Vec::new(),
+        }
     }
     pub fn ty(&mut self, params: Vec<u8>, results: Vec<u8>) -> u32 {
         if let Some(i) = self.types.iter().position(|t| t.0 == params && t.1 == results) {
@@ -295,8 +267,23 @@ impl Module {
         self.types.push((params, results));
         (self.types.len() - 1) as u32
     }
+    pub fn n_imports(&self) -> u32 {
+        self.imports.len() as u32
+    }
+    /// Declares a function and returns its index (imports counted first).
+    pub fn add_func(&mut self, ty: u32) -> u32 {
+        self.funcs.push(Func::new(ty));
+        self.n_imports() + (self.funcs.len() - 1) as u32
+    }
+    pub fn func_mut(&mut self, index: u32) -> &mut Func {
+        let i = (index - self.n_imports()) as usize;
+        &mut self.funcs[i]
+    }
 
     fn section(out: &mut Vec<u8>, id: u8, body: &[u8]) {
+        if body.is_empty() {
+            return;
+        }
         out.push(id);
         uleb(out, body.len() as u64);
         out.extend_from_slice(body);
@@ -316,6 +303,20 @@ impl Module {
         }
         Self::section(&mut out, 1, &s);
 
+        if !self.imports.is_empty() {
+            let mut s = Vec::new();
+            uleb(&mut s, self.imports.len() as u64);
+            for im in &self.imports {
+                uleb(&mut s, im.module.len() as u64);
+                s.extend_from_slice(im.module.as_bytes());
+                uleb(&mut s, im.name.len() as u64);
+                s.extend_from_slice(im.name.as_bytes());
+                s.push(0x00);
+                uleb(&mut s, im.ty as u64);
+            }
+            Self::section(&mut out, 2, &s);
+        }
+
         let mut s = Vec::new();
         uleb(&mut s, self.funcs.len() as u64);
         for f in &self.funcs {
@@ -323,56 +324,55 @@ impl Module {
         }
         Self::section(&mut out, 3, &s);
 
+        if self.table_min > 0 {
+            let mut s = Vec::new();
+            uleb(&mut s, 1);
+            s.push(0x70);
+            s.push(0x00);
+            uleb(&mut s, self.table_min as u64);
+            Self::section(&mut out, 4, &s);
+        }
+
         if self.mem_pages > 0 {
             let mut s = Vec::new();
             uleb(&mut s, 1);
-            s.push(0x00); // no max
+            s.push(0x00);
             uleb(&mut s, self.mem_pages as u64);
             Self::section(&mut out, 5, &s);
         }
 
-        let mut s = Vec::new();
-        uleb(&mut s, self.exports.len() as u64);
-        for (name, idx) in &self.exports {
-            uleb(&mut s, name.len() as u64);
-            s.extend_from_slice(name.as_bytes());
-            s.push(0x00);
-            uleb(&mut s, *idx as u64);
+        if !self.exports.is_empty() {
+            let mut s = Vec::new();
+            uleb(&mut s, self.exports.len() as u64);
+            for (name, kind, idx) in &self.exports {
+                uleb(&mut s, name.len() as u64);
+                s.extend_from_slice(name.as_bytes());
+                s.push(*kind);
+                uleb(&mut s, *idx as u64);
+            }
+            Self::section(&mut out, 7, &s);
         }
-        if self.mem_pages > 0 {
-            let name = b"mem";
-            uleb(&mut s, name.len() as u64);
-            s.extend_from_slice(name);
-            s.push(0x02);
-            uleb(&mut s, 0);
+
+        if !self.elems.is_empty() {
+            let mut s = Vec::new();
+            uleb(&mut s, self.elems.len() as u64);
+            for (offset, funcs) in &self.elems {
+                uleb(&mut s, 0);
+                s.push(op::I32_CONST);
+                sleb(&mut s, *offset as i64);
+                s.push(op::END);
+                uleb(&mut s, funcs.len() as u64);
+                for &f in funcs {
+                    uleb(&mut s, f as u64);
+                }
+            }
+            Self::section(&mut out, 9, &s);
         }
-        let exported = self.exports.len() + if self.mem_pages > 0 { 1 } else { 0 };
-        let mut s2 = Vec::new();
-        uleb(&mut s2, exported as u64);
-        s2.drain(0..0);
-        // rebuild: count first (patched), then entries
-        let mut body = Vec::new();
-        uleb(&mut body, exported as u64);
-        for (name, idx) in &self.exports {
-            uleb(&mut body, name.len() as u64);
-            body.extend_from_slice(name.as_bytes());
-            body.push(0x00);
-            uleb(&mut body, *idx as u64);
-        }
-        if self.mem_pages > 0 {
-            let name = b"mem";
-            uleb(&mut body, name.len() as u64);
-            body.extend_from_slice(name);
-            body.push(0x02);
-            uleb(&mut body, 0);
-        }
-        Self::section(&mut out, 7, &body);
 
         let mut s = Vec::new();
         uleb(&mut s, self.funcs.len() as u64);
         for f in &self.funcs {
             let mut fb = Vec::new();
-            // group consecutive identical local types
             let mut groups: Vec<(u32, u8)> = Vec::new();
             for &t in &f.locals {
                 match groups.last_mut() {
@@ -396,9 +396,11 @@ impl Module {
             let mut s = Vec::new();
             uleb(&mut s, self.data.len() as u64);
             for (off, bytes) in &self.data {
-                uleb(&mut s, 0); // active, memory 0
+                uleb(&mut s, 0);
                 s.push(op::I32_CONST);
-                sleb(&mut s, *off as i64);
+                // i32.const is a signed LEB: an offset above 2^31 must be sign-extended, not
+                // encoded as a positive 5-byte varint
+                sleb(&mut s, *off as u32 as i32 as i64);
                 s.push(op::END);
                 uleb(&mut s, bytes.len() as u64);
                 s.extend_from_slice(bytes);
