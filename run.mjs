@@ -1,5 +1,5 @@
 // Host side of the armjit PoC: loads a translated module, provides the kernel the guest talks to,
-// runs it.
+// runs it. ARMJIT_ROOTFS names the directory the guest sees as /.
 //
 // The Linux ABI contract lives in host/syscall.mjs. Everything here is the process boundary: read
 // the metadata the translator wrote next to the module, instantiate, run from the entry with the
@@ -65,7 +65,7 @@ function syscall(nr, a0, a1, a2, a3, a4, a5) {
 const module = new WebAssembly.Module(bytes);
 const instance = new WebAssembly.Instance(module, { env: { syscall, trap, trace2 } });
 memory = instance.exports.mem;
-kernel = new Kernel(memory, meta);
+kernel = new Kernel(memory, meta, { rootfs: process.env.ARMJIT_ROOTFS });
 
 const started = process.hrtime.bigint();
 const status = instance.exports.run(meta.entry, BigInt(meta.sp));

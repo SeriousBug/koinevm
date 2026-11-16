@@ -64,7 +64,7 @@ for opt in $OPTS; do
     done
 done
 
-for extra in dyn mem; do
+for extra in dyn mem files; do
     extra_out=$(MODES="$MODES" bash "tests/$extra.sh")
     extra_code=$?
     [ -n "$extra_out" ] && echo "$extra_out"
