@@ -11,7 +11,7 @@ OPTS=${OPTS:-"-O0 -O1 -O2 -O3 -Os"}
 MODES=${MODES:-"check trust"}
 
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+trap 'rm -rf "$work"; OPT=-O2 bash tools/build-guest.sh > /dev/null 2>&1' EXIT
 
 if ! cargo build --release --quiet > "$work/cargo.log" 2>&1; then
     echo "FAIL cargo build"
@@ -63,6 +63,12 @@ for opt in $OPTS; do
         done
     done
 done
+
+dyn_out=$(MODES="$MODES" bash tests/dyn.sh)
+dyn_code=$?
+[ -n "$dyn_out" ] && echo "$dyn_out"
+pass=$((pass + $(echo "$dyn_out" | grep -c '^ok ')))
+[ "$dyn_code" -eq 0 ] || fail=$((fail + 1))
 
 echo
 echo "$pass passed, $fail failed"

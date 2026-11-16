@@ -18,7 +18,17 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> String {
-    "usage: armjit translate <elf> -o <out.wasm> [--bounds=check|trust] [--argv=a,b] [--env=k=v,...]\n       armjit dump <elf>".into()
+    "usage: armjit translate <elf> -o <out.wasm> [--bounds=check|trust] [--mem-pages=N] [--trace]\n       \
+     [--argv=a,b] [--env=k=v,...] [--rootfs=<dir>] [--interp=<elf>] [--interp-base=0xADDR]\n       \
+     armjit dump <elf>".into()
+}
+
+/// Parse an image and place it: `ET_EXEC` stays at its link addresses, `ET_DYN` lands at `base`.
+fn load_image(path: &str, base: Option<u64>) -> Result<elf::Elf, String> {
+    let image = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let elf = elf::Elf::parse(image)?;
+    let base = base.unwrap_or(if elf.etype == elf::ET_DYN { emit::IMAGE_BASE } else { elf.load_offset() });
+    elf.relocated(base).map_err(|e| format!("{path}: {e}"))
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -32,6 +42,9 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut mem_pages = emit::DEFAULT_MEM_PAGES;
             let mut argv: Vec<String> = Vec::new();
             let mut envp: Vec<String> = Vec::new();
+            let mut rootfs: Option<String> = None;
+            let mut interp_path: Option<String> = None;
+            let mut interp_base = emit::INTERP_BASE;
             let mut i = 2;
             while i < args.len() {
                 let a = &args[i];
@@ -57,16 +70,38 @@ fn run(args: &[String]) -> Result<(), String> {
                 } else if let Some(v) = a.strip_prefix("--env=") {
                     envp = v.split(',').map(|s| s.to_string()).collect();
                     i += 1;
+                } else if let Some(v) = a.strip_prefix("--rootfs=") {
+                    rootfs = Some(v.to_string());
+                    i += 1;
+                } else if let Some(v) = a.strip_prefix("--interp=") {
+                    interp_path = Some(v.to_string());
+                    i += 1;
+                } else if let Some(v) = a.strip_prefix("--interp-base=") {
+                    interp_base = u64::from_str_radix(v.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad interp base {v}"))?;
+                    i += 1;
                 } else {
                     return Err(format!("unknown argument {a}"));
                 }
             }
             let out_path = out.ok_or("missing -o <out.wasm>")?;
-            let image = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-            let elf = elf::Elf::parse(image)?;
+            let main = load_image(path, None)?;
+            let interp = match &main.interp {
+                None => None,
+                Some(want) => {
+                    let resolved = interp_path.clone().or_else(|| {
+                        rootfs.as_ref().map(|root| format!("{root}{want}"))
+                    });
+                    let resolved = resolved.ok_or_else(|| {
+                        format!("{path} wants {want} as its interpreter: pass --rootfs=<dir> or --interp=<elf>")
+                    })?;
+                    Some(load_image(&resolved, Some(interp_base))?)
+                }
+            };
             let cfg = emit::Config { bounds_check, trace, mem_pages };
             let started = std::time::Instant::now();
-            let res = emit::translate(&elf, &cfg, &argv, &envp)?;
+            let res =
+                emit::translate(emit::Images { main: &main, interp: interp.as_ref() }, &cfg, &argv, &envp)?;
             let elapsed = started.elapsed();
 
             std::fs::write(&out_path, &res.wasm).map_err(|e| format!("{out_path}: {e}"))?;
@@ -81,8 +116,11 @@ fn run(args: &[String]) -> Result<(), String> {
             println!(
                 "translated {} instructions of {} regions in {:?}: {} bytes wasm ({} bytes guest)",
                 res.stats.instructions, res.stats.regions, elapsed, res.stats.wasm_bytes,
-                elf.image.len()
+                main.image.len() + interp.as_ref().map(|i| i.image.len()).unwrap_or(0)
             );
+            if let Some(interp) = &interp {
+                println!("  interpreter at 0x{:x}, entry 0x{:x}", interp.load_offset(), interp.entry);
+            }
             for (addr, why) in &res.unsupported {
                 eprintln!("  unsupported at 0x{addr:x}: {why}");
             }

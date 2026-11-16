@@ -31,11 +31,19 @@ pub struct Symbol {
     pub shndx: u16,
 }
 
+pub const ET_EXEC: u16 = 2;
+pub const ET_DYN: u16 = 3;
+
+/// An ELF64 AArch64 image, parsed and, once `relocated` says where it landed, at its final
+/// addresses: every vaddr in here is a guest virtual address.
 pub struct Elf {
+    pub etype: u16,
     pub entry: u64,
     pub phoff: u64,
     pub phentsize: u16,
     pub phnum: u16,
+    /// `PT_INTERP`'s path, for an image that wants a dynamic loader.
+    pub interp: Option<String>,
     pub segments: Vec<Segment>,
     pub symbols: Vec<Symbol>,
     pub image: Vec<u8>,
@@ -65,11 +73,8 @@ impl Elf {
             return Err("ELF is not little-endian".into());
         }
         let e_type = u16at(&image, 16)?;
-        if e_type != 2 {
-            return Err(format!(
-                "ELF type {} is not ET_EXEC; static non-PIE only for now (ET_DYN needs a loader)",
-                e_type
-            ));
+        if e_type != ET_EXEC && e_type != ET_DYN {
+            return Err(format!("ELF type {e_type} is neither ET_EXEC nor ET_DYN"));
         }
         let machine = u16at(&image, 18)?;
         if machine != EM_AARCH64 {
@@ -82,11 +87,17 @@ impl Elf {
         let phnum = u16at(&image, 56)?;
 
         let mut segments = Vec::new();
+        let mut interp = None;
         for i in 0..phnum as usize {
             let o = (phoff as usize) + i * phentsize as usize;
             let p_type = u32at(&image, o)?;
             if p_type == PT_INTERP {
-                return Err("image has PT_INTERP: dynamically linked, needs ld.so, not supported yet".into());
+                let off = u64at(&image, o + 8)? as usize;
+                let len = u64at(&image, o + 32)? as usize;
+                let raw = image.get(off..off + len).ok_or("PT_INTERP past end of file")?;
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                interp = Some(String::from_utf8_lossy(&raw[..end]).into_owned());
+                continue;
             }
             if p_type != PT_LOAD {
                 continue;
@@ -146,7 +157,34 @@ impl Elf {
             }
         }
 
-        Ok(Elf { entry, phoff, phentsize, phnum, segments, symbols, image })
+        Ok(Elf { etype: e_type, entry, phoff, phentsize, phnum, interp, segments, symbols, image })
+    }
+
+    /// Where this image wants to start: what a kernel or a loader has to subtract from a chosen load
+    /// address to make `PT_LOAD` segment 0 land there.
+    pub fn load_offset(&self) -> u64 {
+        self.segments.iter().map(|s| s.vaddr & !0xfff).min().unwrap_or(0)
+    }
+
+    /// The same image as if it had been loaded at `base`. `ET_EXEC` images only accept their link
+    /// addresses; `ET_DYN` images accept any base.
+    pub fn relocated(mut self, base: u64) -> Result<Elf, String> {
+        let bias = base.wrapping_sub(self.load_offset());
+        if self.etype == ET_EXEC && bias != 0 {
+            return Err(format!("ET_EXEC image cannot be moved to 0x{base:x}"));
+        }
+        if bias != 0 {
+            self.entry = self.entry.wrapping_add(bias);
+            for s in &mut self.segments {
+                s.vaddr = s.vaddr.wrapping_add(bias);
+            }
+            for s in &mut self.symbols {
+                if s.shndx != 0 {
+                    s.value = s.value.wrapping_add(bias);
+                }
+            }
+        }
+        Ok(self)
     }
 
     /// Bytes at a guest virtual address, when a segment's file contents cover it.

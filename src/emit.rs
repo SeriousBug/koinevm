@@ -61,8 +61,11 @@ pub const TABLE_BASE: u64 = PTE_BASE + PTE_PAGES;
 /// tag is `pc >> 2` plus one so it is never zero.
 pub const TABLE_SLOT: u64 = 8;
 pub const TABLE_MAX_SLOTS: u64 = 1 << 18;
-/// PoC simplification against a real kernel's randomized layout: images start at a fixed 4 MiB.
+/// PoC simplification against a real kernel's randomized layout: images start at fixed addresses.
+/// The program at 4 MiB, its dynamic loader well above the heap, `mmap` in between.
 pub const IMAGE_BASE: u64 = 0x400000;
+pub const INTERP_BASE: u64 = 0x1000_0000;
+pub const MMAP_BASE: u64 = 0x4000_0000;
 
 pub mod pte {
     pub const MAPPED: u8 = 1;
@@ -166,7 +169,7 @@ fn build_dispatch_table(regions: &[Region]) -> Result<(Vec<u8>, u32), String> {
 
 /// One byte per 4 KiB page for the ranges this translator maps: engine memory, the images and the
 /// stack. `mmap` and `mprotect` maintain the rest of it at run time.
-fn page_table(elf: &Elf, stack_floor: u64, stack_top: u64) -> Vec<u8> {
+fn page_table(images: &[&Elf], stack_floor: u64, stack_top: u64) -> Vec<u8> {
     let mut ptes = vec![0u8; PTE_PAGES as usize];
     let mut set = |lo: u64, hi: u64, bits: u8| {
         let lo_page = (lo >> 12) as usize;
@@ -177,15 +180,17 @@ fn page_table(elf: &Elf, stack_floor: u64, stack_top: u64) -> Vec<u8> {
     };
     set(0, IMAGE_BASE, pte::MAPPED | pte::WRITABLE);
     set(stack_floor, stack_top, pte::MAPPED | pte::WRITABLE);
-    for s in &elf.segments {
-        let mut bits = pte::MAPPED;
-        if s.flags & crate::elf::PF_W != 0 {
-            bits |= pte::WRITABLE;
+    for image in images {
+        for s in &image.segments {
+            let mut bits = pte::MAPPED;
+            if s.flags & crate::elf::PF_W != 0 {
+                bits |= pte::WRITABLE;
+            }
+            if s.flags & crate::elf::PF_X != 0 {
+                bits |= pte::EXECUTABLE | pte::TRANSLATED;
+            }
+            set(s.vaddr, s.end(), bits);
         }
-        if s.flags & crate::elf::PF_X != 0 {
-            bits |= pte::EXECUTABLE | pte::TRANSLATED;
-        }
-        set(s.vaddr, s.end(), bits);
     }
     ptes
 }
@@ -213,33 +218,59 @@ fn push_sparse(m: &mut Module, base: u64, bytes: &[u8]) {
     }
 }
 
-pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> Result<Output, String> {
+/// The images one process starts with: the program itself and, when it is dynamically linked, the
+/// loader the kernel would have started instead. Both are translated into one module, because the
+/// loader hands control to the program by jumping, not by `exec`.
+pub struct Images<'a> {
+    pub main: &'a Elf,
+    pub interp: Option<&'a Elf>,
+}
+
+impl Images<'_> {
+    fn all(&self) -> impl Iterator<Item = &Elf> {
+        std::iter::once(self.main).chain(self.interp)
+    }
+}
+
+pub fn translate(
+    images: Images,
+    cfg: &Config,
+    argv: &[String],
+    envp: &[String],
+) -> Result<Output, String> {
+    let elf = images.main;
     let (code_lo, code_hi) = elf.code_range().ok_or("no executable segment")?;
     let mem_size = cfg.mem_pages as u64 * 65536;
+    let entry = images.interp.map(|i| i.entry).unwrap_or(elf.entry);
 
-    // Decode the executable range once. Literal pools and padding decode to Undefined, which is
-    // only an error if a translated block actually reaches it.
+    // Decode every image's executable range once. Literal pools and padding decode to Undefined,
+    // which is only an error if a translated block actually reaches it.
     let mut insns: BTreeMap<u64, Insn> = BTreeMap::new();
-    let mut a = code_lo;
-    while a + 4 <= code_hi {
-        let Some(w) = elf.vaddr_bytes(a, 4) else { break };
-        insns.insert(a, decode(u32::from_le_bytes(w.try_into().unwrap())));
-        a += 4;
+    for image in images.all() {
+        let Some((lo, hi)) = image.code_range() else { continue };
+        let mut a = lo;
+        while a + 4 <= hi {
+            let Some(w) = image.vaddr_bytes(a, 4) else { break };
+            insns.insert(a, decode(u32::from_le_bytes(w.try_into().unwrap())));
+            a += 4;
+        }
     }
 
-    // Entry points: the ELF entry, every function symbol in executable code, every direct call
+    // Entry points: the ELF entries, every function symbol in executable code, every direct call
     // target. A branch to an entry starts a new region instead of being folded into this one.
     let mut entries: BTreeSet<u64> = BTreeSet::new();
-    entries.insert(elf.entry);
-    for s in &elf.symbols {
-        if s.is_func && s.value >= code_lo && s.value < code_hi {
-            entries.insert(s.value);
+    for image in images.all() {
+        entries.insert(image.entry);
+        for s in &image.symbols {
+            if s.is_func && insns.contains_key(&s.value) {
+                entries.insert(s.value);
+            }
         }
     }
     for (&addr, i) in &insns {
         if let Insn::Bl { offset } = i {
             let t = (addr as i64 + *offset) as u64;
-            if t >= code_lo && t <= code_hi {
+            if insns.contains_key(&t) {
                 entries.insert(t);
             }
         }
@@ -251,19 +282,19 @@ pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> R
     for &e in &entries {
         queue.push_back(e);
     }
-    while let Some(entry) = queue.pop_front() {
-        if region_index.contains_key(&entry) {
+    while let Some(start) = queue.pop_front() {
+        if region_index.contains_key(&start) {
             continue;
         }
-        let region = discover_region(entry, &insns, &entries, code_hi);
+        let region = discover_region(start, &insns, &entries);
         if region.blocks.is_empty() {
             continue;
         }
-        region_index.insert(entry, regions.len());
+        region_index.insert(start, regions.len());
         regions.push(region);
     }
-    if !region_index.contains_key(&elf.entry) {
-        return Err(format!("entry point 0x{:x} did not decode", elf.entry));
+    if !region_index.contains_key(&entry) {
+        return Err(format!("entry point 0x{entry:x} did not decode"));
     }
 
     if regions.len() > 0xfffe {
@@ -276,20 +307,36 @@ pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> R
     if heap_base >= stack_floor {
         return Err("image too large for the fixed layout".into());
     }
-    for s in &elf.segments {
-        if s.vaddr < IMAGE_BASE || s.end() > stack_floor {
-            return Err(format!(
-                "segment 0x{:x}..0x{:x} collides with engine memory or the stack",
-                s.vaddr,
-                s.end()
-            ));
+    for (image, arena) in images.all().zip([IMAGE_BASE, INTERP_BASE]) {
+        for s in &image.segments {
+            if s.vaddr < arena || s.end() > stack_floor {
+                return Err(format!(
+                    "segment 0x{:x}..0x{:x} collides with engine memory, another image or the stack",
+                    s.vaddr,
+                    s.end()
+                ));
+            }
+        }
+    }
+    if let Some(interp) = images.interp {
+        let span = |e: &Elf| {
+            (e.segments.iter().map(|s| s.vaddr).min().unwrap_or(0), e.image_end())
+        };
+        let (main_lo, main_hi) = span(elf);
+        let (interp_lo, interp_hi) = span(interp);
+        if main_lo < interp_hi && interp_lo < main_hi {
+            return Err("the program and its loader overlap".into());
         }
     }
 
     let (table_bytes, table_mask) = build_dispatch_table(&regions)?;
-    let ptes = page_table(&elf, stack_floor, stack_top);
+    let loaded: Vec<&Elf> = images.all().collect();
+    let ptes = page_table(&loaded, stack_floor, stack_top);
 
-    let (stack_bytes, stack_used) = build_initial_stack(elf, argv, envp, stack_top);
+    // AT_BASE is the loader's load address, which after relocation is its own base.
+    let interp_base = images.interp.map(|i| i.load_offset()).unwrap_or(0);
+    let (stack_bytes, stack_used) =
+        build_initial_stack(elf, interp_base, argv, envp, stack_top);
     let sp = stack_top - stack_used;
 
     let mut m = Module::new();
@@ -365,9 +412,12 @@ pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> R
     }
     *m.func_mut(run_id) = emit_run(&ids, &layout, ty_run);
 
-    for s in &elf.segments {
-        let bytes = elf.image[s.file_offset as usize..(s.file_offset + s.filesz) as usize].to_vec();
-        m.data.push((s.vaddr, bytes));
+    for image in images.all() {
+        for s in &image.segments {
+            let bytes =
+                image.image[s.file_offset as usize..(s.file_offset + s.filesz) as usize].to_vec();
+            m.data.push((s.vaddr, bytes));
+        }
     }
     push_sparse(&mut m, TABLE_BASE, &table_bytes);
     push_sparse(&mut m, PTE_BASE, &ptes);
@@ -381,7 +431,7 @@ pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> R
     let wasm = m.encode();
     unsupported.sort();
     Ok(Output {
-        entry: elf.entry,
+        entry,
         sp,
         mem_pages: cfg.mem_pages,
         stats: Stats { instructions, regions: regions.len(), wasm_bytes: wasm.len() },
@@ -416,12 +466,7 @@ struct Ids {
     ty_region: u32,
 }
 
-fn discover_region(
-    entry: u64,
-    insns: &BTreeMap<u64, Insn>,
-    entries: &BTreeSet<u64>,
-    code_hi: u64,
-) -> Region {
+fn discover_region(entry: u64, insns: &BTreeMap<u64, Insn>, entries: &BTreeSet<u64>) -> Region {
     // Pass 1: find every block start. A block runs from its start to the first terminator, which
     // may pass over a later block's start; that is fine here because only terminators and their
     // targets matter. Pass 2 slices the blocks so that they are disjoint.
@@ -431,7 +476,7 @@ fn discover_region(
         if !starts.insert(start) {
             continue;
         }
-        if start >= code_hi || start % 4 != 0 {
+        if start % 4 != 0 || !insns.contains_key(&start) {
             starts.remove(&start);
             continue;
         }
@@ -448,14 +493,14 @@ fn discover_region(
                 Insn::B { offset } => succ.push((here as i64 + offset) as u64),
                 Insn::BCond { offset, .. } | Insn::Cbz { offset, .. } | Insn::Tbz { offset, .. } => {
                     succ.push((here as i64 + offset) as u64);
-                    if a < code_hi {
+                    if insns.contains_key(&a) {
                         succ.push(a);
                     }
                 }
                 // blr is a call: its return address is the fallthrough, exactly like bl.
                 Insn::Br { .. } | Insn::Ret { .. } => {}
                 _ => {
-                    if a < code_hi {
+                    if insns.contains_key(&a) {
                         succ.push(a);
                     }
                 }
@@ -522,6 +567,7 @@ impl StackBuilder {
 
 pub fn build_initial_stack(
     elf: &Elf,
+    interp_base: u64,
     argv: &[String],
     envp: &[String],
     stack_top: u64,
@@ -540,7 +586,7 @@ pub fn build_initial_stack(
     for a in &argv {
         argv_addrs.push(sb.bytes(format!("{a}\0").as_bytes()));
     }
-    sb.bytes(b"aarch64\0");
+    let platform_addr = sb.bytes(b"aarch64\0");
     // Fixed AT_RANDOM: runs reproduce, at the cost of every run being identical.
     let random_addr = sb.bytes(&[
         0x4a, 0x9f, 0x11, 0x2c, 0x77, 0x03, 0xd5, 0x6e, 0x21, 0xb8, 0x64, 0x9a, 0x0f, 0x33, 0xc7, 0x58,
@@ -560,15 +606,20 @@ pub fn build_initial_stack(
     auxv.push((4, elf.phentsize as u64));
     auxv.push((5, elf.phnum as u64));
     auxv.push((6, 4096));
-    auxv.push((7, 0));
+    // AT_BASE is the loader's load address, and the only auxv entry about the loader: AT_ENTRY and
+    // AT_PHDR describe the program itself, which is how the loader finds what it was started for.
+    if interp_base != 0 {
+        auxv.push((7, interp_base));
+    }
     auxv.push((8, 0));
     auxv.push((9, elf.entry));
     auxv.push((11, 0));
     auxv.push((12, 0));
     auxv.push((13, 0));
     auxv.push((14, 0));
-    // AT_HWCAP stays 0. FP and ASIMD are not translated yet; claiming them turns into a trap on
-    // the first vector instruction instead of an honest refusal.
+    auxv.push((15, platform_addr));
+    // AT_HWCAP stays 0. FP and ASIMD are not translated yet; claiming them turns into a trap on the
+    // first vector instruction instead of an honest refusal.
     auxv.push((16, 0));
     auxv.push((17, 100));
     auxv.push((23, 0));

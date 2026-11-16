@@ -35,3 +35,16 @@ EOF
     echo "oracle exit=$code stdout:"; cat tests/guest/$g.expected
     echo "$code" > tests/guest/$g.expected_exit
 done
+
+# The dynamically linked path: a PIE program and a stand-in for ld.so. No native oracle can run
+# these, so tests/dyn.sh asserts the loader's view of the initial stack instead.
+echo "== guest: ld-fake interpreter (ET_DYN) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fpie -nostdlib \
+    -c tests/guest/interp.c -o tests/guest/interp.o
+python3 tools/minilink.py tests/guest/interp.o tests/guest/interp.elf _start --type=dyn --base=0
+
+echo "== guest: hello_pie (ET_DYN, PT_INTERP=/lib/ld-fake.so) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fpie -nostdlib \
+    -c tests/guest/hello.c -o tests/guest/hello_pie.o
+python3 tools/minilink.py tests/guest/hello_pie.o tests/guest/hello_pie.elf _start \
+    --type=dyn --base=0 --interp=/lib/ld-fake.so
