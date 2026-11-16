@@ -30,6 +30,8 @@ export class AddressSpace {
     this.brkBase = map.heap_base;
     this.brkLimit = map.heap_limit;
     this.brk = map.heap_base;
+    this.arenaLo = map.mmap_base;
+    this.arenaHi = map.stack_floor;
     // Everything from mmap_base to the stack is available for mmap. Freed ranges go back here.
     this.free = [{ lo: map.mmap_base, hi: map.stack_floor }];
     this.ptes = new Uint8Array(memory.buffer, this.pteBase, 1 << 20);
@@ -46,6 +48,20 @@ export class AddressSpace {
     return bits;
   }
 
+  /// Drop `[lo, hi)` from the free spans, keeping whatever lies outside it.
+  subtract(lo, hi) {
+    const out = [];
+    for (const s of this.free) {
+      if (s.hi <= lo || s.lo >= hi) {
+        out.push(s);
+        continue;
+      }
+      if (s.lo < lo) out.push({ lo: s.lo, hi: lo });
+      if (s.hi > hi) out.push({ lo: hi, hi: s.hi });
+    }
+    return out;
+  }
+
   setPtes(lo, hi, bits) {
     for (let p = lo >> 12; p < roundUp(hi, PAGE) >> 12; p++) this.ptes[p] |= bits;
   }
@@ -57,13 +73,10 @@ export class AddressSpace {
   /// Take `len` bytes of the free list, at `addr` when it is fixed, else as low as it fits.
   reserve(len, addr, fixed) {
     if (addr !== 0 && fixed) {
-      const i = this.free.findIndex((s) => s.lo <= addr && addr + len <= s.hi);
-      if (i < 0) return -EINVAL;
-      const span = this.free[i];
-      const rest = [];
-      if (span.lo < addr) rest.push({ lo: span.lo, hi: addr });
-      if (span.hi > addr + len) rest.push({ lo: addr + len, hi: span.hi });
-      this.free.splice(i, 1, ...rest);
+      // MAP_FIXED puts the mapping where it says even when something else is already there, which
+      // is how a loader maps each segment over the reservation it just made for the whole library.
+      if (addr < this.arenaLo || addr + len > this.arenaHi) return -ENOMEM;
+      this.free = this.subtract(addr, addr + len);
       return addr;
     }
     let best = -1;
@@ -92,6 +105,8 @@ export class AddressSpace {
     len = roundUp(len, PAGE);
     if (len <= 0) return -EINVAL;
     const at = this.reserve(len, addr, flags & MAP.FIXED);
+    if (process.env.ARMJIT_TRACE_SYSCALLS)
+      console.error(`  reserve(0x${addr.toString(16)}, 0x${len.toString(16)}, fixed=${flags & MAP.FIXED}) -> ${at}`);
     if (at < 0) return at;
     const view = this.bytes(at, len);
     view.fill(0);

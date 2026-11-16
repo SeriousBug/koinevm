@@ -750,10 +750,14 @@ pub fn build_initial_stack(
 
     let slots = 1 + (argv_addrs.len() + 1) + (env_addrs.len() + 1) + (auxv.len() * 2 + 2);
     sb.align16();
+    // `argc` is the lowest word, so the entry point sees a 16-byte aligned stack only if the
+    // words below it come to an even count, which is what the ABI expects at a function entry.
     if slots % 2 == 1 {
         sb.cur -= 8;
     }
 
+    // AT_NULL is a pair like every other entry.
+    sb.u64(0);
     sb.u64(0);
     for (t, v) in auxv.iter().rev() {
         sb.u64(*v);
@@ -2522,7 +2526,7 @@ impl<'a> RegionEmitter<'a> {
                     self.flags_logic(sf);
                     self.store_t0(rd, sf, false);
                 } else {
-                    self.set(rd, sf);
+                    self.set_sp(rd, sf);
                 }
             }
             Insn::MoveWide { sf, opc, hw, imm16, rd } => {
@@ -2865,7 +2869,7 @@ impl<'a> RegionEmitter<'a> {
             }
             Insn::AddSubExt { sf, sub, setflags, extend, amount, rm, rn, rd } => {
                 if setflags {
-                    self.get(rn, sf);
+                    self.get_sp(rn, sf);
                     self.to_i64(sf);
                     self.f.ls(L_T1);
                     self.push_extended(rm, extend);
@@ -2878,7 +2882,7 @@ impl<'a> RegionEmitter<'a> {
                     self.flags_addsub(sf, sub);
                     self.store_t0(rd, sf, false);
                 } else {
-                    self.get(rn, sf);
+                    self.get_sp(rn, sf);
                     self.to_i64(sf);
                     self.push_extended(rm, extend);
                     if amount != 0 {
@@ -2887,11 +2891,7 @@ impl<'a> RegionEmitter<'a> {
                     }
                     self.f.op(if sub { I64_SUB } else { I64_ADD });
                     self.mask_w(sf);
-                    if rd == 31 {
-                        self.f.op(DROP);
-                    } else {
-                        self.f.ls(rd);
-                    }
+                    self.set_sp(rd, sf);
                 }
             }
             Insn::AddSubCarry { sf, sub, setflags, rm, rn, rd } => {
@@ -3103,6 +3103,11 @@ impl<'a> RegionEmitter<'a> {
                 self.emit_load(L_T1, if sf { 3 } else { 2 }, 1, rt);
             }
             Insn::Svc => {
+                // The host side reports which instruction called it, which is how a failing
+                // syscall is traced back to the guest code that asked for it.
+                self.f.i32c(SHADOW_PC as i32);
+                self.f.i32c(self.cur_pc as i32);
+                self.f.mem(I32_STORE, 2, 0);
                 self.f.lg(8);
                 for i in 0..6u32 {
                     self.f.lg(i);

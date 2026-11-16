@@ -81,7 +81,10 @@ export class Kernel {
 
   call(nr, a0, a1, a2, a3, a4, a5) {
     if (process.env.ARMJIT_TRACE_SYSCALLS) {
-      console.error(`syscall ${Number(nr)}(${[a0, a1, a2].map((v) => "0x" + BigInt.asUintN(64, v).toString(16)).join(", ")})`);
+      const args = [a0, a1, a2, a3, a4, a5]
+        .map((v) => "0x" + BigInt.asUintN(64, v).toString(16))
+        .join(", ");
+      console.error(`syscall ${Number(nr)}(${args})`);
     }
     const fn = this.table.get(Number(nr));
     if (!fn) {
@@ -127,6 +130,12 @@ export class Kernel {
         flags: Number(flags),
         contents,
       });
+      if (process.env.ARMJIT_TRACE_SYSCALLS)
+        console.error(
+          `  mmap at=0x${BigInt(at).toString(16)} len=0x${Number(len).toString(16)} prot=${Number(prot)} ` +
+            `flags=0x${Number(flags).toString(16)} fd=${Number(fd)} off=0x${Number(off).toString(16)} ` +
+            `bytes=${contents ? contents.length : 0}`,
+        );
       return [BigInt(at), 0];
     });
 
@@ -185,8 +194,16 @@ export class Kernel {
       let total = 0;
       for (let i = 0; i < n; i++) {
         const base = k.u64(iov) + BigInt(i) * 16n;
-        const bytes = k.read(base, Number(k.u64(base + 8n)));
-        if (bytes === null) return k.fail(EFAULT);
+        const len = Number(k.u64(base + 8n));
+        const at = k.u64(base);
+        const bytes = k.read(at, len);
+        if (bytes === null) {
+          if (process.env.ARMJIT_TRACE_SYSCALLS)
+            console.error(`  writev fd=${Number(fd)} iov[${i}] at=0x${at.toString(16)} len=${len} unreachable`);
+          return k.fail(EFAULT);
+        }
+        if (process.env.ARMJIT_TRACE_SYSCALLS)
+          console.error(`  writev fd=${Number(fd)} ${JSON.stringify(Buffer.from(bytes).toString("latin1"))}`);
         const wrote = k.files.write(Number(fd), Buffer.from(bytes));
         if (typeof wrote === "number" && wrote < 0) return [BigInt(wrote), 0];
         total += wrote;
@@ -207,6 +224,13 @@ export class Kernel {
     });
 
     this.on(79, (k, dirfd, path, buf, flags) => {
+      // glibc spells `fstat` as `newfstatat (fd, "", buf, AT_EMPTY_PATH)`.
+      if (k.str(path) === "") {
+        const st = k.files.statFd(Number(dirfd));
+        if (typeof st === "number") return [BigInt(st), 0];
+        k.fillStat(buf, st);
+        return [0n, 0];
+      }
       if (!isCwd(dirfd)) return k.fail(ENOSYS);
       const follow = (Number(flags) & 0x100) === 0; // AT_SYMLINK_NOFOLLOW is 0x100
       const st = follow ? k.files.statFile(k.str(path)) : k.files.statPath(k.str(path));

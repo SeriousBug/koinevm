@@ -59,6 +59,11 @@ function trace2(pc, sp) {
 }
 
 function syscall(nr, a0, a1, a2, a3, a4, a5) {
+  if (process.env.ARMJIT_TRACE_SYSCALLS) {
+    const view = new DataView(memory.buffer);
+    const pc = view.getInt32(0xf8 + 16, true) >>> 0;
+    console.error(`from 0x${pc.toString(16)}`);
+  }
   return kernel.call(nr, a0, a1, a2, a3, a4, a5);
 }
 
