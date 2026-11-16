@@ -91,9 +91,10 @@ Two things follow.
 
 ## What this does not prove, in order of how much it matters
 
-- **Dynamic linking with a real `ld.so`.** Two images at chosen bases load and hand off, and the
-  syscalls a loader uses exist, but no real `ld.so` has run yet: there is no rootfs in the repo and
-  the machine has no Linux oracle. That run is the next milestone.
+- **A loader run to the end.** Debian's own `ld-linux-aarch64.so.1` is translated with dash and
+  executes from `_dl_start` through the tunable scan, `/etc/ld.so.preload`, and the start of path
+  substitution, then stops at a function it reaches only through a computed value. A prompt, a
+  `libc.so.6` mapped at run time and a shell are all still missing.
 - **Code that appears at run time.** Translation is ahead-of-time over the images given to the
   translator. `ld.so` maps `libc.so.6` while it runs, so the first call into it will stop with
   "jumped to untranslated address". Making that work needs translation at run time and a resume
@@ -109,15 +110,20 @@ Two things follow.
   offsets, so the shadow register file and the page table sit in low memory where a wild guest write
   can reach them. A real kernel keeps them out of the address space entirely; here the map is
   documented and the reserved ranges are the ones the guest must not be mapped at.
-- **FP and NEON.** Decoded as `Undefined` and refused at the instruction that reaches them, which is
-  honest but means most real code will stop at its first float.
+- **Scalar floating point arithmetic.** The vector register file is translated and compared against
+  the oracle case by case, as are the moves and conversions between the general and FP registers.
+  `fadd`, `fmul`, `fdiv`, `fsqrt`, `fcmp`, `fcsel`, `fneg`/`fabs`/`fmax`/`fmin` and `fcvt` between
+  precisions are still refused at the instruction that reaches them.
 - **Instruction coverage is compiler output, not the ISA.** Hand-written or obfuscated code that uses
   `rmif`, `setf*`, `ldraa`, pointer authentication, `mrs` of anything else, exclusive/atomic
   accesses, or `SVE` is refused rather than mistranslated. That is the right failure mode but it is
   not coverage.
 - **Untranslated indirect targets.** Translation is ahead of time over the whole executable range
-  plus symbols and call targets. A computed jump to code that is neither is reported, not translated
-  on demand. Real stripped binaries need the translate-on-demand tier.
+  plus symbols, call targets, code addresses that `adrp` + `add` spells out, and code addresses an
+  image stores in its data. Those last two are heuristics: ld.so builds and stores addresses in ways
+  the scan does not see, and each miss is reported rather than translated. Enumerating function
+  entries from `.eh_frame`, and a translate-on-demand tier that spills the registers, translates the
+  page that faulted and resumes, are both still missing.
 - **No optimisation tier.** Flags are always materialised, direct calls always go through the
   dispatcher, blocks are never linked or inlined, no branch hints. The IR exists to make those
   passes additive.
