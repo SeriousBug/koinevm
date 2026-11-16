@@ -38,6 +38,13 @@ pub enum LsMode {
     Register,
 }
 
+/// How a multi-register load or store updates its base register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostIndex {
+    Imm(i64),
+    Reg(u32),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairMode {
     Offset,
@@ -68,6 +75,71 @@ pub enum Insn {
     LogicalReg { sf: bool, opc: u32, invert: bool, shift: Shift, amount: u32, rm: u32, rn: u32, rd: u32 },
     CondSelect { sf: bool, op2: u32, rm: u32, cond: u32, rn: u32, rd: u32 },
     CondCompare { sf: bool, sub: bool, reg: bool, rm_or_imm: u32, nzcv: u32, cond: u32, rn: u32 },
+    /// SMADDL/SMSUBL/UMADDL/UMSUBL: 32-bit operands widened into a 64-bit product and accumulator.
+    MulLong { signed: bool, sub: bool, rm: u32, ra: u32, rn: u32, rd: u32 },
+    /// `mrs Xt, <system register>`, for the registers a guest can legitimately read.
+    MrsSys { reg: SysReg, rd: u32 },
+    /// `msr <system register>, Xt`, for the ones whose writes mean something here.
+    MsrSys { reg: SysReg, rn: u32 },
+    /// `dc cvau`/`ic ivau`/`at`/`tlbi`: cache maintenance, which this machine does not have. The
+    /// instruction cache one is where translation invalidation will hang once code can change.
+    CacheOp,
+    /// `brk #imm`: a deliberate trap.
+    Brk,
+
+    // ---- Advanced SIMD and scalar floating point
+    /// Single-register vector load/store, B/H/S/D/Q wide.
+    VecLoadStore {
+        width: u32,
+        is_load: bool,
+        mode: LsMode,
+        offset: i64,
+        rn: u32,
+        rt: u32,
+        rm: u32,
+        option: u32,
+        scaled: bool,
+    },
+    VecLoadStorePair { width: u32, is_load: bool, mode: PairMode, offset: i64, rn: u32, rt: u32, rt2: u32 },
+    /// `ld1`/`st1` of one to four whole registers, contiguous, with an optional post-index.
+    VecLd1 { is_load: bool, count: u32, q: bool, post: Option<PostIndex>, rn: u32, rt: u32 },
+    /// `ld1r`: load one element and replicate it across the register.
+    VecLd1r { q: bool, size: u32, post: Option<PostIndex>, rn: u32, rt: u32 },
+    /// Three-register, same-width integer or FP operation: `add v.4s`, `cmeq`, `umaxp`, ...
+    VecThreeSame { q: bool, u: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
+    /// Two-register, same-width operation: `not`, `abs`, `cmeq ... #0`, `rev64`, `cnt`, ...
+    VecTwoMisc { q: bool, u: bool, size: u32, op: u32, rn: u32, rd: u32 },
+    /// One result across the lanes: `addv`, `smaxv`, `uminv`, `addp` to a scalar.
+    VecAcross { q: bool, u: bool, size: u32, op: u32, rn: u32, rd: u32 },
+    /// Narrowing and widening between element widths: `xtn`, `addhn`, `saddl`, ...
+    VecThreeDiff { q: bool, u: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
+    /// Shift by immediate: `ushr`, `sshr`, `shl`, `sli`, `sri`, `shrn`, `sshll`, ...
+    VecShiftImm { q: bool, u: bool, immh: u32, immb: u32, op: u32, rn: u32, rd: u32 },
+    /// `dup`, `ins`, `umov`, `smov`: moves between the vector file and the general registers.
+    VecCopy { q: bool, op: bool, imm5: u32, imm4: u32, rn: u32, rd: u32 },
+    /// `movi` and `mvni`, whose result is a constant the translator can build.
+    VecModImm { q: bool, op: bool, cmode: u32, imm8: u32, rd: u32 },
+    /// `zip1/2`, `uzp1/2`, `trn1/2`.
+    VecPermute { q: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
+    /// `ext`: concatenate two registers and take 16 bytes from a byte offset.
+    VecExt { q: bool, imm4: u32, rn: u32, rm: u32, rd: u32 },
+    /// `tbl`/`tbx`: byte permutation through a table of one to four registers.
+    VecTbl { q: bool, tbx: bool, len: u32, rn: u32, rm: u32, rd: u32 },
+    /// Scalar FP between the vector file and the general registers: `fmov`, `fcvtzs`, ...
+    FpToGpr { sf: bool, signed: bool, size: u32, rmode: u32, opcode: u32, rn: u32, rd: u32 },
+    GprToFp { sf: bool, signed: bool, size: u32, rmode: u32, opcode: u32, rn: u32, rd: u32 },
+    /// Scalar FP arithmetic on one register: `fmov`, `fabs`, `fneg`, `fsqrt`, `fcvt`, ...
+    FpOneSource { size: u32, opcode: u32, rn: u32, rd: u32 },
+    /// Scalar FP arithmetic on two registers: `fadd`, `fdiv`, `fmax`, `fcmp`, ...
+    FpTwoSource { size: u32, opcode: u32, rn: u32, rm: u32, rd: u32 },
+    /// `fcsel`: a conditional select between two FP registers.
+    FpCondSelect { size: u32, cond: u32, rn: u32, rm: u32, rd: u32 },
+    /// Scalar FP with an immediate: `fmov s0, #1.0`.
+    FpImm { size: u32, imm8: u32, rd: u32 },
+    /// Ordered and exclusive loads and stores. One thread, so an exclusive always succeeds.
+    Atomic { is_load: bool, exclusive: bool, size: u32, rn: u32, rt: u32, rs: u32 },
+    /// Compare and swap (`cas`/`casa`/`casl`): the loaded value goes back into Rs either way.
+    AtomicCas { size: u32, rn: u32, rt: u32, rs: u32 },
     LoadStore { size: u32, is_load: bool, opc: u32, mode: LsMode, offset: i64, rn: u32, rt: u32, rm: u32, option: u32, scaled: bool },
     LoadStorePair { is_load: bool, mode: PairMode, offset: i64, rn: u32, rt: u32, rt2: u32, width: u32, signed_word: bool },
     Literal { sf: bool, offset: i64, rt: u32 },
@@ -129,6 +201,43 @@ pub fn decode_bitmask(n: u32, imms: u32, immr: u32, sf: bool) -> Option<u64> {
     }
 }
 
+/// The system registers the guest is allowed to read or write, resolved at decode time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SysReg {
+    Nzcv,
+    Fpcr,
+    Fpsr,
+    CtrEl0,
+    DczidEl0,
+    MidrEl1,
+    MpidrEl1,
+    CntvctEl0,
+    TpidrEl0,
+    TpidrroEl0,
+    /// Cache and feature identification: answered as the baseline AArch64 model.
+    IdAa64Pfr0,
+    IdAa64Isar0,
+    Unknown,
+}
+
+fn sys_reg(o0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> SysReg {
+    match (o0, op1, crn, crm, op2) {
+        (3, 3, 4, 2, 0) => SysReg::Nzcv,
+        (3, 3, 4, 4, 0) => SysReg::Fpcr,
+        (3, 3, 4, 4, 1) => SysReg::Fpsr,
+        (3, 3, 0, 0, 1) => SysReg::CtrEl0,
+        (3, 3, 0, 0, 7) => SysReg::DczidEl0,
+        (3, 0, 0, 0, 0) => SysReg::MidrEl1,
+        (3, 0, 0, 0, 5) => SysReg::MpidrEl1,
+        (3, 3, 14, 0, 2) => SysReg::CntvctEl0,
+        (3, 3, 13, 0, 2) => SysReg::TpidrEl0,
+        (3, 3, 13, 0, 3) => SysReg::TpidrroEl0,
+        (3, 0, 0, 4, 0) => SysReg::IdAa64Pfr0,
+        (3, 0, 0, 6, 0) => SysReg::IdAa64Isar0,
+        _ => SysReg::Unknown,
+    }
+}
+
 pub fn decode(w: u32) -> Insn {
     let sf = w >> 31 != 0;
     let rd = w & 31;
@@ -136,12 +245,26 @@ pub fn decode(w: u32) -> Insn {
     let rm = (w >> 16) & 31;
     let op0 = (w >> 25) & 0xf;
 
+    // SIMD&FP loads and stores share their encoding space with the integer ones and are told apart
+    // by bit 26; the multi-structure forms (ld1 and friends) sit in a corner of their own.
+    match (w >> 24) & 0x3f {
+        0b001100 | 0b001101 => return decode_simd_multi(w),
+        _ => {}
+    }
+    let top3 = (w >> 27) & 7;
+    // A vector load/store has bit 26 set and bit 25 clear; the vector data-processing encodings that
+    // also have bit 26 set use bit 25 to say so.
+    if (w >> 26) & 1 == 1 && (w >> 25) & 1 == 0 && (top3 == 0b111 || top3 == 0b101) {
+        return decode_simd_loadstore(w);
+    }
+
     match op0 {
         0b1000 | 0b1001 => decode_dp_imm(w, sf, rd, rn),
         0b1010 | 0b1011 => decode_branch_system(w, sf, rd, rn),
         0b0101 | 0b1101 => decode_dp_reg(w, sf, rd, rn, rm),
         0b0100 | 0b0110 | 0b1100 | 0b1110 => decode_loadstore(w, sf, rd, rn),
-        // 001x is SVE, x111 is scalar FP/SIMD: deliberately not decoded yet.
+        // 0b0111 is vector data processing, 0b1111 is scalar floating point.
+        0b0111 | 0b1111 => decode_simd_dp(w),
         _ => Insn::Undefined,
     }
 }
@@ -199,17 +322,35 @@ fn decode_dp_imm(w: u32, sf: bool, rd: u32, rn: u32) -> Insn {
 
 fn decode_branch_system(w: u32, sf: bool, rd: u32, _rn: u32) -> Insn {
     if w >> 24 == 0xD4 {
-        return if w == 0xD400_0001 { Insn::Svc } else { Insn::Undefined };
+        if w == 0xD400_0001 {
+            return Insn::Svc;
+        }
+        if w & 0xFFE0_001F == 0xD420_0000 {
+            return Insn::Brk; // brk #imm16
+        }
+        return Insn::Undefined;
     }
     if w >> 24 == 0xD5 {
-        if w & 0xFFFF_F01F == 0xD503_201F || w & 0xFFFF_F0DF == 0xD503_30DF {
-            return Insn::Hint; // hint #n, dsb/dmb/isb
+        // HINT #imm and the DSB/DMB/ISB group: nothing to do in a single-threaded translated guest
+        // that has no caches of its own.
+        if w & 0xFFFF_F01F == 0xD503_201F || w & 0xFFFF_F09F == 0xD503_309F {
+            return Insn::Hint;
         }
-        if w & 0xFFFF_FFE0 == 0xD53B_D040 {
-            return Insn::MrsTpidr { rd };
-        }
-        if w & 0xFFFF_FFE0 == 0xD51B_D040 {
-            return Insn::MsrTpidr { rn: rd };
+        if w & 0xFFC0_0000 == 0xD500_0000 {
+            // Bits 21:20 pick the form: 11 reads a system register, 01 writes one, 00/10 are the
+            // cache and TLB maintenance instructions, which have nothing to act on here.
+            let o0 = 2 + ((w >> 19) & 1);
+            let op1 = (w >> 16) & 7;
+            let crn = (w >> 12) & 0xf;
+            let crm = (w >> 8) & 0xf;
+            let op2 = (w >> 5) & 7;
+            let rt = w & 31;
+            let reg = sys_reg(o0, op1, crn, crm, op2);
+            return match (w >> 20) & 3 {
+                3 => Insn::MrsSys { reg, rd: rt },
+                1 => Insn::MsrSys { reg, rn: rt },
+                _ => Insn::CacheOp,
+            };
         }
         return Insn::Undefined;
     }
@@ -299,6 +440,12 @@ fn decode_dp_reg(w: u32, sf: bool, rd: u32, rn: u32, rm: u32) -> Insn {
             match (op31, o0) {
                 (0, 0) => Insn::MaddMsub { sf, sub: false, rm, ra: (w >> 10) & 31, rn, rd },
                 (0, 1) => Insn::MaddMsub { sf, sub: true, rm, ra: (w >> 10) & 31, rn, rd },
+                (1, _) if sf => {
+                    Insn::MulLong { signed: true, sub: o0 == 1, rm, ra: (w >> 10) & 31, rn, rd }
+                }
+                (5, _) if sf => {
+                    Insn::MulLong { signed: false, sub: o0 == 1, rm, ra: (w >> 10) & 31, rn, rd }
+                }
                 (2, 0) if sf => Insn::MulHigh { sf, signed: true, rn, rm, rd },
                 (6, 0) if sf => Insn::MulHigh { sf, signed: false, rn, rm, rd },
                 _ => Insn::Undefined,
@@ -353,6 +500,33 @@ fn decode_dp_reg(w: u32, sf: bool, rd: u32, rn: u32, rm: u32) -> Insn {
 }
 
 fn decode_loadstore(w: u32, sf: bool, rd: u32, rn: u32) -> Insn {
+    // Load/store exclusive and ordered. Bit 23 clear means the exclusive pair form, bit 22 is the
+    // direction, and bit 15 selects acquire/release over the plain exclusive.
+    if (w >> 24) & 0x3f == 0b001000 && (w >> 21) & 7 == 0b111 {
+        // Compare and swap, from the atomic memory operations group.
+        let size = (w >> 30) & 3;
+        if (w >> 12) & 7 != 0b111 {
+            return Insn::Undefined;
+        }
+        return Insn::AtomicCas { size, rn: (w >> 5) & 31, rt: w & 31, rs: (w >> 16) & 31 };
+    }
+    if (w >> 24) & 0x3f == 0b001000 {
+        let size = (w >> 30) & 3;
+        let is_load = (w >> 22) & 1 != 0;
+        let exclusive = (w >> 23) & 1 == 0;
+        let status = (w >> 15) & 1 == 0;
+        return match (is_load, exclusive, status) {
+            (true, true, true) => Insn::Atomic { is_load, exclusive, size, rn, rt: rd, rs: 0 },
+            (true, true, false) => Insn::Atomic { is_load, exclusive: false, size, rn, rt: rd, rs: 0 },
+            (false, true, true) => {
+                Insn::Atomic { is_load, exclusive, size, rn, rt: (w >> 10) & 31, rs: (w >> 16) & 31 }
+            }
+            (false, true, false) => Insn::Atomic { is_load, exclusive: false, size, rn, rt: rd, rs: 0 },
+            (true, false, false) => Insn::Atomic { is_load, exclusive: false, size, rn, rt: rd, rs: 0 },
+            (false, false, false) => Insn::Atomic { is_load, exclusive: false, size, rn, rt: rd, rs: 0 },
+            _ => Insn::Undefined,
+        };
+    }
     match (w >> 27) & 7 {
         0b111 => {
             let size = (w >> 30) & 3;
@@ -423,4 +597,240 @@ fn decode_loadstore(w: u32, sf: bool, rd: u32, rn: u32) -> Insn {
         }
         _ => Insn::Undefined,
     }
+}
+
+// ---------------------------------------------------------------- SIMD and floating point
+
+/// `ldr`/`str`/`ldur`/`stur`/`ldp`/`stp` for the vector and FP registers.
+fn decode_simd_loadstore(w: u32) -> Insn {
+    let q = (w >> 30) & 1 != 0;
+    let rn = (w >> 5) & 31;
+    let rt = w & 31;
+    let rm = (w >> 16) & 31;
+
+    if (w >> 27) & 7 == 0b101 {
+        // Pair: `opc 101 V 01 L imm7 Rt2 Rn Rt`, with bits 24:23 picking the addressing form.
+        let opc = (w >> 30) & 3;
+        let width = match opc {
+            0 => 32,
+            1 => 64,
+            2 => 128,
+            _ => return Insn::Undefined,
+        };
+        let is_load = (w >> 22) & 1 != 0;
+        let mode = match (w >> 23) & 3 {
+            0b00 => PairMode::PostIndex,
+            0b10 => PairMode::Offset,
+            0b11 => PairMode::PreIndex,
+            _ => return Insn::Undefined,
+        };
+        let offset = sx(((w >> 15) & 0x7f) as u32, 7) * (width / 8) as i64;
+        return Insn::VecLoadStorePair { width, is_load, mode, offset, rn, rt, rt2: (w >> 10) & 31 };
+    }
+
+    // Single register. `size` is the access width; `opc` picks load or store, and its high bit
+    // means "Q register", which is only valid with size 00.
+    let size = (w >> 30) & 3;
+    let opc = (w >> 22) & 3;
+    let width = match opc {
+        0b00 | 0b01 => 8 << size,
+        0b10 | 0b11 if size == 0 => 128,
+        _ => return Insn::Undefined,
+    };
+    let is_load = opc & 1 != 0;
+    let _ = q;
+    let imm12 = ((w >> 10) & 0xfff) as i64;
+    match (w >> 24) & 3 {
+        0b01 => Insn::VecLoadStore {
+            width,
+            is_load,
+            mode: LsMode::Unsigned,
+            offset: imm12 * (width / 8) as i64,
+            rn,
+            rt,
+            rm: 0,
+            option: 0,
+            scaled: false,
+        },
+        0b00 if (w >> 21) & 1 == 0 => {
+            let offset = sx(((w >> 12) & 0x1ff) as u32, 9);
+            let mode = match (w >> 10) & 3 {
+                0b00 => LsMode::Unscaled,
+                0b01 => LsMode::PostIndex,
+                0b11 => LsMode::PreIndex,
+                _ => return Insn::Undefined,
+            };
+            Insn::VecLoadStore { width, is_load, mode, offset, rn, rt, rm: 0, option: 0, scaled: false }
+        }
+        0b00 => Insn::VecLoadStore {
+            width,
+            is_load,
+            mode: LsMode::Register,
+            offset: 0,
+            rn,
+            rt,
+            rm: (w >> 16) & 31,
+            option: (w >> 13) & 7,
+            scaled: (w >> 12) & 1 != 0,
+        },
+        _ => Insn::Undefined,
+    }
+}
+
+/// The multi-structure loads and stores: `ld1`/`st1` and the replicating `ld1r`.
+fn decode_simd_multi(w: u32) -> Insn {
+    let q = (w >> 30) & 1 != 0;
+    let rn = (w >> 5) & 31;
+    let rt = w & 31;
+    let rm = (w >> 16) & 31;
+    let opcode = (w >> 12) & 0xf;
+    let size = (w >> 10) & 3;
+    let is_load = (w >> 22) & 1 != 0;
+    let post_index = (w >> 23) & 1 != 0;
+
+    if (w >> 24) & 0x3f == 0b001101 {
+        // Replicate one element: `ld1r`, `ld2r`, `ld3r`, `ld4r`. Only ld1r is translated.
+        return match opcode {
+            0b1100 | 0b1101 | 0b1110 | 0b1111 => {
+                let count = 1 + (opcode & 3);
+                if count != 1 {
+                    return Insn::Undefined;
+                }
+                Insn::VecLd1r {
+                    q,
+                    size,
+                    post: if post_index {
+                        Some(if rm == 31 {
+                            PostIndex::Imm(if q { 16 } else { 8 })
+                        } else {
+                            PostIndex::Reg(rm)
+                        })
+                    } else {
+                        None
+                    },
+                    rn,
+                    rt,
+                }
+            }
+            _ => Insn::Undefined,
+        };
+    }
+
+    // `ld1`/`st1` of whole registers: opcode 0111 is one register, 1010 two, 0110 three, 0010 four.
+    let count = match opcode {
+        0b0111 => 1,
+        0b1010 => 2,
+        0b0110 => 3,
+        0b0010 => 4,
+        _ => return Insn::Undefined, // interleaved and single-lane forms are not translated
+    };
+    let bytes = count as i64 * if q { 16 } else { 8 };
+    Insn::VecLd1 {
+        is_load,
+        count,
+        q,
+        post: if post_index {
+            Some(if rm == 31 { PostIndex::Imm(bytes) } else { PostIndex::Reg(rm) })
+        } else {
+            None
+        },
+        rn,
+        rt,
+    }
+}
+
+/// Vector data processing (bit 28 clear) and scalar FP (bit 28 set).
+fn decode_simd_dp(w: u32) -> Insn {
+    if (w >> 28) & 1 == 1 {
+        return decode_scalar_fp(w);
+    }
+    let q = (w >> 30) & 1 != 0;
+    let u = (w >> 29) & 1 != 0;
+    let rn = (w >> 5) & 31;
+    let rd = w & 31;
+    let rm = (w >> 16) & 31;
+    let size = (w >> 22) & 3;
+    let op = (w >> 11) & 0x1f;
+    let bit10 = (w >> 10) & 1;
+    let bit21 = (w >> 21) & 1;
+
+    // `movi`/`mvni` and the shift-by-immediate group share bits 28:24, told apart by whether an
+    // element width is present.
+    if (w >> 24) & 0x1f == 0b01111 {
+        if (w >> 19) & 0xf != 0 {
+            return Insn::VecShiftImm {
+                q,
+                u,
+                immh: (w >> 19) & 0xf,
+                immb: (w >> 16) & 7,
+                op,
+                rn,
+                rd,
+            };
+        }
+        let imm8 = (((w >> 16) & 7) << 5 | ((w >> 5) & 0x1f)) as u32;
+        return Insn::VecModImm { q, op: u, cmode: (w >> 12) & 0xf, imm8, rd };
+    }
+
+    if bit21 == 1 && bit10 == 1 {
+        return Insn::VecThreeSame { q, u, size, op, rn, rm, rd };
+    }
+    if bit21 == 1 && (w >> 11) & 1 == 1 {
+        // One result across the lanes has a marker in bits 21:17 of its own.
+        if (w >> 17) & 0x1f == 0b11000 {
+            return Insn::VecAcross { q, u, size, op: (w >> 12) & 0x1f, rn, rd };
+        }
+        return Insn::VecTwoMisc { q, u, size, op: (w >> 12) & 0x1f, rn, rd };
+    }
+    if bit21 == 1 {
+        return Insn::VecThreeDiff { q, u, size, op, rn, rm, rd };
+    }
+    if bit10 == 1 {
+        return Insn::VecCopy { q, op: u, imm5: (w >> 16) & 0x1f, imm4: (w >> 11) & 0xf, rn, rd };
+    }
+    if (w >> 11) & 1 == 1 {
+        if u && op == 0b00101 && (w >> 15) & 1 == 0 {
+            return Insn::VecExt { q, imm4: (w >> 11) & 0xf, rn, rm, rd };
+        }
+        return Insn::VecPermute { q, size, op, rn, rm, rd };
+    }
+    Insn::VecTbl { q, tbx: (w >> 12) & 1 != 0, len: (w >> 13) & 3, rn, rm, rd }
+}
+
+/// Scalar floating point: the one- and two-source arithmetic, comparisons, selects, conversions and
+/// the immediate form.
+fn decode_scalar_fp(w: u32) -> Insn {
+    let sf = (w >> 31) & 1 != 0;
+    let size = (w >> 22) & 3;
+    let rn = (w >> 5) & 31;
+    let rd = w & 31;
+    let rm = (w >> 16) & 31;
+    let rmode = (w >> 19) & 3;
+    let opcode = (w >> 12) & 0x3f;
+
+    // Between FP and the general registers. Bit 21 is set, bits 15:10 are zero, and bits 20:16 name
+    // the operation: 6 and 24..31 take their result from an FP register, 7 and 2..3 from a general
+    // one. The direction is a property of those codes, not of a direction bit.
+    if (w >> 21) & 1 == 1 && (w >> 10) & 0x3f == 0 {
+        let code = (w >> 16) & 0x1f;
+        return match code {
+            6 | 24..=31 => Insn::FpToGpr { sf, signed: code != 6 && code & 1 == 0, size, rmode, opcode: code, rn, rd },
+            7 | 2..=3 => Insn::GprToFp { sf, signed: code != 7 && code == 2, size, rmode, opcode: code, rn, rd },
+            _ => Insn::Undefined,
+        };
+    }
+
+    // FP immediate: `fmov s0, #const`.
+    if (w >> 21) & 0xf == 0b1001 && (w >> 5) & 0xf == 0b1000 {
+        let imm8 = (((w >> 16) & 0x7f) << 1 | ((w >> 5) & 1)) as u32;
+        return Insn::FpImm { size, imm8, rd };
+    }
+
+    if (w >> 24) & 0x1f == 0b01111 {
+        // Two source: `fadd`, `fmul`, `fdiv`, `fmax`, `fcmp` share this space with one opcode bit
+        // selecting the comparison forms.
+        return Insn::FpTwoSource { size, opcode, rn, rm, rd };
+    }
+
+    Insn::FpOneSource { size, opcode, rn, rd }
 }

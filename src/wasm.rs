@@ -2,6 +2,7 @@
 
 pub const I32: u8 = 0x7f;
 pub const I64: u8 = 0x7e;
+pub const V128: u8 = 0x7b;
 
 pub fn uleb(out: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -95,6 +96,8 @@ pub mod op {
     pub const I32_CLZ: u8 = 0x67;
     pub const I32_CTZ: u8 = 0x68;
     pub const I32_POPCNT: u8 = 0x69;
+    pub const I32_EXTEND8_S: u8 = 0xc0;
+    pub const I32_EXTEND16_S: u8 = 0xc1;
     pub const I32_ADD: u8 = 0x6a;
     pub const I32_SUB: u8 = 0x6b;
     pub const I32_MUL: u8 = 0x6c;
@@ -127,11 +130,237 @@ pub mod op {
     pub const I64_ROTR: u8 = 0x8a;
 
     pub const I32_WRAP_I64: u8 = 0xa7;
+    pub const F32_CONVERT_I32_S: u8 = 0xb2;
+    pub const F32_CONVERT_I32_U: u8 = 0xb3;
+    pub const F32_CONVERT_I64_S: u8 = 0xb4;
+    pub const F32_CONVERT_I64_U: u8 = 0xb5;
+    pub const F32_DEMOTE_F64: u8 = 0xb6;
+    pub const F64_CONVERT_I32_S: u8 = 0xb7;
+    pub const F64_CONVERT_I32_U: u8 = 0xb8;
+    pub const F64_CONVERT_I64_S: u8 = 0xb9;
+    pub const F64_CONVERT_I64_U: u8 = 0xba;
+    pub const F64_PROMOTE_F32: u8 = 0xbb;
+    pub const I32_REINTERPRET_F32: u8 = 0xbc;
+    pub const I64_REINTERPRET_F64: u8 = 0xbd;
+    pub const F32_REINTERPRET_I32: u8 = 0xbe;
+    pub const F64_REINTERPRET_I64: u8 = 0xbf;
     pub const I64_EXTEND_I32_S: u8 = 0xac;
     pub const I64_EXTEND_I32_U: u8 = 0xad;
     pub const I64_EXTEND8_S: u8 = 0xc2;
     pub const I64_EXTEND16_S: u8 = 0xc3;
     pub const I64_EXTEND32_S: u8 = 0xc4;
+}
+
+/// Nontrapping float-to-integer conversions and other `0xfc`-prefixed opcodes.
+pub mod sat {
+    pub const I32_TRUNC_SAT_F32_S: u32 = 0x00;
+    pub const I32_TRUNC_SAT_F32_U: u32 = 0x01;
+    pub const I32_TRUNC_SAT_F64_S: u32 = 0x02;
+    pub const I32_TRUNC_SAT_F64_U: u32 = 0x03;
+    pub const I64_TRUNC_SAT_F32_S: u32 = 0x04;
+    pub const I64_TRUNC_SAT_F32_U: u32 = 0x05;
+    pub const I64_TRUNC_SAT_F64_S: u32 = 0x06;
+    pub const I64_TRUNC_SAT_F64_U: u32 = 0x07;
+}
+
+/// WebAssembly SIMD opcodes (`0xfd` prefix), as numbered by the SIMD proposal's binary format.
+pub mod simd {
+    pub const V128_LOAD: u32 = 0x00;
+    pub const V128_LOAD8X8_S: u32 = 0x01;
+    pub const V128_LOAD8X8_U: u32 = 0x02;
+    pub const V128_LOAD16X4_S: u32 = 0x03;
+    pub const V128_LOAD16X4_U: u32 = 0x04;
+    pub const V128_LOAD32X2_S: u32 = 0x05;
+    pub const V128_LOAD32X2_U: u32 = 0x06;
+    pub const V128_LOAD8_SPLAT: u32 = 0x07;
+    pub const V128_LOAD16_SPLAT: u32 = 0x08;
+    pub const V128_LOAD32_SPLAT: u32 = 0x09;
+    pub const V128_LOAD64_SPLAT: u32 = 0x0a;
+    pub const V128_STORE: u32 = 0x0b;
+    pub const V128_CONST: u32 = 0x0c;
+    pub const I8X16_SHUFFLE: u32 = 0x0d;
+    pub const I8X16_SWIZZLE: u32 = 0x0e;
+    pub const I8X16_SPLAT: u32 = 0x0f;
+    pub const I16X8_SPLAT: u32 = 0x10;
+    pub const I32X4_SPLAT: u32 = 0x11;
+    pub const I64X2_SPLAT: u32 = 0x12;
+    pub const F32X4_SPLAT: u32 = 0x13;
+    pub const F64X2_SPLAT: u32 = 0x14;
+    pub const I8X16_EXTRACT_LANE_S: u32 = 0x15;
+    pub const I8X16_EXTRACT_LANE_U: u32 = 0x16;
+    pub const I8X16_REPLACE_LANE: u32 = 0x17;
+    pub const I16X8_EXTRACT_LANE_S: u32 = 0x18;
+    pub const I16X8_EXTRACT_LANE_U: u32 = 0x19;
+    pub const I16X8_REPLACE_LANE: u32 = 0x1a;
+    pub const I32X4_EXTRACT_LANE: u32 = 0x1b;
+    pub const I32X4_REPLACE_LANE: u32 = 0x1c;
+    pub const I64X2_EXTRACT_LANE: u32 = 0x1d;
+    pub const I64X2_REPLACE_LANE: u32 = 0x1e;
+    pub const F32X4_EXTRACT_LANE: u32 = 0x1f;
+    pub const F32X4_REPLACE_LANE: u32 = 0x20;
+    pub const F64X2_EXTRACT_LANE: u32 = 0x21;
+    pub const F64X2_REPLACE_LANE: u32 = 0x22;
+    pub const I8X16_EQ: u32 = 0x23;
+    pub const I8X16_NE: u32 = 0x24;
+    pub const I8X16_LT_S: u32 = 0x25;
+    pub const I8X16_LT_U: u32 = 0x26;
+    pub const I8X16_GT_S: u32 = 0x27;
+    pub const I8X16_GT_U: u32 = 0x28;
+    pub const I8X16_LE_S: u32 = 0x29;
+    pub const I8X16_GE_S: u32 = 0x2b;
+    pub const I8X16_GE_U: u32 = 0x2c;
+    pub const I16X8_EQ: u32 = 0x2d;
+    pub const I16X8_LT_S: u32 = 0x2f;
+    pub const I16X8_GT_S: u32 = 0x31;
+    pub const I16X8_GT_U: u32 = 0x32;
+    pub const I16X8_LE_S: u32 = 0x33;
+    pub const I16X8_GE_S: u32 = 0x35;
+    pub const I16X8_GE_U: u32 = 0x36;
+    pub const I32X4_EQ: u32 = 0x37;
+    pub const I32X4_LT_S: u32 = 0x39;
+    pub const I32X4_GT_S: u32 = 0x3b;
+    pub const I32X4_GT_U: u32 = 0x3c;
+    pub const I32X4_LE_S: u32 = 0x3d;
+    pub const I32X4_GE_S: u32 = 0x3f;
+    pub const I32X4_GE_U: u32 = 0x40;
+    pub const F32X4_EQ: u32 = 0x41;
+    pub const F32X4_NE: u32 = 0x42;
+    pub const F32X4_LT: u32 = 0x43;
+    pub const F32X4_GT: u32 = 0x44;
+    pub const F32X4_LE: u32 = 0x45;
+    pub const F32X4_GE: u32 = 0x46;
+    pub const F64X2_EQ: u32 = 0x47;
+    pub const F64X2_NE: u32 = 0x48;
+    pub const F64X2_LT: u32 = 0x49;
+    pub const F64X2_GT: u32 = 0x4a;
+    pub const F64X2_LE: u32 = 0x4b;
+    pub const F64X2_GE: u32 = 0x4c;
+    pub const V128_NOT: u32 = 0x4d;
+    pub const V128_AND: u32 = 0x4e;
+    pub const V128_ANDNOT: u32 = 0x4f;
+    pub const V128_OR: u32 = 0x50;
+    pub const V128_XOR: u32 = 0x51;
+    pub const V128_BITSELECT: u32 = 0x52;
+    pub const V128_ANY_TRUE: u32 = 0x53;
+    pub const V128_LOAD8_LANE: u32 = 0x54;
+    pub const V128_LOAD16_LANE: u32 = 0x55;
+    pub const V128_LOAD32_LANE: u32 = 0x56;
+    pub const V128_LOAD64_LANE: u32 = 0x57;
+    pub const V128_STORE8_LANE: u32 = 0x58;
+    pub const V128_STORE16_LANE: u32 = 0x59;
+    pub const V128_STORE32_LANE: u32 = 0x5a;
+    pub const V128_STORE64_LANE: u32 = 0x5b;
+    pub const V128_LOAD32_ZERO: u32 = 0x5c;
+    pub const V128_LOAD64_ZERO: u32 = 0x5d;
+    pub const F32X4_DEMOTE_F64X2_ZERO: u32 = 0x5e;
+    pub const F64X2_PROMOTE_LOW_F32X4: u32 = 0x5f;
+    pub const I8X16_ABS: u32 = 0x60;
+    pub const I8X16_NEG: u32 = 0x61;
+    pub const I8X16_POPCNT: u32 = 0x62;
+    pub const I8X16_ALL_TRUE: u32 = 0x63;
+    pub const I8X16_BITMASK: u32 = 0x64;
+    pub const I8X16_NARROW_I16X8_S: u32 = 0x65;
+    pub const I8X16_NARROW_I16X8_U: u32 = 0x66;
+    pub const F32X4_CEIL: u32 = 0x67;
+    pub const F32X4_FLOOR: u32 = 0x68;
+    pub const F32X4_TRUNC: u32 = 0x69;
+    pub const F32X4_NEAREST: u32 = 0x6a;
+    pub const I8X16_SHL: u32 = 0x6b;
+    pub const I8X16_SHR_S: u32 = 0x6c;
+    pub const I8X16_SHR_U: u32 = 0x6d;
+    pub const I8X16_ADD: u32 = 0x6e;
+    pub const I8X16_SUB: u32 = 0x71;
+    pub const I8X16_MIN_S: u32 = 0x76;
+    pub const I8X16_MIN_U: u32 = 0x77;
+    pub const I8X16_MAX_S: u32 = 0x78;
+    pub const I8X16_MAX_U: u32 = 0x79;
+    pub const I16X8_EXTADD_PAIRWISE_I8X16_S: u32 = 0x7c;
+    pub const I16X8_EXTADD_PAIRWISE_I8X16_U: u32 = 0x7d;
+    pub const I32X4_EXTADD_PAIRWISE_I16X8_S: u32 = 0x7e;
+    pub const I32X4_EXTADD_PAIRWISE_I16X8_U: u32 = 0x7f;
+    pub const I16X8_ABS: u32 = 0x80;
+    pub const I16X8_NEG: u32 = 0x81;
+    pub const I16X8_ALL_TRUE: u32 = 0x83;
+    pub const I16X8_BITMASK: u32 = 0x84;
+    pub const I16X8_NARROW_I32X4_S: u32 = 0x85;
+    pub const I16X8_NARROW_I32X4_U: u32 = 0x86;
+    pub const I16X8_EXTEND_LOW_I8X16_S: u32 = 0x87;
+    pub const I16X8_EXTEND_HIGH_I8X16_S: u32 = 0x88;
+    pub const I16X8_EXTEND_LOW_I8X16_U: u32 = 0x89;
+    pub const I16X8_EXTEND_HIGH_I8X16_U: u32 = 0x8a;
+    pub const I16X8_SHL: u32 = 0x8b;
+    pub const I16X8_SHR_S: u32 = 0x8c;
+    pub const I16X8_SHR_U: u32 = 0x8d;
+    pub const I16X8_ADD: u32 = 0x8e;
+    pub const I16X8_SUB: u32 = 0x91;
+    pub const I16X8_MUL: u32 = 0x95;
+    pub const I16X8_MIN_S: u32 = 0x96;
+    pub const I16X8_MIN_U: u32 = 0x97;
+    pub const I16X8_MAX_S: u32 = 0x98;
+    pub const I16X8_MAX_U: u32 = 0x99;
+    pub const I32X4_ABS: u32 = 0xa0;
+    pub const I32X4_NEG: u32 = 0xa1;
+    pub const I32X4_ALL_TRUE: u32 = 0xa3;
+    pub const I32X4_BITMASK: u32 = 0xa4;
+    pub const I32X4_EXTEND_LOW_I16X8_S: u32 = 0xa7;
+    pub const I32X4_EXTEND_HIGH_I16X8_S: u32 = 0xa8;
+    pub const I32X4_EXTEND_LOW_I16X8_U: u32 = 0xa9;
+    pub const I32X4_EXTEND_HIGH_I16X8_U: u32 = 0xaa;
+    pub const I32X4_SHL: u32 = 0xab;
+    pub const I32X4_SHR_S: u32 = 0xac;
+    pub const I32X4_SHR_U: u32 = 0xad;
+    pub const I32X4_ADD: u32 = 0xae;
+    pub const I32X4_SUB: u32 = 0xb1;
+    pub const I32X4_MUL: u32 = 0xb5;
+    pub const I32X4_MIN_S: u32 = 0xb6;
+    pub const I32X4_MIN_U: u32 = 0xb7;
+    pub const I32X4_MAX_S: u32 = 0xb8;
+    pub const I32X4_MAX_U: u32 = 0xb9;
+    pub const I64X2_ABS: u32 = 0xc0;
+    pub const I64X2_NEG: u32 = 0xc1;
+    pub const I64X2_ALL_TRUE: u32 = 0xc3;
+    pub const I64X2_BITMASK: u32 = 0xc4;
+    pub const I64X2_EXTEND_LOW_I32X4_S: u32 = 0xc7;
+    pub const I64X2_EXTEND_HIGH_I32X4_S: u32 = 0xc8;
+    pub const I64X2_EXTEND_LOW_I32X4_U: u32 = 0xc9;
+    pub const I64X2_EXTEND_HIGH_I32X4_U: u32 = 0xca;
+    pub const I64X2_SHL: u32 = 0xcb;
+    pub const I64X2_SHR_S: u32 = 0xcc;
+    pub const I64X2_SHR_U: u32 = 0xcd;
+    pub const I64X2_ADD: u32 = 0xce;
+    pub const I64X2_SUB: u32 = 0xd1;
+    pub const I64X2_MUL: u32 = 0xd5;
+    pub const I64X2_EQ: u32 = 0xd6;
+    pub const I64X2_LT_S: u32 = 0xd8;
+    pub const I64X2_GT_S: u32 = 0xd9;
+    pub const F32X4_ABS: u32 = 0xe0;
+    pub const F32X4_NEG: u32 = 0xe1;
+    pub const F32X4_SQRT: u32 = 0xe3;
+    pub const F32X4_ADD: u32 = 0xe4;
+    pub const F32X4_SUB: u32 = 0xe5;
+    pub const F32X4_MUL: u32 = 0xe6;
+    pub const F32X4_DIV: u32 = 0xe7;
+    pub const F32X4_MIN: u32 = 0xe8;
+    pub const F32X4_MAX: u32 = 0xe9;
+    pub const F32X4_PMIN: u32 = 0xea;
+    pub const F32X4_PMAX: u32 = 0xeb;
+    pub const F64X2_ABS: u32 = 0xec;
+    pub const F64X2_NEG: u32 = 0xed;
+    pub const F64X2_SQRT: u32 = 0xef;
+    pub const F64X2_ADD: u32 = 0xf0;
+    pub const F64X2_SUB: u32 = 0xf1;
+    pub const F64X2_MUL: u32 = 0xf2;
+    pub const F64X2_DIV: u32 = 0xf3;
+    pub const F64X2_MIN: u32 = 0xf4;
+    pub const F64X2_MAX: u32 = 0xf5;
+    pub const I32X4_TRUNC_SAT_F32X4_S: u32 = 0xf8;
+    pub const I32X4_TRUNC_SAT_F32X4_U: u32 = 0xf9;
+    pub const F32X4_CONVERT_I32X4_S: u32 = 0xfa;
+    pub const F32X4_CONVERT_I32X4_U: u32 = 0xfb;
+    pub const I32X4_TRUNC_SAT_F64X2_S_ZERO: u32 = 0xfc;
+    pub const I32X4_TRUNC_SAT_F64X2_U_ZERO: u32 = 0xfd;
+    pub const F64X2_CONVERT_LOW_I32X4_S: u32 = 0xfe;
+    pub const F64X2_CONVERT_LOW_I32X4_U: u32 = 0xff;
 }
 
 #[derive(Default)]
@@ -219,6 +448,40 @@ impl Func {
         self.body.push(o);
         uleb(&mut self.body, align_log2 as u64);
         uleb(&mut self.body, offset);
+        self
+    }
+    /// A `0xfd`-prefixed SIMD instruction.
+    pub fn simd(&mut self, op: u32) -> &mut Self {
+        self.body.push(0xfd);
+        uleb(&mut self.body, op as u64);
+        self
+    }
+    pub fn simd_mem(&mut self, op: u32, align_log2: u32, offset: u64) -> &mut Self {
+        self.simd(op);
+        uleb(&mut self.body, align_log2 as u64);
+        uleb(&mut self.body, offset);
+        self
+    }
+    pub fn simd_mem_lane(&mut self, op: u32, align_log2: u32, offset: u64, lane: u8) -> &mut Self {
+        self.simd(op);
+        uleb(&mut self.body, align_log2 as u64);
+        uleb(&mut self.body, offset);
+        self.body.push(lane);
+        self
+    }
+    pub fn simd_lane(&mut self, op: u32, lane: u8) -> &mut Self {
+        self.simd(op);
+        self.body.push(lane);
+        self
+    }
+    pub fn sat(&mut self, op: u32) -> &mut Self {
+        self.body.push(0xfc);
+        uleb(&mut self.body, op as u64);
+        self
+    }
+    pub fn v128c(&mut self, bytes: [u8; 16]) -> &mut Self {
+        self.simd(simd::V128_CONST);
+        self.body.extend_from_slice(&bytes);
         self
     }
     pub fn wrap_i64(&mut self) -> &mut Self {

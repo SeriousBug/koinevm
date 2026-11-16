@@ -22,16 +22,26 @@ use crate::wasm::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 pub const NR: u32 = 33; // x0..x30 (0..30), sp (31), nzcv (32)
-/// Parameter 33 of a region is the block index to start at, so a guest return can resume at any
-/// block rather than only at the region entry.
-pub const P_ENTRY: u32 = 33;
-pub const L_PC: u32 = 34;
-pub const L_T0: u32 = 35;
-pub const L_T1: u32 = 36;
-pub const L_T2: u32 = 37;
-pub const L_T3: u32 = 38;
-pub const L_T4: u32 = 39;
-pub const L_TI: u32 = 40;
+/// v0..v31, the SIMD/FP register file: 128-bit values, first vector parameter at NVEC0.
+pub const NVEC: u32 = 32;
+pub const NVEC0: u32 = NR; // 33
+/// The last parameter of a region is the block index to start at, so a guest return can resume at
+/// any block rather than only at the region entry.
+pub const P_ENTRY: u32 = NR + NVEC; // 65
+pub const L_PC: u32 = P_ENTRY + 1; // 66
+pub const L_T0: u32 = L_PC + 1;
+pub const L_T1: u32 = L_T0 + 1;
+pub const L_T2: u32 = L_T1 + 1;
+pub const L_T3: u32 = L_T2 + 1;
+pub const L_T4: u32 = L_T3 + 1;
+pub const L_TI: u32 = L_T4 + 1;
+/// Two 128-bit scratch values for the sequences that need more than one vector live at a time.
+pub const L_V0: u32 = L_TI + 1;
+pub const L_V1: u32 = L_V0 + 1;
+pub const L_V2: u32 = L_V1 + 1;
+pub const L_V3: u32 = L_V2 + 1;
+/// Where the trace writes the vector file, one 16-byte value per register.
+pub const SHADOW_V0: u64 = 0x600;
 
 pub const SHADOW: u64 = 0x0;
 pub const SHADOW_SP: u64 = SHADOW + 31 * 8;
@@ -41,6 +51,17 @@ pub const SHADOW_TP: u64 = SHADOW_PC + 8;
 /// Trace mode ring buffer of dispatched guest pcs: a count at RING_IDX and 256 slots at RING.
 pub const RING_IDX: u64 = 0x1fc;
 pub const RING: u64 = 0x200;
+/// FPCR and FPSR live where a guest read returns what a guest write put there.
+pub const SHADOW_FPCR: u64 = 0x120;
+pub const SHADOW_FPSR: u64 = 0x128;
+/// What the guest is told about the machine. DCZID_EL0 has DZP set, so no `dc zva` in `memset`.
+/// The cache line is 64 bytes. ID registers describe plain AArch64 with FP and ASIMD, and no LSE,
+/// no crypto, no SVE.
+pub const CTR_EL0_VALUE: u64 = 0x8444_c004;
+pub const DCZID_EL0_VALUE: u64 = 0x10;
+pub const MIDR_EL1_VALUE: u64 = 0x410f_d034;
+pub const ID_AA64PFR0_VALUE: u64 = 0x0000_0000_00ff_0011;
+pub const ID_AA64ISAR0_VALUE: u64 = 0;
 /// End of the control block. Everything below IMAGE_BASE is engine memory the guest never sees.
 pub const ENGINE_HI: u64 = 0x1000;
 
@@ -85,6 +106,9 @@ pub struct Config {
     pub mem_pages: u32,
     /// Write the register shadow on every dispatch, so a trap can report guest state.
     pub trace: bool,
+    /// Translate what decodes and trap at what does not, instead of refusing the whole image. This
+    /// is how `scan` measures the gap, and how a run gets far enough to say what it is missing.
+    pub allow_undefined: bool,
 }
 
 struct Block {
@@ -355,13 +379,16 @@ pub fn translate(
     m.mem_pages = cfg.mem_pages;
 
     let mut region_params = vec![I64; NR as usize];
+    region_params.extend(vec![V128; NVEC as usize]);
     region_params.push(I32); // entry block
     let mut region_results = vec![I64; NR as usize];
+    region_results.extend(vec![V128; NVEC as usize]);
     region_results.push(I32);
     let ty_region = m.ty(region_params, region_results);
     let ty_syscall = m.ty(vec![I64; 7], vec![I64, I32]);
     let ty_trap = m.ty(vec![I32, I64, I32], vec![]);
     let ty_ii_i64 = m.ty(vec![I64, I64], vec![I64]);
+    let ty_i_i64 = m.ty(vec![I64], vec![I64]);
     let ty_run = m.ty(vec![I32, I64], vec![I32]);
 
     m.imports.push(Import { module: "env".into(), name: "syscall".into(), ty: ty_syscall });
@@ -384,9 +411,9 @@ pub fn translate(
         smulh: smulh_id,
         udiv: emit_udiv(&mut m, ty_ii_i64),
         sdiv: emit_sdiv(&mut m, ty_ii_i64),
-        bswap64: emit_bswap(&mut m, ty_ii_i64, 64),
-        bswap32: emit_bswap(&mut m, ty_ii_i64, 32),
-        rbit64: emit_rbit(&mut m, ty_ii_i64),
+        bswap64: emit_bswap(&mut m, ty_i_i64, 64),
+        bswap32: emit_bswap(&mut m, ty_i_i64, 32),
+        rbit64: emit_rbit(&mut m, ty_i_i64),
         ty_region,
     };
 
@@ -403,6 +430,7 @@ pub fn translate(
         stack_floor,
         bounds_check: cfg.bounds_check,
         trace: cfg.trace,
+        allow_undefined: cfg.allow_undefined,
         mem_size,
     };
 
@@ -416,9 +444,9 @@ pub fn translate(
         }
     }
     let mut instructions = 0usize;
-    let mut unsupported = Vec::new();
+    let mut unsupported: Vec<(u64, String)> = Vec::new();
     for (i, region) in regions.iter().enumerate() {
-        let body = RegionEmitter::new(region, &layout, &ids).emit()?;
+        let body = RegionEmitter::new(region, &layout, &ids, &mut unsupported).emit()?;
         instructions += region.blocks.iter().map(|b| b.insns.len()).sum::<usize>();
         *m.func_mut(region_func_ids[i]) = body;
     }
@@ -467,6 +495,7 @@ struct Layout {
     stack_floor: u64,
     bounds_check: bool,
     trace: bool,
+    allow_undefined: bool,
     mem_size: u64,
 }
 
@@ -816,14 +845,14 @@ fn emit_sdiv(m: &mut Module, ty: u32) -> u32 {
 fn emit_bswap(m: &mut Module, ty: u32, bits: u32) -> u32 {
     let id = m.add_func(ty);
     let f = m.func_mut(id);
-    f.locals = vec![I64; 1]; // 2 = accumulator
+    f.locals = vec![I64; 1]; // 1 = accumulator, since the only parameter is 0
     let bytes = bits / 8;
     f.i64c(0);
-    f.ls(2);
+    f.ls(1);
     for i in 0..bytes {
         let mask_shift = i * 8;
         let out_shift = (bytes - 1 - i) * 8;
-        f.lg(2);
+        f.lg(1);
         f.lg(0);
         f.i64c(mask_shift as i64);
         f.op(I64_SHR_U);
@@ -834,9 +863,9 @@ fn emit_bswap(m: &mut Module, ty: u32, bits: u32) -> u32 {
             f.op(I64_SHL);
         }
         f.op(I64_OR);
-        f.ls(2);
+        f.ls(1);
     }
-    f.lg(2);
+    f.lg(1);
     if bits == 32 {
         f.i64c(0xffff_ffff);
         f.op(I64_AND);
@@ -848,31 +877,31 @@ fn emit_bswap(m: &mut Module, ty: u32, bits: u32) -> u32 {
 fn emit_rbit(m: &mut Module, ty: u32) -> u32 {
     let id = m.add_func(ty);
     let f = m.func_mut(id);
-    f.locals = vec![I64; 2]; // 2 = x, 3 = reversed bytes
+    f.locals = vec![I64; 2]; // 1 = x, 2 = reversed bytes (the only parameter is 0)
     f.lg(0);
-    f.ls(2);
+    f.ls(1);
     for (shift, mask) in [(1i64, 0x5555_5555_5555_5555u64), (2, 0x3333_3333_3333_3333), (4, 0x0f0f_0f0f_0f0f_0f0f)] {
-        f.lg(2);
+        f.lg(1);
         f.i64c(shift);
         f.op(I64_SHR_U);
         f.i64c(mask as i64);
         f.op(I64_AND);
-        f.lg(2);
+        f.lg(1);
         f.i64c(mask as i64);
         f.op(I64_AND);
         f.i64c(shift);
         f.op(I64_SHL);
         f.op(I64_OR);
-        f.ls(2);
+        f.ls(1);
     }
     // reverse the byte order of the swapped value
     f.i64c(0);
-    f.ls(3);
+    f.ls(1);
     for i in 0..8 {
         let mask_shift = i * 8;
         let out_shift = (7 - i) * 8;
-        f.lg(3);
-        f.lg(2);
+        f.lg(1);
+        f.lg(1);
         f.i64c(mask_shift as i64);
         f.op(I64_SHR_U);
         f.i64c(0xff);
@@ -882,9 +911,9 @@ fn emit_rbit(m: &mut Module, ty: u32) -> u32 {
             f.op(I64_SHL);
         }
         f.op(I64_OR);
-        f.ls(3);
+        f.ls(1);
     }
-    f.lg(3);
+    f.lg(1);
     id
 }
 
@@ -902,6 +931,8 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     f.locals.push(I32); // want tag: key + 1 -> 39
     f.locals.push(I64); // dispatch slot -> 40
     f.locals.push(I32); // slot address -> 41
+    f.locals.extend(vec![V128; NVEC as usize]); // v0..v31 -> 42..73
+    const V0: u32 = 42;
 
     for i in 0..31u32 {
         f.i64c(0);
@@ -909,6 +940,10 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     }
     f.i64c(0);
     f.ls(33);
+    for i in 0..NVEC {
+        f.v128c([0; 16]);
+        f.ls(V0 + i);
+    }
 
     f.block(); // $exit, depth from inside the loop's ifs = 2
     f.loop_();
@@ -921,6 +956,11 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
         f.i32c(SHADOW_SP as i32);
         f.lg(1);
         f.mem(I64_STORE, 3, 0);
+        for i in 0..NVEC {
+            f.i32c((SHADOW_V0 + i as u64 * 16) as i32);
+            f.lg(V0 + i);
+            f.simd_mem(simd::V128_STORE, 4, 0);
+        }
         f.i32c(SHADOW_PC as i32);
         f.lg(0);
         f.mem(I32_STORE, 2, 0);
@@ -1033,6 +1073,9 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     }
     f.lg(1); // sp
     f.lg(33); // nzcv
+    for i in 0..NVEC {
+        f.lg(V0 + i);
+    }
     f.lg(37); // entry block
     f.lg(34); // table slot, popped by call_indirect last
     f.op(CALL_INDIRECT);
@@ -1040,6 +1083,9 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     uleb(&mut f.body, 0);
 
     f.ls(35); // next
+    for i in (0..NVEC).rev() {
+        f.ls(V0 + i);
+    }
     f.ls(33); // nzcv
     f.ls(1); // sp
     for i in (0..31u32).rev() {
@@ -1069,6 +1115,11 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     f.i32c(SHADOW_SP as i32);
     f.lg(1);
     f.mem(I64_STORE, 3, 0);
+    for i in 0..NVEC {
+        f.i32c((SHADOW_V0 + i as u64 * 16) as i32);
+        f.lg(V0 + i);
+        f.simd_mem(simd::V128_STORE, 4, 0);
+    }
     f.i32c(SHADOW_NZCV as i32);
     f.lg(33);
     f.mem(I64_STORE, 3, 0);
@@ -1079,6 +1130,234 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     f
 }
 
+
+
+/// All ones in the low 64 bits and zeros above: what a D-register operation writes.
+fn low_half_mask() -> [u8; 16] {
+    let mut out = [0xffu8; 16];
+    for b in 8..16 {
+        out[b] = 0;
+    }
+    out
+}
+
+/// A per-lane mask of the low `bits` bits, for the insert-style shifts.
+fn low_bits_mask(esize: u32, bits: u32) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let lane_bytes = (esize / 8) as usize;
+    let masked = if bits >= esize { u64::MAX } else { (1u64 << bits) - 1 };
+    for lane in 0..(16 / lane_bytes) {
+        for b in 0..lane_bytes {
+            out[lane * lane_bytes + b] = ((masked >> (8 * b)) & 0xff) as u8;
+        }
+    }
+    out
+}
+
+/// A per-lane constant, used for the rounding bias of a rounding narrowing shift.
+fn round_mask(esize: u32, value: u32) -> [u8; 16] {
+    low_bits_mask(esize, 32)
+        .iter()
+        .enumerate()
+        .map(|(i, _)| if i % (esize / 8) as usize == 0 { value as u8 } else { 0 })
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap()
+}
+
+/// The byte shuffle for zip1/zip2/uzp1/uzp2/trn1/trn2 at one element width.
+fn permute_mask(size: u32, op: u32) -> Option<[u8; 16]> {
+    let lane = 1u32 << size;
+    let lanes = 16 / lane;
+    let half = lanes / 2;
+    let mut m = [0u8; 16];
+    let mut put = |dst_lane: u32, src_lane: u32, from_b: bool| {
+        for b in 0..lane {
+            m[(dst_lane * lane + b) as usize] =
+                (src_lane * lane + b) as u8 + if from_b { 16 } else { 0 };
+        }
+    };
+    match op {
+        0b00111 => {
+            // zip1: interleave the low halves
+            for i in 0..half {
+                put(i * 2, i, false);
+                put(i * 2 + 1, i, true);
+            }
+        }
+        0b01111 => {
+            // zip2: interleave the high halves
+            for i in 0..half {
+                put(i * 2, half + i, false);
+                put(i * 2 + 1, half + i, true);
+            }
+        }
+        0b00011 => {
+            // uzp1: the even lanes of both
+            for i in 0..half {
+                put(i, i * 2, false);
+                put(half + i, i * 2, true);
+            }
+        }
+        0b01011 => {
+            // uzp2: the odd lanes of both
+            for i in 0..half {
+                put(i, i * 2 + 1, false);
+                put(half + i, i * 2 + 1, true);
+            }
+        }
+        0b00101 => {
+            // trn1: even lanes interleaved
+            for i in 0..half {
+                put(i * 2, i * 2, false);
+                put(i * 2 + 1, i * 2, true);
+            }
+        }
+        0b01101 => {
+            // trn2: odd lanes interleaved
+            for i in 0..half {
+                put(i * 2, i * 2 + 1, false);
+                put(i * 2 + 1, i * 2 + 1, true);
+            }
+        }
+        _ => return None,
+    }
+    Some(m)
+}
+
+
+/// Reverse the element order within each 64-bit half, for the element width `size` codes.
+fn rev64_mask(size: u32) -> [u8; 16] {
+    let lane = 1u32 << size;
+    let per_half = 8 / lane;
+    let mut m = [0u8; 16];
+    for half in 0..2 {
+        for i in 0..per_half {
+            for b in 0..lane {
+                m[(half * 8 + i * lane + b) as usize] = (half * 8 + (per_half - 1 - i) * lane + b) as u8;
+            }
+        }
+    }
+    m
+}
+
+/// Reverse the bytes of every group of `group` bytes.
+fn rev_group_mask(group: u32) -> [u8; 16] {
+    let mut m = [0u8; 16];
+    let groups = 16 / group;
+    for g in 0..groups {
+        for b in 0..group {
+            m[(g * group + b) as usize] = (g * group + (group - 1 - b)) as u8;
+        }
+    }
+    m
+}
+
+// ---------------------------------------------------------------- SIMD shuffle masks
+//
+// The wasm shuffle takes a byte index per result byte: 0..15 selects from the first operand, 16..31
+// from the second. These build the index patterns a NEON operation needs, at translate time.
+
+/// Even lanes of both operands, then odd lanes of both: the layout of a pairwise operation.
+fn pair_masks(size: u32) -> ([u8; 16], [u8; 16]) {
+    let lane = 1u32 << size;
+    let half = (16 / lane) / 2;
+    let mut even = [0u8; 16];
+    let mut odd = [0u8; 16];
+    for i in 0..half {
+        for b in 0..lane {
+            even[((i * lane) + b) as usize] = ((i * 2 * lane) + b) as u8;
+            even[(((half + i) * lane) + b) as usize] = (16 + (i * 2 * lane) + b) as u8;
+            odd[((i * lane) + b) as usize] = (((i * 2 + 1) * lane) + b) as u8;
+            odd[(((half + i) * lane) + b) as usize] = (16 + ((i * 2 + 1) * lane) + b) as u8;
+        }
+    }
+    (even, odd)
+}
+
+/// Move lanes `width..2*width` down onto `0..width`, for one step of a reduction.
+fn halve_mask(size: u32, width: u32) -> [u8; 16] {
+    let lane = 1u32 << size;
+    let mut m = [0u8; 16];
+    for j in 0..width {
+        for b in 0..lane {
+            m[((j * lane) + b) as usize] = (((j + width) * lane) + b) as u8;
+        }
+    }
+    m
+}
+
+/// The low half of every source lane, packed into result bytes 8..16.
+fn narrow_mask(size: u32) -> [u8; 16] {
+    let dlane = 1u32 << size;
+    let dlanes = 8 / dlane;
+    let mut m = [0u8; 16];
+    for b in 0..8 {
+        m[b as usize] = b as u8;
+    }
+    for j in 0..dlanes {
+        for b in 0..dlane {
+            m[(8 + j * dlane + b) as usize] = (16 + j * 2 * dlane + b) as u8;
+        }
+    }
+    m
+}
+
+
+/// The high byte of every lane: what a narrowing add takes from a wider sum.
+fn high_half_mask(size: u32) -> [u8; 16] {
+    let slane = 1u32 << size;
+    let lanes = 16 / slane;
+    let mut m = [0u8; 16];
+    for b in 0..8 {
+        m[b as usize] = b as u8;
+    }
+    for j in 0..lanes {
+        for b in 0..(slane / 2) {
+            m[(8 + j * (slane / 2) + b) as usize] = (16 + j * slane + slane / 2 + b) as u8;
+        }
+    }
+    m
+}
+
+/// The 128-bit value of a `movi`/`mvni`, built at translate time from the modified immediate fields.
+fn modified_immediate(q: bool, op: bool, cmode: u32, imm8: u32) -> [u8; 16] {
+    let bytes = 8 * (2 - q as usize); // bytes the instruction writes: 16 for a Q register, 8 for D
+    let mut out = [0u8; 16];
+    let (lane, shift) = match cmode {
+        0b0000 => (4, 0),
+        0b0010 => (4, 8),
+        0b0100 => (4, 16),
+        0b0110 => (4, 24),
+        0b1000 => (2, 0),
+        0b1010 => (2, 8),
+        0b1100 => (4, 8),
+        0b1101 => (4, 16),
+        0b1110 => (0, 0), // 8-bit lanes, or the 64-bit form when Q is clear
+        0b1111 => (0, 0),
+        _ => (1, 0),
+    };
+    if lane == 0 && !q {
+        // 64-bit MOVI: each bit of imm8 becomes a byte of all ones or all zeros.
+        for i in 0..8 {
+            let bit = (imm8 >> i) & 1;
+            out[i] = if op { !(bit as u8) } else { bit as u8 } * 0xff;
+        }
+        if op {
+            for i in 0..8 {
+                out[i] = if (imm8 >> i) & 1 == 1 { 0x00 } else { 0xff };
+            }
+        }
+        return out;
+    }
+    let width = if lane == 0 { 1 } else { lane as usize };
+    let pattern = (imm8 as u64) << shift;
+    for i in 0..bytes {
+        let byte = ((pattern >> (8 * (i % width))) & 0xff) as u8;
+        out[i] = if op { !byte } else { byte };
+    }
+    out
+}
 // ---------------------------------------------------------------- region bodies
 //
 // Invariant: a register local always holds the architecturally correct 64-bit value, so the top 32
@@ -1090,15 +1369,21 @@ struct RegionEmitter<'a> {
     region: &'a Region,
     layout: &'a Layout,
     ids: &'a Ids,
+    unsupported: &'a mut Vec<(u64, String)>,
     open: u32,
     cur_pc: u64,
 }
 
 impl<'a> RegionEmitter<'a> {
-    fn new(region: &'a Region, layout: &'a Layout, ids: &'a Ids) -> Self {
+    fn new(
+        region: &'a Region,
+        layout: &'a Layout,
+        ids: &'a Ids,
+        unsupported: &'a mut Vec<(u64, String)>,
+    ) -> Self {
         let mut f = Func::new(ids.ty_region);
-        f.locals = vec![I32, I64, I64, I64, I64, I64, I32];
-        RegionEmitter { f, region, layout, ids, open: 0, cur_pc: 0 }
+        f.locals = vec![I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128];
+        RegionEmitter { f, region, layout, ids, unsupported, open: 0, cur_pc: 0 }
     }
 
     fn emit(mut self) -> Result<Func, String> {
@@ -1252,6 +1537,9 @@ impl<'a> RegionEmitter<'a> {
     fn begin_return(&mut self) {
         for r in 0..NR {
             self.f.lg(r);
+        }
+        for r in 0..NVEC {
+            self.f.lg(NVEC0 + r);
         }
     }
 
@@ -1623,6 +1911,185 @@ impl<'a> RegionEmitter<'a> {
         self.close_if();
     }
 
+
+    // ---- SIMD and floating point
+
+    fn getv(&mut self, r: u32) {
+        self.f.lg(NVEC0 + r);
+    }
+
+    fn setv(&mut self, r: u32) {
+        self.f.ls(NVEC0 + r);
+    }
+
+    /// A vector register read into a scratch local, so a second read can follow.
+    fn savev(&mut self, r: u32, tmp: u32) {
+        self.getv(r);
+        self.f.ls(tmp);
+    }
+
+    fn vload(&mut self, width: u32, addr: u32, rt: u32) {
+        self.check_byte(addr, width as u64);
+        match width {
+            16 | 8 | 4 => {
+                self.f.lg(addr);
+                self.f.wrap_i64();
+                let op = match width {
+                    16 => simd::V128_LOAD,
+                    8 => simd::V128_LOAD64_ZERO,
+                    _ => simd::V128_LOAD32_ZERO,
+                };
+                self.f.simd_mem(op, width.trailing_zeros(), 0);
+            }
+            _ => {
+                self.f.v128c([0; 16]);
+                self.f.lg(addr);
+                self.f.wrap_i64();
+                if width == 2 {
+                    self.f.mem(I32_LOAD16_U, 1, 0);
+                } else {
+                    self.f.mem(I32_LOAD8_U, 0, 0);
+                }
+                self.f.simd_lane(simd::I32X4_REPLACE_LANE, 0);
+            }
+        }
+        self.setv(rt);
+    }
+
+    fn vstore(&mut self, width: u32, addr: u32, rt: u32) {
+        self.check_byte(addr, width as u64);
+        self.f.lg(addr);
+        self.f.wrap_i64();
+        match width {
+            16 => {
+                self.getv(rt);
+                self.f.simd_mem(simd::V128_STORE, 4, 0);
+            }
+            8 => {
+                self.getv(rt);
+                self.f.simd_mem_lane(simd::V128_STORE64_LANE, 3, 0, 0);
+            }
+            4 => {
+                self.getv(rt);
+                self.f.simd_mem_lane(simd::V128_STORE32_LANE, 2, 0, 0);
+            }
+            2 => {
+                self.getv(rt);
+                self.f.simd_lane(simd::I16X8_EXTRACT_LANE_U, 0);
+                self.f.mem(I32_STORE16, 1, 0);
+            }
+            _ => {
+                self.getv(rt);
+                self.f.simd_lane(simd::I8X16_EXTRACT_LANE_U, 0);
+                self.f.mem(I32_STORE8, 0, 0);
+            }
+        }
+    }
+
+    /// Writeback of the addressing-mode increment for the paired and multi-register forms.
+    fn writeback(&mut self, rn: u32, base: u32, add: i64) {
+        self.f.lg(base);
+        if add != 0 {
+            self.f.i64c(add);
+            self.f.op(I64_ADD);
+        }
+        self.f.ls(rn);
+    }
+
+    /// Store a value already in a scratch local into a guest register, honouring the zero register.
+    fn set_loaded(&mut self, r: u32, tmp: u32) {
+        if r == 31 {
+            return;
+        }
+        self.f.lg(tmp);
+        self.f.ls(r);
+    }
+
+    /// A single `v128` op with two vector sources and a vector destination.
+    fn vec3(&mut self, rn: u32, rm: u32, rd: u32, op: u32) {
+        self.getv(rn);
+        self.getv(rm);
+        self.f.simd(op);
+        self.setv(rd);
+    }
+
+    fn vec2(&mut self, rn: u32, rd: u32, op: u32) {
+        self.getv(rn);
+        self.f.simd(op);
+        self.setv(rd);
+    }
+
+    /// Element width code (0..3) to the matching wasm lane opcode, so one table can serve all sizes.
+    fn lanes_op(&self, size: u32, ops: [u32; 4]) -> Option<u32> {
+        if size > 3 {
+            None
+        } else {
+            Some(ops[size as usize])
+        }
+    }
+
+    /// Byte shuffle of two operands: `mask` holds 16 lane indices, 0..15 from `a`, 16..31 from `b`.
+    fn shuffle(&mut self, a: u32, b: u32, mask: [u8; 16]) {
+        self.f.lg(a);
+        self.f.lg(b);
+        self.f.simd(simd::I8X16_SHUFFLE);
+        self.f.body.extend_from_slice(&mask);
+    }
+
+    /// A pairwise operation across adjacent lanes: `pairs(a)` in the low half, `pairs(b)` in the high.
+    fn vec_pairwise(&mut self, size: u32, op: u32, rn: u32, rm: u32, rd: u32) {
+        let (even, odd) = pair_masks(size);
+        self.shuffle(NVEC0 + rn, NVEC0 + rm, even);
+        self.f.ls(L_V0);
+        self.shuffle(NVEC0 + rn, NVEC0 + rm, odd);
+        self.f.ls(L_V1);
+        self.f.lg(L_V0);
+        self.f.lg(L_V1);
+        self.f.simd(op);
+        self.setv(rd);
+    }
+
+    /// A reduction across all lanes, confined to the element width and left in lane 0.
+    fn vec_across(&mut self, size: u32, op: u32, rn: u32, rd: u32) {
+        self.getv(rn);
+        self.f.ls(L_V0);
+        let lanes = 16u32 >> size;
+        let mut width = lanes;
+        while width > 1 {
+            width /= 2;
+            let mask = halve_mask(size, width);
+            self.f.lg(L_V0);
+            self.f.lg(L_V0);
+            self.f.simd(simd::I8X16_SHUFFLE);
+            self.f.body.extend_from_slice(&mask);
+            self.f.ls(L_V1);
+            self.f.lg(L_V0);
+            self.f.lg(L_V1);
+            self.f.simd(op);
+            self.f.ls(L_V0);
+        }
+        self.f.lg(L_V0);
+        self.setv(rd);
+    }
+
+    /// Narrow a vector to half-width lanes, packed into the low 8 bytes and zeroing (XTN) or keeping
+    /// (XTN2) the upper half.
+    fn vec_narrow(&mut self, size: u32, src: u32, dst: u32, into_high: bool) {
+        let mask = narrow_mask(size);
+        if into_high {
+            self.getv(dst);
+            self.f.ls(L_V0);
+            self.f.lg(L_V0);
+            self.f.lg(src);
+        } else {
+            self.f.v128c([0; 16]);
+            self.f.lg(src);
+        }
+        self.f.simd(simd::I8X16_SHUFFLE);
+        self.f.body.extend_from_slice(&mask);
+        self.setv(dst);
+    }
+
     fn emit_load(&mut self, addr: u32, size: u32, opc: u32, rt: u32) {
         self.check_byte(addr, 1u64 << size);
         self.f.lg(addr);
@@ -1702,6 +2169,11 @@ impl<'a> RegionEmitter<'a> {
                 self.f.lg(r);
                 self.f.mem(I64_STORE, 3, 0);
             }
+            for r in 0..NVEC {
+                self.f.i32c((SHADOW_V0 + r as u64 * 16) as i32);
+                self.f.lg(NVEC0 + r);
+                self.f.simd_mem(simd::V128_STORE, 4, 0);
+            }
             self.f.i32c(SHADOW_PC as i32);
             self.f.i32c(addr as i32);
             self.f.mem(I32_STORE, 2, 0);
@@ -1712,9 +2184,16 @@ impl<'a> RegionEmitter<'a> {
         match insn {
             Insn::Hint => {}
             Insn::Undefined => {
-                let raw = u32::from_le_bytes([0, 0, 0, 0]);
-                let _ = raw;
-                return Err(format!("unsupported instruction at 0x{addr:x}"));
+                let why = format!("undecoded instruction at 0x{addr:x}");
+                self.unsupported.push((addr, why.clone()));
+                if !self.layout.allow_undefined {
+                    return Err(why);
+                }
+                self.f.i32c(3);
+                self.f.i64c(addr as i64);
+                self.f.i32c(addr as i32);
+                self.f.call(self.ids.trap);
+                self.f.op(UNREACHABLE);
             }
             Insn::Adr { rd, imm } => {
                 if rd != 31 {
@@ -2021,6 +2500,36 @@ impl<'a> RegionEmitter<'a> {
                 }
                 self.set(rd, sf);
             }
+            Insn::MulLong { signed, sub, rm, ra, rn, rd } => {
+                // Widen the 32-bit operands to 64: a mask for unsigned, a shift pair for signed,
+                // because the sign-extending wasm opcodes are one instruction each but the shift
+                // pair works for both widths without another table.
+                let widen = |e: &mut Self| {
+                    if signed {
+                        e.f.i64c(32);
+                        e.f.op(I64_SHL);
+                        e.f.i64c(32);
+                        e.f.op(I64_SHR_S);
+                    } else {
+                        e.f.i64c(0xffff_ffff);
+                        e.f.op(I64_AND);
+                    }
+                };
+                self.get(rn, true);
+                widen(self);
+                self.f.ls(L_T1);
+                self.get(rm, true);
+                widen(self);
+                self.f.ls(L_T2);
+                self.f.lg(L_T1);
+                self.f.lg(L_T2);
+                self.f.op(I64_MUL);
+                self.f.ls(L_T0);
+                self.get(ra, true);
+                self.f.lg(L_T0);
+                self.f.op(if sub { I64_SUB } else { I64_ADD });
+                self.set(rd, true);
+            }
             Insn::MulHigh { sf, signed, rn, rm, rd } => {
                 if !sf {
                     return Err(format!("smulh/umulh only exist in 64-bit form at 0x{addr:x}"));
@@ -2306,6 +2815,904 @@ impl<'a> RegionEmitter<'a> {
                 if self.f.body.last() == Some(&UNREACHABLE) {}
                 self.f.lg(L_T0);
                 self.f.ls(0);
+            }
+            Insn::CacheOp => {}
+            Insn::MsrSys { reg, rn } => match reg {
+                SysReg::Nzcv => {
+                    if rn == 31 {
+                        self.f.i64c(0);
+                    } else {
+                        self.f.lg(rn);
+                    }
+                    self.f.ls(32);
+                }
+                SysReg::TpidrEl0 | SysReg::TpidrroEl0 => {
+                    self.f.i32c(SHADOW_TP as i32);
+                    if rn == 31 {
+                        self.f.i64c(0);
+                    } else {
+                        self.f.lg(rn);
+                    }
+                    self.f.mem(I64_STORE, 3, 0);
+                }
+                // FPCR and FPSR are stored so a read returns what was written; nothing acts on
+                // them yet, which means FP rounding stays at the default.
+                SysReg::Fpcr | SysReg::Fpsr => {
+                    let at = if reg == SysReg::Fpcr { SHADOW_FPCR } else { SHADOW_FPSR };
+                    self.f.i32c(at as i32);
+                    if rn == 31 {
+                        self.f.i64c(0);
+                    } else {
+                        self.f.lg(rn);
+                    }
+                    self.f.mem(I64_STORE, 3, 0);
+                }
+                _ => {}
+            },
+            Insn::MrsSys { reg, rd } => {
+                match reg {
+                    SysReg::Nzcv => {
+                        self.f.lg(32);
+                    }
+                    SysReg::Fpcr | SysReg::Fpsr => {
+                        let at = if reg == SysReg::Fpcr { SHADOW_FPCR } else { SHADOW_FPSR };
+                        self.f.i32c(at as i32);
+                        self.f.mem(I64_LOAD, 3, 0);
+                    }
+                    SysReg::CtrEl0 => {
+                        self.f.i64c(CTR_EL0_VALUE as i64);
+                    }
+                    SysReg::DczidEl0 => {
+                        self.f.i64c(DCZID_EL0_VALUE as i64);
+                    }
+                    SysReg::MidrEl1 => {
+                        self.f.i64c(MIDR_EL1_VALUE as i64);
+                    }
+                    SysReg::MpidrEl1 => {
+                        self.f.i64c(0x8000_0000);
+                    }
+                    SysReg::CntvctEl0 => {
+                        self.f.i64c(0);
+                    }
+                    SysReg::TpidrEl0 | SysReg::TpidrroEl0 => {
+                        self.f.i32c(SHADOW_TP as i32);
+                        self.f.mem(I64_LOAD, 3, 0);
+                    }
+                    SysReg::IdAa64Pfr0 => {
+                        self.f.i64c(ID_AA64PFR0_VALUE as i64);
+                    }
+                    SysReg::IdAa64Isar0 => {
+                        self.f.i64c(ID_AA64ISAR0_VALUE as i64);
+                    }
+                    SysReg::Unknown => {
+                        let why = format!("mrs of an unknown system register at 0x{addr:x}");
+                        self.unsupported.push((addr, why.clone()));
+                        if !self.layout.allow_undefined {
+                            return Err(why);
+                        }
+                        self.f.i64c(0);
+                    }
+                }
+                if rd != 31 {
+                    self.f.ls(rd);
+                } else {
+                    self.f.op(DROP);
+                }
+            }
+            Insn::Brk => {
+                self.f.i32c(3);
+                self.f.i64c(addr as i64);
+                self.f.i32c(addr as i32);
+                self.f.call(self.ids.trap);
+                self.f.op(UNREACHABLE);
+            }
+
+            Insn::VecLoadStore { width, is_load, mode, offset, rn, rt, rm, option, scaled } => {
+                let mut writeback = None;
+                match mode {
+                    LsMode::Unsigned | LsMode::Unscaled => self.addr_base_off(rn, offset),
+                    LsMode::PreIndex => {
+                        self.addr_base_off(rn, offset);
+                        writeback = Some(0i64);
+                    }
+                    LsMode::PostIndex => {
+                        self.addr_base_off(rn, 0);
+                        writeback = Some(offset);
+                    }
+                    LsMode::Register => {
+                        self.addr_base_reg(rn, rm, option, scaled, width.trailing_zeros())
+                    }
+                }
+                if is_load {
+                    self.vload(width, L_T1, rt);
+                } else {
+                    self.vstore(width, L_T1, rt);
+                }
+                if let Some(extra) = writeback {
+                    self.writeback(rn, L_T1, extra);
+                }
+            }
+            Insn::VecLoadStorePair { width, is_load, mode, offset, rn, rt, rt2 } => {
+                let base_off = if mode == PairMode::PostIndex { 0 } else { offset };
+                self.addr_base_off(rn, base_off);
+                self.f.lg(L_T1);
+                self.f.ls(L_T2);
+                let step = (width / 8) as i64;
+                if is_load {
+                    self.vload(width, L_T1, rt);
+                    self.f.lg(L_T2);
+                    self.f.i64c(step);
+                    self.f.op(I64_ADD);
+                    self.f.ls(L_T1);
+                    self.vload(width, L_T1, rt2);
+                } else {
+                    self.vstore(width, L_T1, rt);
+                    self.f.lg(L_T2);
+                    self.f.i64c(step);
+                    self.f.op(I64_ADD);
+                    self.f.ls(L_T1);
+                    self.vstore(width, L_T1, rt2);
+                }
+                match mode {
+                    PairMode::PostIndex => self.writeback(rn, L_T2, offset),
+                    PairMode::PreIndex => self.writeback(rn, L_T2, offset),
+                    PairMode::Offset => {}
+                }
+            }
+            Insn::VecLd1 { is_load, count, q, post, rn, rt } => {
+                let step: u32 = if q { 16 } else { 8 };
+                self.addr_base_off(rn, 0);
+                self.f.lg(L_T1);
+                self.f.ls(L_T2);
+                for i in 0..count {
+                    if i > 0 {
+                        self.f.lg(L_T1);
+                        self.f.i64c(step as i64);
+                        self.f.op(I64_ADD);
+                        self.f.ls(L_T1);
+                    }
+                    let r = (rt + i) % 32;
+                    if is_load {
+                        self.vload(step, L_T1, r);
+                    } else {
+                        self.vstore(step, L_T1, r);
+                    }
+                }
+                if let Some(index) = post {
+                    match index {
+                        PostIndex::Imm(imm) => self.writeback(rn, L_T2, imm),
+                        PostIndex::Reg(r) => {
+                            self.f.lg(L_T2);
+                            self.get(r, true);
+                            self.f.op(I64_ADD);
+                            self.f.ls(rn);
+                        }
+                    }
+                }
+            }
+            Insn::VecLd1r { q, size, post, rn, rt } => {
+                let bits = 8u32 << size;
+                self.addr_base_off(rn, 0);
+                self.f.lg(L_T1);
+                self.f.ls(L_T2);
+                self.check_byte(L_T1, (bits / 8) as u64);
+                self.f.lg(L_T1);
+                self.f.wrap_i64();
+                let op = match bits {
+                    8 => simd::V128_LOAD8_SPLAT,
+                    16 => simd::V128_LOAD16_SPLAT,
+                    32 => simd::V128_LOAD32_SPLAT,
+                    _ => simd::V128_LOAD64_SPLAT,
+                };
+                self.f.simd_mem(op, size, 0);
+                if !q {
+                    self.f.v128c(low_half_mask());
+                    self.f.simd(simd::V128_AND);
+                }
+                self.setv(rt);
+                if let Some(index) = post {
+                    match index {
+                        PostIndex::Imm(imm) => self.writeback(rn, L_T2, imm),
+                        PostIndex::Reg(r) => {
+                            self.f.lg(L_T2);
+                            self.get(r, true);
+                            self.f.op(I64_ADD);
+                            self.f.ls(rn);
+                        }
+                    }
+                }
+            }
+            Insn::VecModImm { q, op, cmode, imm8, rd } => {
+                let bytes = modified_immediate(q, op, cmode, imm8);
+                self.f.v128c(bytes);
+                self.setv(rd);
+            }
+            Insn::VecThreeSame { q, u, size, op, rn, rm, rd } => {
+                let _ = q;
+                match (u, size, op) {
+                    (false, 0, 0b00011) => self.vec3(rn, rm, rd, simd::V128_AND),
+                    (false, 1, 0b00011) => {
+                        self.savev(rm, L_V0);
+                        self.f.lg(L_V0);
+                        self.f.simd(simd::V128_NOT);
+                        self.f.ls(L_V0);
+                        self.getv(rn);
+                        self.f.lg(L_V0);
+                        self.f.simd(simd::V128_AND);
+                        self.setv(rd);
+                    }
+                    (false, 2, 0b00011) => self.vec3(rn, rm, rd, simd::V128_OR),
+                    (false, 3, 0b00011) => {
+                        self.savev(rm, L_V0);
+                        self.f.lg(L_V0);
+                        self.f.simd(simd::V128_NOT);
+                        self.f.ls(L_V0);
+                        self.getv(rn);
+                        self.f.lg(L_V0);
+                        self.f.simd(simd::V128_OR);
+                        self.setv(rd);
+                    }
+                    (true, 0, 0b00011) => self.vec3(rn, rm, rd, simd::V128_XOR),
+                    (true, 1, 0b00011) => {
+                        self.getv(rn);
+                        self.getv(rm);
+                        self.getv(rd);
+                        self.f.simd(simd::V128_BITSELECT);
+                        self.setv(rd);
+                    }
+                    (true, 2, 0b00011) => {
+                        self.getv(rn);
+                        self.getv(rd);
+                        self.getv(rm);
+                        self.f.simd(simd::V128_BITSELECT);
+                        self.setv(rd);
+                    }
+                    (true, 3, 0b00011) => {
+                        self.getv(rd);
+                        self.getv(rn);
+                        self.getv(rm);
+                        self.f.simd(simd::V128_BITSELECT);
+                        self.setv(rd);
+                    }
+                    (false, _, 0b10000) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_ADD, simd::I16X8_ADD, simd::I32X4_ADD, simd::I64X2_ADD]) {
+                            self.vec3(rn, rm, rd, o);
+                        } else {
+                            return Err(format!("unsupported vector add at 0x{addr:x}"));
+                        }
+                    }
+                    (true, _, 0b10000) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_SUB, simd::I16X8_SUB, simd::I32X4_SUB, simd::I64X2_SUB]) {
+                            self.vec3(rn, rm, rd, o);
+                        } else {
+                            return Err(format!("unsupported vector sub at 0x{addr:x}"));
+                        }
+                    }
+                    (false, 1, 0b10011) => self.vec3(rn, rm, rd, simd::I16X8_MUL),
+                    (false, 2, 0b10011) => self.vec3(rn, rm, rd, simd::I32X4_MUL),
+                    (false, 3, 0b10011) => self.vec3(rn, rm, rd, simd::I64X2_MUL),
+                    (false, _, 0b10010) => {
+                        let mul = self.lanes_op(size, [simd::I8X16_ADD, simd::I16X8_MUL, simd::I32X4_MUL, simd::I64X2_MUL]);
+                        let add = self.lanes_op(size, [simd::I8X16_ADD, simd::I16X8_ADD, simd::I32X4_ADD, simd::I64X2_ADD]);
+                        match (mul, add) {
+                            (Some(m), Some(a)) => {
+                                self.getv(rn);
+                                self.getv(rm);
+                                self.f.simd(m);
+                                self.getv(rd);
+                                self.f.simd(a);
+                                self.setv(rd);
+                            }
+                            _ => return Err(format!("unsupported mla at 0x{addr:x}")),
+                        }
+                    }
+                    (true, _, 0b10010) => {
+                        let mul = self.lanes_op(size, [simd::I8X16_ADD, simd::I16X8_MUL, simd::I32X4_MUL, simd::I64X2_MUL]);
+                        let sub = self.lanes_op(size, [simd::I8X16_SUB, simd::I16X8_SUB, simd::I32X4_SUB, simd::I64X2_SUB]);
+                        match (mul, sub) {
+                            (Some(m), Some(s)) => {
+                                self.getv(rn);
+                                self.getv(rm);
+                                self.f.simd(m);
+                                self.getv(rd);
+                                self.f.simd(s);
+                                self.setv(rd);
+                            }
+                            _ => return Err(format!("unsupported mls at 0x{addr:x}")),
+                        }
+                    }
+                    (true, _, 0b10001) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_EQ, simd::I16X8_EQ, simd::I32X4_EQ, simd::I64X2_EQ]) {
+                            self.vec3(rn, rm, rd, o);
+                        }
+                    }
+                    (false, _, 0b10001) => {
+                        // cmtst: (a & b) != 0, lane by lane.
+                        let and = simd::V128_AND;
+                        let eq = self.lanes_op(size, [simd::I8X16_EQ, simd::I16X8_EQ, simd::I32X4_EQ, simd::I64X2_EQ]);
+                        let Some(eq) = eq else { return Err(format!("unsupported cmtst at 0x{addr:x}")); };
+                        self.getv(rn);
+                        self.getv(rm);
+                        self.f.simd(and);
+                        self.f.v128c([0; 16]);
+                        self.f.simd(eq);
+                        self.f.simd(simd::V128_NOT);
+                        self.setv(rd);
+                    }
+                    (false, _, 0b00110) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_GT_S, simd::I16X8_GT_S, simd::I32X4_GT_S, simd::I64X2_GT_S]) {
+                            self.vec3(rn, rm, rd, o);
+                        }
+                    }
+                    (true, _, 0b00110) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_GT_U, simd::I16X8_GT_U, simd::I32X4_GT_U, simd::I64X2_GT_S]) {
+                            self.vec3(rn, rm, rd, o);
+                        }
+                    }
+                    (false, _, 0b00111) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_GE_S, simd::I16X8_GE_S, simd::I32X4_GE_S, simd::I64X2_GT_S]) {
+                            self.vec3(rn, rm, rd, o);
+                        }
+                    }
+                    (true, _, 0b00111) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_GE_U, simd::I16X8_GE_U, simd::I32X4_GE_U, simd::I64X2_GT_S]) {
+                            self.vec3(rn, rm, rd, o);
+                        }
+                    }
+                    (false, _, 0b01100) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MAX_S, simd::I16X8_MAX_S, simd::I32X4_MAX_S, simd::I8X16_MAX_S]) {
+                            self.vec3(rn, rm, rd, o);
+                        }
+                    }
+                    (true, _, 0b01100) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MAX_U, simd::I16X8_MAX_U, simd::I32X4_MAX_U, simd::I8X16_MAX_U]) {
+                            self.vec3(rn, rm, rd, o);
+                        }
+                    }
+                    (false, _, 0b01101) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MIN_S, simd::I16X8_MIN_S, simd::I32X4_MIN_S, simd::I8X16_MIN_S]) {
+                            self.vec3(rn, rm, rd, o);
+                        }
+                    }
+                    (true, _, 0b01101) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MIN_U, simd::I16X8_MIN_U, simd::I32X4_MIN_U, simd::I8X16_MIN_U]) {
+                            self.vec3(rn, rm, rd, o);
+                        }
+                    }
+                    (true, _, 0b10100) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MAX_U, simd::I16X8_MAX_U, simd::I32X4_MAX_U, simd::I8X16_MAX_U]) {
+                            self.vec_pairwise(size, o, rn, rm, rd);
+                        }
+                    }
+                    (false, _, 0b10100) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MAX_S, simd::I16X8_MAX_S, simd::I32X4_MAX_S, simd::I8X16_MAX_S]) {
+                            self.vec_pairwise(size, o, rn, rm, rd);
+                        }
+                    }
+                    (true, _, 0b10101) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MIN_U, simd::I16X8_MIN_U, simd::I32X4_MIN_U, simd::I8X16_MIN_U]) {
+                            self.vec_pairwise(size, o, rn, rm, rd);
+                        }
+                    }
+                    (false, _, 0b10101) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MIN_S, simd::I16X8_MIN_S, simd::I32X4_MIN_S, simd::I8X16_MIN_S]) {
+                            self.vec_pairwise(size, o, rn, rm, rd);
+                        }
+                    }
+                    (false, _, 0b10111) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_ADD, simd::I16X8_ADD, simd::I32X4_ADD, simd::I64X2_ADD]) {
+                            self.vec_pairwise(size, o, rn, rm, rd);
+                        }
+                    }
+                    _ => return Err(format!("unsupported vector operation {op:05b} u={u} size={size} at 0x{addr:x}")),
+                }
+            }
+            Insn::VecTwoMisc { q, u, size, op, rn, rd } => {
+                let _ = q;
+                match (u, size, op) {
+                    (true, _, 0b00101) => self.vec2(rn, rd, simd::V128_NOT),
+                    (false, 0, 0b00101) => self.vec2(rn, rd, simd::I8X16_POPCNT),
+                    (false, _, 0b01011) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_ABS, simd::I16X8_ABS, simd::I32X4_ABS, simd::I64X2_ABS]) {
+                            self.vec2(rn, rd, o);
+                        }
+                    }
+                    (true, _, 0b01011) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_NEG, simd::I16X8_NEG, simd::I32X4_NEG, simd::I64X2_NEG]) {
+                            self.vec2(rn, rd, o);
+                        }
+                    }
+                    (false, _, 0b01001) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_EQ, simd::I16X8_EQ, simd::I32X4_EQ, simd::I64X2_EQ]) {
+                            self.getv(rn);
+                            self.f.v128c([0; 16]);
+                            self.f.simd(o);
+                            self.setv(rd);
+                        }
+                    }
+                    (false, _, 0b01000) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_GT_S, simd::I16X8_GT_S, simd::I32X4_GT_S, simd::I64X2_GT_S]) {
+                            self.getv(rn);
+                            self.f.v128c([0; 16]);
+                            self.f.simd(o);
+                            self.setv(rd);
+                        }
+                    }
+                    (false, _, 0b01010) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_LE_S, simd::I16X8_LE_S, simd::I32X4_LE_S, simd::I32X4_LE_S]) {
+                            self.getv(rn);
+                            self.f.v128c([0; 16]);
+                            self.f.simd(o);
+                            self.setv(rd);
+                        }
+                    }
+                    (false, _, 0b00000) => {
+                        // rev64: reverse the elements within each 64-bit half.
+                        let mask = rev64_mask(size);
+                        self.getv(rn);
+                        self.f.ls(L_V0);
+                        self.shuffle(L_V0, L_V0, mask);
+                        self.setv(rd);
+                    }
+                    (true, 0, 0b00000) => {
+                        // rev32 on bytes: reverse each 4-byte group.
+                        let mask = rev_group_mask(4);
+                        self.getv(rn);
+                        self.f.ls(L_V0);
+                        self.shuffle(L_V0, L_V0, mask);
+                        self.setv(rd);
+                    }
+                    (false, 0, 0b00001) => {
+                        // rev16 on bytes: swap the bytes of every 16-bit element.
+                        let mask = rev_group_mask(2);
+                        self.getv(rn);
+                        self.f.ls(L_V0);
+                        self.shuffle(L_V0, L_V0, mask);
+                        self.setv(rd);
+                    }
+                    _ => return Err(format!("unsupported two-register vector op {op:05b} u={u} size={size} at 0x{addr:x}")),
+                }
+            }
+            Insn::VecAcross { q, u, size, op, rn, rd } => {
+                let _ = q;
+                match (u, op) {
+                    (false, 0b11011) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_ADD, simd::I16X8_ADD, simd::I32X4_ADD, simd::I64X2_ADD]) {
+                            self.vec_across(size, o, rn, rd);
+                        }
+                    }
+                    (false, 0b01010) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MAX_S, simd::I16X8_MAX_S, simd::I32X4_MAX_S, simd::I8X16_MAX_S]) {
+                            self.vec_across(size, o, rn, rd);
+                        }
+                    }
+                    (true, 0b01010) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MAX_U, simd::I16X8_MAX_U, simd::I32X4_MAX_U, simd::I8X16_MAX_U]) {
+                            self.vec_across(size, o, rn, rd);
+                        }
+                    }
+                    (false, 0b11010) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MIN_S, simd::I16X8_MIN_S, simd::I32X4_MIN_S, simd::I8X16_MIN_S]) {
+                            self.vec_across(size, o, rn, rd);
+                        }
+                    }
+                    (true, 0b11010) => {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_MIN_U, simd::I16X8_MIN_U, simd::I32X4_MIN_U, simd::I8X16_MIN_U]) {
+                            self.vec_across(size, o, rn, rd);
+                        }
+                    }
+                    _ => return Err(format!("unsupported across-lane op {op:05b} u={u} at 0x{addr:x}")),
+                }
+            }
+            Insn::VecThreeDiff { q, u, size, op, rn, rm, rd } => {
+                match (u, op) {
+                    (false, 0b00101) => {
+                        // xtn / xtn2
+                        self.getv(rn);
+                        self.f.ls(L_V0);
+                        self.vec_narrow(size, L_V0, rd, q);
+                    }
+                    (false, 0b01000) | (true, 0b01000) => {
+                        // addhn / raddhn: add, take the high half of each lane.
+                        let add = self.lanes_op(size, [simd::I8X16_ADD, simd::I16X8_ADD, simd::I32X4_ADD, simd::I64X2_ADD])
+                            .ok_or_else(|| format!("unsupported addhn at 0x{addr:x}"))?;
+                        self.getv(rn);
+                        self.getv(rm);
+                        self.f.simd(add);
+                        self.f.ls(L_V0);
+                        let half = size + 1;
+                        let mask = high_half_mask(half);
+                        self.f.v128c([0; 16]);
+                        self.f.lg(L_V0);
+                        self.f.simd(simd::I8X16_SHUFFLE);
+                        self.f.body.extend_from_slice(&mask);
+                        self.setv(rd);
+                        if u {
+                            // raddhn rounds by adding half of the discarded bits first; the rounding
+                            // is folded in by the caller's idiom closely enough only for exact halves,
+                            // so it is refused rather than mistranslated.
+                            return Err(format!("raddhn is not translated (0x{addr:x})"));
+                        }
+                    }
+                    _ => return Err(format!("unsupported three-different op {op:05b} at 0x{addr:x}")),
+                }
+            }
+
+            Insn::VecShiftImm { q, u, immh, immb, op, rn, rd } => {
+                let _ = q;
+                let size = 31 - immh.leading_zeros(); // 0 for 8-bit lanes through 3 for 64-bit
+                let esize = 8u32 << size;
+                let immhb = (immh << 3) | immb;
+                let rshift = (2 * esize).wrapping_sub(immhb) as u32;
+                let lshift = immhb.wrapping_sub(esize) as u32;
+                let shr = self.lanes_op(size, [simd::I8X16_SHR_U, simd::I16X8_SHR_U, simd::I32X4_SHR_U, simd::I64X2_SHR_U]);
+                let shr_s = self.lanes_op(size, [simd::I8X16_SHR_S, simd::I16X8_SHR_S, simd::I32X4_SHR_S, simd::I64X2_SHR_S]);
+                let shl = self.lanes_op(size, [simd::I8X16_SHL, simd::I16X8_SHL, simd::I32X4_SHL, simd::I64X2_SHL]);
+                let add = self.lanes_op(size, [simd::I8X16_ADD, simd::I16X8_ADD, simd::I32X4_ADD, simd::I64X2_ADD]);
+                match op {
+                    0b00000 => {
+                        let o = if u { shr } else { shr_s }.ok_or_else(|| format!("bad shift at 0x{addr:x}"))?;
+                        self.getv(rn);
+                        self.f.i32c(rshift as i32);
+                        self.f.simd(o);
+                        self.setv(rd);
+                    }
+                    0b00010 => {
+                        // usra/ssra: accumulate the shifted value into the destination.
+                        let o = if u { shr } else { shr_s }.ok_or_else(|| format!("bad shift at 0x{addr:x}"))?;
+                        let a = add.ok_or_else(|| format!("bad shift at 0x{addr:x}"))?;
+                        self.getv(rn);
+                        self.f.i32c(rshift as i32);
+                        self.f.simd(o);
+                        self.f.ls(L_V0);
+                        self.getv(rd);
+                        self.f.lg(L_V0);
+                        self.f.simd(a);
+                        self.setv(rd);
+                    }
+                    0b01010 => {
+                        if u {
+                            // sli: keep the destination's low bits, take the shift from the source.
+                            self.getv(rn);
+                            self.f.i32c(lshift as i32);
+                            self.f.simd(shl.ok_or_else(|| format!("bad shift at 0x{addr:x}"))?);
+                            self.f.ls(L_V0);
+                            self.getv(rd);
+                            self.f.v128c(low_bits_mask(esize, lshift));
+                            self.f.simd(simd::V128_AND);
+                            self.f.lg(L_V0);
+                            self.f.simd(simd::V128_OR);
+                            self.setv(rd);
+                        } else {
+                            self.getv(rn);
+                            self.f.i32c(lshift as i32);
+                            self.f.simd(shl.ok_or_else(|| format!("bad shift at 0x{addr:x}"))?);
+                            self.setv(rd);
+                        }
+                    }
+                    0b01000 => {
+                        // sri: take the high bits from the shifted source, keep the destination's low.
+                        self.getv(rn);
+                        self.f.i32c(rshift as i32);
+                        self.f.simd(shr.ok_or_else(|| format!("bad shift at 0x{addr:x}"))?);
+                        self.f.ls(L_V0);
+                        self.getv(rd);
+                        self.f.v128c(low_bits_mask(esize, rshift));
+                        self.f.simd(simd::V128_AND);
+                        self.f.lg(L_V0);
+                        self.f.simd(simd::V128_OR);
+                        self.setv(rd);
+                    }
+                    0b10000 | 0b10001 => {
+                        // shrn/rshrn: shift then narrow, taking the low half of each lane.
+                        let src_size = size + 1;
+                        let o = if u {
+                            self.lanes_op(src_size, [simd::I8X16_SHR_U, simd::I16X8_SHR_U, simd::I32X4_SHR_U, simd::I64X2_SHR_U])
+                        } else {
+                            self.lanes_op(src_size, [simd::I8X16_SHR_S, simd::I16X8_SHR_S, simd::I32X4_SHR_S, simd::I64X2_SHR_S])
+                        };
+                        let add_wide = self.lanes_op(src_size, [simd::I8X16_ADD, simd::I16X8_ADD, simd::I32X4_ADD, simd::I64X2_ADD]);
+                        let o = o.ok_or_else(|| format!("bad narowing shift at 0x{addr:x}"))?;
+                        self.getv(rn);
+                        if op == 0b10001 {
+                            let round = 1u32 << (rshift - 1);
+                            self.f.v128c(round_mask(src_size, round));
+                            self.f.simd(add_wide.ok_or_else(|| format!("bad shift at 0x{addr:x}"))?);
+                        }
+                        self.f.i32c(rshift as i32);
+                        self.f.simd(o);
+                        self.f.ls(L_V0);
+                        self.vec_narrow(size, L_V0, rd, false);
+                    }
+                    0b10100 => {
+                        // sshll/ushll: widen the low half, then shift left.
+                        let wide = if u {
+                            self.lanes_op(size, [
+                                simd::I16X8_EXTEND_LOW_I8X16_U,
+                                simd::I32X4_EXTEND_LOW_I16X8_U,
+                                simd::I64X2_EXTEND_LOW_I32X4_U,
+                                simd::I64X2_EXTEND_LOW_I32X4_U,
+                            ])
+                        } else {
+                            self.lanes_op(size, [
+                                simd::I16X8_EXTEND_LOW_I8X16_S,
+                                simd::I32X4_EXTEND_LOW_I16X8_S,
+                                simd::I64X2_EXTEND_LOW_I32X4_S,
+                                simd::I64X2_EXTEND_LOW_I32X4_S,
+                            ])
+                        };
+                        let wide = wide.ok_or_else(|| format!("bad widening shift at 0x{addr:x}"))?;
+                        let shl_wide = self.lanes_op(size, [simd::I16X8_SHL, simd::I32X4_SHL, simd::I64X2_SHL, simd::I64X2_SHL]);
+                        self.getv(rn);
+                        self.f.simd(wide);
+                        if lshift != 0 {
+                            self.f.i32c(lshift as i32);
+                            self.f.simd(shl_wide.ok_or_else(|| format!("bad widening shift at 0x{addr:x}"))?);
+                        }
+                        self.setv(rd);
+                    }
+                    _ => return Err(format!("unsupported shift-immediate op {op:05b} at 0x{addr:x}")),
+                }
+            }
+            Insn::VecCopy { q, op, imm5, imm4, rn, rd } => {
+                let size = imm5.trailing_zeros();
+                let index = imm5 >> (size + 1);
+                let lane = 1u32 << size;
+                match (op, imm4, size) {
+                    // dup from a general register
+                    (false, 0b0001, _) => {
+                        self.get(rn, size == 3);
+                        let splat = match size {
+                            0 => simd::I8X16_SPLAT,
+                            1 => simd::I16X8_SPLAT,
+                            2 => simd::I32X4_SPLAT,
+                            _ => simd::I64X2_SPLAT,
+                        };
+                        self.f.simd(splat);
+                        self.setv(rd);
+                    }
+                    // dup from an element
+                    (false, 0b0000, _) => {
+                        self.getv(rn);
+                        let ext = match size {
+                            0 => simd::I8X16_EXTRACT_LANE_U,
+                            1 => simd::I16X8_EXTRACT_LANE_U,
+                            2 => simd::I32X4_EXTRACT_LANE,
+                            _ => simd::I64X2_EXTRACT_LANE,
+                        };
+                        self.f.simd_lane(ext, index as u8);
+                        let splat = match size {
+                            0 => simd::I8X16_SPLAT,
+                            1 => simd::I16X8_SPLAT,
+                            2 => simd::I32X4_SPLAT,
+                            _ => simd::I64X2_SPLAT,
+                        };
+                        self.f.simd(splat);
+                        self.setv(rd);
+                    }
+                    // ins from a general register
+                    (false, 0b0011, _) => {
+                        self.getv(rd);
+                        self.get(rn, size == 3);
+                        let insert = match size {
+                            0 => simd::I8X16_REPLACE_LANE,
+                            1 => simd::I16X8_REPLACE_LANE,
+                            2 => simd::I32X4_REPLACE_LANE,
+                            _ => simd::I64X2_REPLACE_LANE,
+                        };
+                        self.f.simd_lane(insert, index as u8);
+                        self.setv(rd);
+                    }
+                    // ins from an element
+                    (true, _, _) => {
+                        self.getv(rn);
+                        let ext = match size {
+                            0 => simd::I8X16_EXTRACT_LANE_U,
+                            1 => simd::I16X8_EXTRACT_LANE_U,
+                            2 => simd::I32X4_EXTRACT_LANE,
+                            _ => simd::I64X2_EXTRACT_LANE,
+                        };
+                        let tmp = if size == 3 { L_T0 } else { L_TI };
+                        self.f.simd_lane(ext, imm4 as u8);
+                        self.f.ls(tmp);
+                        self.getv(rd);
+                        self.f.lg(tmp);
+                        let insert = match size {
+                            0 => simd::I8X16_REPLACE_LANE,
+                            1 => simd::I16X8_REPLACE_LANE,
+                            2 => simd::I32X4_REPLACE_LANE,
+                            _ => simd::I64X2_REPLACE_LANE,
+                        };
+                        self.f.simd_lane(insert, index as u8);
+                        self.setv(rd);
+                    }
+                    // umov/smov: a lane into a general register
+                    (false, 0b0111, _) | (false, 0b0101, _) => {
+                        let signed = imm4 == 0b0101;
+                        self.getv(rn);
+                        let ext = match (size, signed) {
+                            (0, false) => simd::I8X16_EXTRACT_LANE_U,
+                            (0, true) => simd::I8X16_EXTRACT_LANE_S,
+                            (1, false) => simd::I16X8_EXTRACT_LANE_U,
+                            (1, true) => simd::I16X8_EXTRACT_LANE_S,
+                            (2, _) => simd::I32X4_EXTRACT_LANE,
+                            _ => simd::I64X2_EXTRACT_LANE,
+                        };
+                        self.f.simd_lane(ext, index as u8);
+                        // The lane arrives as i32 (or i64 for the doubleword form); a W destination
+                        // keeps the register's upper half clear, and X destinations extend the way
+                        // the operation says (smov sign, umov zero).
+                        if size == 3 {
+                            // already 64 bits
+                        } else if q && signed {
+                            self.f.op(I64_EXTEND_I32_S);
+                        } else {
+                            self.f.op(I64_EXTEND_I32_U);
+                        }
+                        self.set(rd, true);
+                        let _ = lane;
+                    }
+                    _ => return Err(format!("unsupported copy op at 0x{addr:x}")),
+                }
+            }
+            Insn::VecPermute { q, size, op, rn, rm, rd } => {
+                let _ = q;
+                let mask = permute_mask(size, op)
+                    .ok_or_else(|| format!("unsupported permute {op:05b} at 0x{addr:x}"))?;
+                self.shuffle(NVEC0 + rn, NVEC0 + rm, mask);
+                self.setv(rd);
+            }
+            Insn::VecExt { q, imm4, rn, rm, rd } => {
+                let mut mask = [0u8; 16];
+                for i in 0..16u32 {
+                    let src = imm4 + i;
+                    mask[i as usize] = if src < 16 { src as u8 } else { (16 + src - 16) as u8 };
+                }
+                self.shuffle(NVEC0 + rn, NVEC0 + rm, mask);
+                if !q {
+                    self.f.v128c(low_half_mask());
+                    self.f.simd(simd::V128_AND);
+                }
+                self.setv(rd);
+            }
+            Insn::VecTbl { q, tbx, len, rn, rm, rd } => {
+                let _ = q;
+                // result = bits from the table where the index is in range, else the destination
+                // (tbx) or zero (tbl). One register of the table at a time, because a wasm swizzle
+                // only reaches 16 bytes.
+                if tbx {
+                    self.getv(rd);
+                } else {
+                    self.f.v128c([0; 16]);
+                }
+                self.f.ls(L_V0);
+                for k in 0..=len {
+                    self.getv(rm);
+                    self.f.i32c((16 * k) as i32);
+                    self.f.simd(simd::I8X16_SUB);
+                    self.f.ls(L_V1);
+                    self.getv((rn + k) % 32);
+                    self.f.lg(L_V1);
+                    self.f.simd(simd::I8X16_SWIZZLE);
+                    self.f.ls(L_V2);
+                    self.f.lg(L_V1);
+                    self.f.v128c([16; 16]);
+                    self.f.simd(simd::I8X16_LT_U);
+                    self.f.ls(L_V3);
+                    self.f.lg(L_V2);
+                    self.f.lg(L_V0);
+                    self.f.lg(L_V3);
+                    self.f.simd(simd::V128_BITSELECT);
+                    self.f.ls(L_V0);
+                }
+                self.f.lg(L_V0);
+                self.setv(rd);
+            }
+            Insn::Atomic { is_load, exclusive, size, rn, rt, rs } => {
+                let width = 1u32 << size;
+                self.addr_base_off(rn, 0);
+                if is_load {
+                    self.emit_load(L_T1, size, 1, rt);
+                } else {
+                    self.emit_store(L_T1, size, rt);
+                    if exclusive {
+                        // The exclusive always succeeds on one thread: the status is zero.
+                        self.f.i64c(0);
+                        self.f.ls(rs);
+                    }
+                }
+                let _ = width;
+            }
+            Insn::AtomicCas { size, rn, rt, rs } => {
+                // tmp = [rn]; if tmp == Rs then [rn] = Rt; Rs = tmp. One thread, so this is a
+                // plain compare followed by a plain store.
+                self.addr_base_off(rn, 0);
+                self.emit_load(L_T1, size, 1, L_T0);
+                self.f.lg(L_T0);
+                self.get(rs, true);
+                self.f.op(I64_EQ);
+                self.open_if();
+                self.emit_store(L_T1, size, rt);
+                self.close_if();
+                self.set_loaded(rs, L_T0);
+            }
+            Insn::FpToGpr { sf, signed, size, opcode, rn, rd, .. } => {
+                // `fmov Wd, Sn` reinterprets the bits; `fcvtzs` and friends saturate to the integer
+                // range, which is what the truncating conversion in wasm does.
+                let double = size == 1;
+                self.getv(rn);
+                self.f.simd_lane(if double { simd::F64X2_EXTRACT_LANE } else { simd::F32X4_EXTRACT_LANE }, 0);
+                if opcode == 6 {
+                    self.f.op(if double { I64_REINTERPRET_F64 } else { I32_REINTERPRET_F32 });
+                    if !double {
+                        self.f.op(I64_EXTEND_I32_U);
+                    }
+                } else {
+                    self.f.sat(if double {
+                        if sf {
+                            if signed { sat::I64_TRUNC_SAT_F64_S } else { sat::I64_TRUNC_SAT_F64_U }
+                        } else if signed {
+                            sat::I32_TRUNC_SAT_F64_S
+                        } else {
+                            sat::I32_TRUNC_SAT_F64_U
+                        }
+                    } else if sf {
+                        if signed { sat::I64_TRUNC_SAT_F32_S } else { sat::I64_TRUNC_SAT_F32_U }
+                    } else if signed {
+                        sat::I32_TRUNC_SAT_F32_S
+                    } else {
+                        sat::I32_TRUNC_SAT_F32_U
+                    });
+                    if !sf {
+                        self.f.op(I64_EXTEND_I32_U);
+                    }
+                }
+                self.set(rd, true);
+            }
+            Insn::GprToFp { sf, signed, size, opcode, rn, rd, .. } => {
+                let double = size == 1;
+                self.f.v128c([0; 16]);
+                if opcode == 7 {
+                    // fmov: the bits go across unchanged.
+                    if sf {
+                        self.get(rn, true);
+                        self.f.op(F64_REINTERPRET_I64);
+                        self.f.simd_lane(simd::F64X2_REPLACE_LANE, 0);
+                    } else {
+                        self.get(rn, false);
+                        self.f.op(F32_REINTERPRET_I32);
+                        self.f.simd_lane(simd::F32X4_REPLACE_LANE, 0);
+                    }
+                } else {
+                    // scvtf/ucvtf: an integer converted to FP.
+                    if sf {
+                        self.get(rn, true);
+                        self.f.op(if double {
+                            if signed { F64_CONVERT_I64_S } else { F64_CONVERT_I64_U }
+                        } else if signed {
+                            F32_CONVERT_I64_S
+                        } else {
+                            F32_CONVERT_I64_U
+                        });
+                    } else {
+                        self.get(rn, false);
+                        self.f.op(if double {
+                            if signed { F64_CONVERT_I32_S } else { F64_CONVERT_I32_U }
+                        } else if signed {
+                            F32_CONVERT_I32_S
+                        } else {
+                            F32_CONVERT_I32_U
+                        });
+                    }
+                    self.f.simd_lane(if double { simd::F64X2_REPLACE_LANE } else { simd::F32X4_REPLACE_LANE }, 0);
+                }
+                self.setv(rd);
+            }
+            Insn::FpOneSource { .. }
+            | Insn::FpTwoSource { .. }
+            | Insn::FpCondSelect { .. }
+            | Insn::FpImm { .. } => {
+                return Err(format!("scalar floating point arithmetic is not translated yet (0x{addr:x})"));
             }
             Insn::MrsTpidr { rd } => {
                 if rd != 31 {

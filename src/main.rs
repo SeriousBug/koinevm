@@ -38,6 +38,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let path = args.get(1).ok_or(usage())?;
             let mut out = None;
             let mut bounds_check = true;
+            let mut allow_undefined = false;
             let mut trace = false;
             let mut mem_pages = emit::DEFAULT_MEM_PAGES;
             let mut argv: Vec<String> = Vec::new();
@@ -56,6 +57,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     i += 1;
                 } else if a == "--trace" {
                     trace = true;
+                    i += 1;
+                } else if a == "--allow-undefined" {
+                    allow_undefined = true;
                     i += 1;
                 } else if let Some(v) = a.strip_prefix("--bounds=") {
                     bounds_check = match v {
@@ -98,7 +102,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     Some(load_image(&resolved, Some(interp_base))?)
                 }
             };
-            let cfg = emit::Config { bounds_check, trace, mem_pages };
+            let cfg = emit::Config { bounds_check, trace, mem_pages, allow_undefined };
             let started = std::time::Instant::now();
             let res =
                 emit::translate(emit::Images { main: &main, interp: interp.as_ref() }, &cfg, &argv, &envp)?;
@@ -136,6 +140,80 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             for (addr, why) in &res.unsupported {
                 eprintln!("  unsupported at 0x{addr:x}: {why}");
+            }
+            Ok(())
+        }
+        "gaps" => {
+            // Translate what decodes and trap at what does not, then group the gaps by encoding: the
+            // size of the work, not one instruction per attempt.
+            let path = args.get(1).ok_or(usage())?;
+            let mut rootfs: Option<String> = None;
+            let mut interp_path: Option<String> = None;
+            let mut interp_base = emit::INTERP_BASE;
+            for a in &args[2..] {
+                if let Some(v) = a.strip_prefix("--rootfs=") {
+                    rootfs = Some(v.to_string());
+                } else if let Some(v) = a.strip_prefix("--interp=") {
+                    interp_path = Some(v.to_string());
+                } else if let Some(v) = a.strip_prefix("--interp-base=") {
+                    interp_base = u64::from_str_radix(v.trim_start_matches("0x"), 16)
+                        .map_err(|_| format!("bad interp base {v}"))?;
+                } else {
+                    return Err(format!("unknown argument {a}"));
+                }
+            }
+            let main = load_image(path, None)?;
+            let interp = match &main.interp {
+                None => None,
+                Some(want) => {
+                    let resolved = interp_path.clone().or_else(|| {
+                        rootfs.as_ref().map(|root| format!("{root}{want}"))
+                    });
+                    match resolved {
+                        Some(p) => Some(load_image(&p, Some(interp_base))?),
+                        None => None,
+                    }
+                }
+            };
+            let cfg = emit::Config {
+                bounds_check: true,
+                trace: false,
+                mem_pages: emit::DEFAULT_MEM_PAGES,
+                allow_undefined: true,
+            };
+            let started = std::time::Instant::now();
+            let res = emit::translate(
+                emit::Images { main: &main, interp: interp.as_ref() },
+                &cfg,
+                &[],
+                &[],
+            )?;
+            let images = [Some(&main), interp.as_ref()];
+            let mut grouped: std::collections::BTreeMap<u32, (usize, u64)> =
+                std::collections::BTreeMap::new();
+            for (addr, _) in &res.unsupported {
+                let word = images
+                    .iter()
+                    .flatten()
+                    .find_map(|i| i.vaddr_bytes(*addr, 4))
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0);
+                let e = grouped.entry(word).or_insert((0, *addr));
+                e.0 += 1;
+            }
+            let mut rows: Vec<(u32, usize, u64)> =
+                grouped.into_iter().map(|(w, (n, at))| (w, n, at)).collect();
+            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            println!(
+                "{} instructions translated, {} unreachable/dead, {} undecoded in {} encodings, {:?}",
+                res.stats.instructions,
+                res.unsupported.len(),
+                res.unsupported.len(),
+                rows.len(),
+                started.elapsed()
+            );
+            for (word, n, at) in &rows {
+                println!("  {n:5}  {word:08x}  first at 0x{at:x}");
             }
             Ok(())
         }
