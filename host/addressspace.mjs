@@ -35,6 +35,9 @@ export class AddressSpace {
     // Everything from mmap_base to the stack is available for mmap. Freed ranges go back here.
     this.free = [{ lo: map.mmap_base, hi: map.stack_floor }];
     this.ptes = new Uint8Array(memory.buffer, this.pteBase, 1 << 20);
+    // Which file each mapping came from. A jump into one of these is a page this machine has not
+    // translated yet, and the file is what it has to translate it from.
+    this.images = [];
   }
 
   bytes(addr, len) {
@@ -46,6 +49,26 @@ export class AddressSpace {
     if (prot & PROT.WRITE) bits |= PTE.WRITABLE;
     if (prot & PROT.EXEC) bits |= PTE.EXECUTABLE;
     return bits;
+  }
+
+  /// Remember the file behind a mapping, with the base its addresses are relative to.
+  noteImage(lo, hi, host, off) {
+    // Segments of one image overlap, because a later segment is mapped over part of the range an
+    // earlier one claimed. Both stay, and `imageOf` takes the nearest one below the address.
+    this.images.push({ lo, hi, host, base: lo - (off & ~(PAGE - 1)) });
+  }
+
+  /// The image a guest address belongs to, if it belongs to one.
+  imageOf(pc) {
+    let best = null;
+    for (const m of this.images) {
+      if (pc >= m.lo && pc < m.hi && (!best || m.lo >= best.lo)) best = m;
+    }
+    return best;
+  }
+
+  forgetImages(lo, hi) {
+    this.images = this.images.filter((m) => m.hi <= lo || m.lo >= hi);
   }
 
   /// Drop `[lo, hi)` from the free spans, keeping whatever lies outside it.
@@ -118,6 +141,7 @@ export class AddressSpace {
   munmap(addr, len) {
     if (addr % PAGE !== 0) return -EINVAL;
     len = roundUp(len, PAGE);
+    this.forgetImages(addr, addr + len);
     this.clearPtes(addr, addr + len);
     this.free.push({ lo: addr, hi: addr + len });
     this.free.sort((a, b) => a.lo - b.lo);

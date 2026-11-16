@@ -7,6 +7,7 @@
 
 import fs from "node:fs";
 import { Kernel } from "./host/syscall.mjs";
+import { Mach, Translator } from "./host/pages.mjs";
 
 const wasmPath = process.argv[2];
 if (!wasmPath) {
@@ -82,22 +83,24 @@ if (process.env.ARMJIT_DUMP_STACK) {
   }
 }
 
+const translator = new Translator(process.env.ARMJIT_TRANSLATOR || "./target/release/armjit");
+const configured = await translator.configure({
+  bounds: meta.bounds === 1,
+  trace: meta.trace === 1,
+  memPages: meta.mem_pages,
+});
+if (!configured.ok) {
+  console.error(`armjit: translator did not start: ${configured.error}`);
+  process.exit(1);
+}
+
+const mach = new Mach({ instance, memory, meta, kernel, translator, imports: { syscall, trap, trace2 } });
 const started = process.hrtime.bigint();
-const status = instance.exports.run(meta.entry, BigInt(meta.sp));
+const code = await mach.run();
 const elapsed = process.hrtime.bigint();
+translator.stop();
 if (process.env.ARMJIT_TIME) {
   console.error(`guest run ${Number(elapsed - started) / 1e6} ms`);
 }
 
-if (status !== 0) {
-  const view = new DataView(memory.buffer);
-  const pc = view.getInt32(0xf8 + 16, true);
-  if (status === 2) {
-    console.error(`armjit: guest jumped to untranslated address 0x${(pc >>> 0).toString(16)}`);
-  } else {
-    console.error(`armjit: stopped with status ${status}`);
-  }
-  process.exit(1);
-}
-
-process.exit(kernel.exited ?? 0);
+process.exit(code === 0 ? (kernel.exited ?? 0) : code);

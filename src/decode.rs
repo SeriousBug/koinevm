@@ -515,19 +515,15 @@ fn decode_loadstore(w: u32, sf: bool, rd: u32, rn: u32) -> Insn {
     if (w >> 24) & 0x3f == 0b001000 {
         let size = (w >> 30) & 3;
         let is_load = (w >> 22) & 1 != 0;
+        // Bit 23 picks between the exclusive pair (LDXR/STXR and their acquire/release forms, which
+        // differ only by bit 15) and LDAR/STLR, which is one ordered access with no monitor. Bit 21
+        // is the o1 group, whose forms are not translated.
+        if (w >> 21) & 1 == 1 {
+            return Insn::Undefined;
+        }
         let exclusive = (w >> 23) & 1 == 0;
-        let status = (w >> 15) & 1 == 0;
-        return match (is_load, exclusive, status) {
-            (true, true, true) => Insn::Atomic { is_load, exclusive, size, rn, rt: rd, rs: 0 },
-            (true, true, false) => Insn::Atomic { is_load, exclusive: false, size, rn, rt: rd, rs: 0 },
-            (false, true, true) => {
-                Insn::Atomic { is_load, exclusive, size, rn, rt: (w >> 10) & 31, rs: (w >> 16) & 31 }
-            }
-            (false, true, false) => Insn::Atomic { is_load, exclusive: false, size, rn, rt: rd, rs: 0 },
-            (true, false, false) => Insn::Atomic { is_load, exclusive: false, size, rn, rt: rd, rs: 0 },
-            (false, false, false) => Insn::Atomic { is_load, exclusive: false, size, rn, rt: rd, rs: 0 },
-            _ => Insn::Undefined,
-        };
+        // A store's status register is Rs; a load leaves that field unused.
+        return Insn::Atomic { is_load, exclusive, size, rn, rt: rd, rs: (w >> 16) & 31 };
     }
     match (w >> 27) & 7 {
         0b111 => {

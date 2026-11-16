@@ -136,6 +136,12 @@ export class Kernel {
             `flags=0x${Number(flags).toString(16)} fd=${Number(fd)} off=0x${Number(off).toString(16)} ` +
             `bytes=${contents ? contents.length : 0}`,
         );
+      if (contents && Number(at) > 0) {
+        const entry = k.files.get(Number(fd));
+        if (entry && entry.host) {
+          k.space.noteImage(Number(at), Number(at) + Number(len), entry.host, Number(off));
+        }
+      }
       return [BigInt(at), 0];
     });
 

@@ -508,10 +508,15 @@ pub struct Module {
     pub imports: Vec<Import>,
     pub funcs: Vec<Func>,
     pub table_min: u32,
+    /// Present when the host grows the table at run time to add translated code.
+    pub table_max: Option<u32>,
     pub elems: Vec<(u32, Vec<u32>)>,
-    /// (name, kind, index): kind 0 = func, 2 = memory
+    /// (name, kind, index): kind 0 = func, 1 = table, 2 = memory
     pub exports: Vec<(String, u8, u32)>,
     pub mem_pages: u32,
+    /// A module that translates more code for an existing run takes the host's memory instead of
+    /// defining one, so both see the same bytes.
+    pub mem_import: Option<(String, String)>,
     pub data: Vec<(u64, Vec<u8>)>,
 }
 
@@ -522,9 +527,11 @@ impl Module {
             imports: Vec::new(),
             funcs: Vec::new(),
             table_min: 0,
+            table_max: None,
             elems: Vec::new(),
             exports: Vec::new(),
             mem_pages: 0,
+            mem_import: None,
             data: Vec::new(),
         }
     }
@@ -571,9 +578,10 @@ impl Module {
         }
         Self::section(&mut out, 1, &s);
 
-        if !self.imports.is_empty() {
+        let n_imports = self.imports.len() + self.mem_import.iter().count();
+        if n_imports > 0 {
             let mut s = Vec::new();
-            uleb(&mut s, self.imports.len() as u64);
+            uleb(&mut s, n_imports as u64);
             for im in &self.imports {
                 uleb(&mut s, im.module.len() as u64);
                 s.extend_from_slice(im.module.as_bytes());
@@ -581,6 +589,15 @@ impl Module {
                 s.extend_from_slice(im.name.as_bytes());
                 s.push(0x00);
                 uleb(&mut s, im.ty as u64);
+            }
+            if let Some((module, name)) = &self.mem_import {
+                uleb(&mut s, module.len() as u64);
+                s.extend_from_slice(module.as_bytes());
+                uleb(&mut s, name.len() as u64);
+                s.extend_from_slice(name.as_bytes());
+                s.push(0x02);
+                s.push(0x00);
+                uleb(&mut s, 1);
             }
             Self::section(&mut out, 2, &s);
         }
@@ -596,8 +613,17 @@ impl Module {
             let mut s = Vec::new();
             uleb(&mut s, 1);
             s.push(0x70);
-            s.push(0x00);
-            uleb(&mut s, self.table_min as u64);
+            match self.table_max {
+                None => {
+                    s.push(0x00);
+                    uleb(&mut s, self.table_min as u64);
+                }
+                Some(max) => {
+                    s.push(0x01);
+                    uleb(&mut s, self.table_min as u64);
+                    uleb(&mut s, max as u64);
+                }
+            }
             Self::section(&mut out, 4, &s);
         }
 

@@ -82,6 +82,8 @@ pub const TABLE_BASE: u64 = PTE_BASE + PTE_PAGES;
 /// tag is `pc >> 2` plus one so it is never zero.
 pub const TABLE_SLOT: u64 = 8;
 pub const TABLE_MAX_SLOTS: u64 = 1 << 18;
+/// Region slots in the wasm table: a dispatch word holds `slot + 1` in 16 bits.
+pub const TABLE_SLOTS_MAX: u32 = 0xffff;
 /// PoC simplification against a real kernel's randomized layout: images start at fixed addresses.
 /// The program at 4 MiB, its dynamic loader well above the heap, `mmap` in between.
 pub const IMAGE_BASE: u64 = 0x400000;
@@ -143,6 +145,9 @@ pub struct Output {
 
 pub struct MapInfo {
     pub pte_base: u64,
+    /// The dispatch table, which the host patches when it translates a page at run time.
+    pub table_base: u64,
+    pub table_mask: u32,
     pub heap_base: u64,
     /// Where the heap has to stop: the loader, if there is one, sits above it.
     pub heap_limit: u64,
@@ -171,8 +176,12 @@ fn page_align(x: u64) -> u64 {
 /// Kick off at one block start, or any pc inside a block that the dispatcher can resume at.
 /// Open addressing with linear probing; a block start is unique in `pc >> 2`, so no key repeats and
 /// a probe only has to skip slots taken by other blocks that hashed to the same index.
-fn build_dispatch_table(regions: &[Region]) -> Result<(Vec<u8>, u32), String> {
-    let blocks: usize = regions.iter().map(|r| r.blocks.len()).sum();
+fn build_dispatch_table(regions: &[Region], failed: &[bool]) -> Result<(Vec<u8>, u32), String> {
+    let blocks: usize = regions
+        .iter()
+        .zip(failed)
+        .map(|(r, &bad)| if bad { 1 } else { r.blocks.len() })
+        .sum();
     let mut slots = 64u64;
     while slots < blocks as u64 * 4 {
         slots *= 2;
@@ -185,7 +194,8 @@ fn build_dispatch_table(regions: &[Region]) -> Result<(Vec<u8>, u32), String> {
     let mask = (slots - 1) as u32;
     let mut table = vec![0u8; (slots * TABLE_SLOT) as usize];
     for (region_idx, region) in regions.iter().enumerate() {
-        for (block_idx, block) in region.blocks.iter().enumerate() {
+        let keep = if failed[region_idx] { 1 } else { region.blocks.len() };
+        for (block_idx, block) in region.blocks.iter().enumerate().take(keep) {
             let key = (block.addr >> 2) as u32;
             let mut slot = (key & mask) as usize;
             loop {
@@ -268,21 +278,21 @@ impl Images<'_> {
     }
 }
 
-pub fn translate(
-    images: Images,
-    cfg: &Config,
-    argv: &[String],
-    envp: &[String],
-) -> Result<Output, String> {
-    let elf = images.main;
-    let (code_lo, code_hi) = elf.code_range().ok_or("no executable segment")?;
-    let mem_size = cfg.mem_pages as u64 * 65536;
-    let entry = images.interp.map(|i| i.entry).unwrap_or(elf.entry);
+/// Instruction words, and the addresses a region may start at, for a set of images.
+///
+/// The whole-image translator and the page translator that runs later both call this, so a page
+/// translated on demand cannot disagree with what a single pass would have produced.
+pub struct Site {
+    pub insns: BTreeMap<u64, Insn>,
+    pub entries: BTreeSet<u64>,
+    pub pointer_entries: BTreeSet<u64>,
+}
 
+pub fn sites<'a>(images: &[&'a Elf]) -> Site {
     // Decode every image's executable range once. Literal pools and padding decode to Undefined,
     // which is only an error if a translated block actually reaches it.
     let mut insns: BTreeMap<u64, Insn> = BTreeMap::new();
-    for image in images.all() {
+    for image in images {
         let Some((lo, hi)) = image.code_range() else { continue };
         let mut a = lo;
         while a + 4 <= hi {
@@ -295,7 +305,7 @@ pub fn translate(
     // Entry points: the ELF entries, every function symbol in executable code, every direct call
     // target. A branch to an entry starts a new region instead of being folded into this one.
     let mut entries: BTreeSet<u64> = BTreeSet::new();
-    for image in images.all() {
+    for image in images {
         entries.insert(image.entry);
         for s in &image.symbols {
             if s.is_func && insns.contains_key(&s.value) {
@@ -313,7 +323,7 @@ pub fn translate(
     }
     // Every function the unwind tables describe, which is the only complete list of entry points a
     // stripped image has.
-    for image in images.all() {
+    for image in images {
         for at in image.function_entries() {
             if insns.contains_key(&at) {
                 entries.insert(at);
@@ -351,7 +361,7 @@ pub fn translate(
     // A function reached only through a pointer has no branch to discover it: the pointer is what
     // makes it an entry, so every code address an image stores in its writable data becomes one.
     // Read-only data is left out: an ELF header holds addresses by construction.
-    for image in images.all() {
+    for image in images {
         // The headers are mapped inside the first loadable segment, so their words are not pointers.
         let headers_end = image.phoff + image.phnum as u64 * image.phentsize as u64;
         for s in &image.segments {
@@ -362,13 +372,84 @@ pub fn translate(
             let end = (s.file_offset + s.filesz) as usize;
             let Some(bytes) = image.image.get(start..end) else { continue };
             for w in bytes.chunks_exact(8) {
-                let v = u64::from_le_bytes(w.try_into().unwrap()).wrapping_add(image.bias);
+                let word = u64::from_le_bytes(w.try_into().unwrap());
+                // A null pointer is not a code address, and with a relocatable image it would
+                // otherwise land on the image base, which is the ELF header.
+                if word == 0 {
+                    continue;
+                }
+                let v = word.wrapping_add(image.bias);
                 if insns.contains_key(&v) {
                     pointer_entries.insert(v);
                 }
             }
         }
     }
+    Site { insns, entries, pointer_entries }
+}
+
+/// Everything a module needs before its region bodies: the types, the two host imports and the
+/// helpers the bodies call. A page translated later repeats this exactly, so a function emitted in
+/// one module and a function emitted in the other see the same signatures and helper ids.
+struct Prelude {
+    ids: Ids,
+    ty_region: u32,
+}
+
+fn prelude(m: &mut Module, cfg: &Config) -> Prelude {
+    let mut region_params = vec![I64; NR as usize];
+    region_params.extend(vec![V128; NVEC as usize]);
+    region_params.push(I32); // entry block
+    let mut region_results = vec![I64; NR as usize];
+    region_results.extend(vec![V128; NVEC as usize]);
+    region_results.push(I32);
+    let ty_region = m.ty(region_params, region_results);
+    let ty_syscall = m.ty(vec![I64; 7], vec![I64, I32]);
+    let ty_trap = m.ty(vec![I32, I64, I32], vec![]);
+    let ty_ii_i64 = m.ty(vec![I64, I64], vec![I64]);
+    let ty_i_i64 = m.ty(vec![I64], vec![I64]);
+
+    m.imports.push(Import { module: "env".into(), name: "syscall".into(), ty: ty_syscall });
+    m.imports.push(Import { module: "env".into(), name: "trap".into(), ty: ty_trap });
+    let trace_idx = if cfg.trace {
+        let ty = m.ty(vec![I32, I64], vec![]);
+        m.imports.push(Import { module: "env".into(), name: "trace2".into(), ty });
+        Some(m.n_imports() - 1)
+    } else {
+        None
+    };
+
+    let umulh_id = emit_umulh(m, ty_ii_i64);
+    let smulh_id = emit_smulh(m, ty_ii_i64, umulh_id);
+    let ids = Ids {
+        syscall: 0,
+        trap: 1,
+        trace: trace_idx,
+        umulh: umulh_id,
+        smulh: smulh_id,
+        udiv: emit_udiv(m, ty_ii_i64),
+        sdiv: emit_sdiv(m, ty_ii_i64),
+        bswap64: emit_bswap(m, ty_i_i64, 64),
+        bswap32: emit_bswap(m, ty_i_i64, 32),
+        rbit64: emit_rbit(m, ty_i_i64),
+        ty_region,
+    };
+    Prelude { ids, ty_region }
+}
+
+pub fn translate(
+    images: Images,
+    cfg: &Config,
+    argv: &[String],
+    envp: &[String],
+) -> Result<Output, String> {
+    let elf = images.main;
+    let (code_lo, code_hi) = elf.code_range().ok_or("no executable segment")?;
+    let mem_size = cfg.mem_pages as u64 * 65536;
+    let entry = images.interp.map(|i| i.entry).unwrap_or(elf.entry);
+
+    let loaded: Vec<&Elf> = images.all().collect();
+    let Site { insns, entries, pointer_entries } = sites(&loaded);
 
     let mut regions: Vec<Region> = Vec::new();
     let mut region_index: HashMap<u64, usize> = HashMap::new();
@@ -423,8 +504,6 @@ pub fn translate(
         }
     }
 
-    let (table_bytes, table_mask) = build_dispatch_table(&regions)?;
-    let loaded: Vec<&Elf> = images.all().collect();
     let ptes = page_table(&loaded, stack_floor, stack_top);
 
     // AT_BASE is the loader's load address, which after relocation is its own base.
@@ -436,55 +515,13 @@ pub fn translate(
     let mut m = Module::new();
     m.mem_pages = cfg.mem_pages;
 
-    let mut region_params = vec![I64; NR as usize];
-    region_params.extend(vec![V128; NVEC as usize]);
-    region_params.push(I32); // entry block
-    let mut region_results = vec![I64; NR as usize];
-    region_results.extend(vec![V128; NVEC as usize]);
-    region_results.push(I32);
-    let ty_region = m.ty(region_params, region_results);
-    let ty_syscall = m.ty(vec![I64; 7], vec![I64, I32]);
-    let ty_trap = m.ty(vec![I32, I64, I32], vec![]);
-    let ty_ii_i64 = m.ty(vec![I64, I64], vec![I64]);
-    let ty_i_i64 = m.ty(vec![I64], vec![I64]);
-    let ty_run = m.ty(vec![I32, I64], vec![I32]);
+    let Prelude { ids, ty_region } = prelude(&mut m, cfg);
+    let ty_run = m.ty(vec![I32, I64, I32], vec![I32]);
 
-    m.imports.push(Import { module: "env".into(), name: "syscall".into(), ty: ty_syscall });
-    m.imports.push(Import { module: "env".into(), name: "trap".into(), ty: ty_trap });
-    let trace_idx = if cfg.trace {
-        let ty = m.ty(vec![I32, I64], vec![]);
-        m.imports.push(Import { module: "env".into(), name: "trace2".into(), ty });
-        Some(m.n_imports() - 1)
-    } else {
-        None
-    };
-
-    let umulh_id = emit_umulh(&mut m, ty_ii_i64);
-    let smulh_id = emit_smulh(&mut m, ty_ii_i64, umulh_id);
-    let ids = Ids {
-        syscall: 0,
-        trap: 1,
-        trace: trace_idx,
-        umulh: umulh_id,
-        smulh: smulh_id,
-        udiv: emit_udiv(&mut m, ty_ii_i64),
-        sdiv: emit_sdiv(&mut m, ty_ii_i64),
-        bswap64: emit_bswap(&mut m, ty_i_i64, 64),
-        bswap32: emit_bswap(&mut m, ty_i_i64, 32),
-        rbit64: emit_rbit(&mut m, ty_i_i64),
-        ty_region,
-    };
-
-    let mut region_func_ids = Vec::new();
-    for _ in &regions {
-        region_func_ids.push(m.add_func(ty_region));
-    }
-    let run_id = m.add_func(ty_run);
-    m.table_min = regions.len() as u32;
-    m.elems.push((0, region_func_ids.clone()));
-
+    // The dispatch table is built once the regions are emitted, and only the run loop reads its
+    // mask, so the region bodies are emitted with a placeholder.
     let layout = Layout {
-        table_mask,
+        table_mask: 0,
         stack_floor,
         bounds_check: cfg.bounds_check,
         trace: cfg.trace,
@@ -503,27 +540,20 @@ pub fn translate(
     }
     let mut instructions = 0usize;
     let mut unsupported: Vec<(u64, String)> = Vec::new();
-    for (i, region) in regions.iter().enumerate() {
-        let body = match RegionEmitter::new(region, &layout, &ids, &mut unsupported).emit() {
-            Ok(body) => body,
-            // A stored value that turned out not to be a code address: the dispatch slot stays, so
-            // a jump to it traps with the reason instead of failing the whole translation.
-            Err(e) if pointer_entries.contains(&region.blocks[0].addr) => {
-                unsupported.push((region.blocks[0].addr, e));
-                let mut f = Func::new(ty_region);
-                f.i32c(3);
-                f.i64c(region.blocks[0].addr as i64);
-                f.i32c(region.blocks[0].addr as i32);
-                f.call(ids.trap);
-                f.op(UNREACHABLE);
-                f
-            }
-            Err(e) => return Err(e),
-        };
+    let (bodies, failed) = emit_regions(&regions, &layout, &ids, ty_region, &mut unsupported);
+    let mut region_func_ids = Vec::new();
+    for (region, body) in regions.iter().zip(bodies) {
         instructions += region.blocks.iter().map(|b| b.insns.len()).sum::<usize>();
-        *m.func_mut(region_func_ids[i]) = body;
+        let id = m.add_func(ty_region);
+        *m.func_mut(id) = body;
+        region_func_ids.push(id);
     }
-    *m.func_mut(run_id) = emit_run(&ids, &layout, ty_run);
+    let run_id = m.add_func(ty_run);
+    m.table_min = region_func_ids.len() as u32;
+    m.table_max = Some(TABLE_SLOTS_MAX);
+    m.elems.push((0, region_func_ids.clone()));
+    let (table_bytes, table_mask) = build_dispatch_table(&regions, &failed)?;
+    *m.func_mut(run_id) = emit_run(&ids, &Layout { table_mask, ..layout }, ty_run);
 
     for image in images.all() {
         for s in &image.segments {
@@ -540,6 +570,7 @@ pub fn translate(
 
     m.exports.push(("run".into(), 0, run_id));
     m.exports.push(("mem".into(), 2, 0));
+    m.exports.push(("tbl".into(), 1, 0));
 
     let wasm = m.encode();
     unsupported.sort();
@@ -554,6 +585,8 @@ pub fn translate(
         wasm,
         map: MapInfo {
             pte_base: PTE_BASE,
+            table_base: TABLE_BASE,
+            table_mask,
             heap_base,
             heap_limit: if images.interp.is_some() { INTERP_BASE } else { MMAP_BASE },
             mmap_base: MMAP_BASE,
@@ -562,6 +595,7 @@ pub fn translate(
     })
 }
 
+#[derive(Clone, Copy)]
 struct Layout {
     /// Slot count minus one for the open-addressed dispatch table: `slot = (pc >> 2) & table_mask`.
     table_mask: u32,
@@ -1000,41 +1034,80 @@ fn emit_rbit(m: &mut Module, ty: u32) -> u32 {
 // ---------------------------------------------------------------- dispatcher
 
 fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
+    // Parameters: 0 = pc, 1 = sp, 2 = resume. Locals hold the rest of the guest state.
     let mut f = Func::new(ty);
-    f.locals = vec![I64; 31]; // x0..x30 -> 2..32
-    f.locals.push(I64); // nzcv -> 33
-    f.locals.push(I32); // idx -> 34
-    f.locals.push(I32); // next -> 35
-    f.locals.push(I32); // status -> 36
-    f.locals.push(I32); // entry block -> 37
-    f.locals.push(I32); // key: pc >> 2 -> 38
-    f.locals.push(I32); // want tag: key + 1 -> 39
-    f.locals.push(I64); // dispatch slot -> 40
-    f.locals.push(I32); // slot address -> 41
-    f.locals.extend(vec![V128; NVEC as usize]); // v0..v31 -> 42..73
-    const V0: u32 = 42;
+    const PC: u32 = 0;
+    const SP: u32 = 1;
+    const X0: u32 = 3;
+    f.locals = vec![I64; 31]; // x0..x30 -> 3..33
+    f.locals.push(I64); // nzcv -> 34
+    f.locals.push(I32); // idx -> 35
+    f.locals.push(I32); // next -> 36
+    f.locals.push(I32); // status -> 37
+    f.locals.push(I32); // entry block -> 38
+    f.locals.push(I32); // key: pc >> 2 -> 39
+    f.locals.push(I32); // want tag: key + 1 -> 40
+    f.locals.push(I64); // dispatch slot -> 41
+    f.locals.push(I32); // slot address -> 42
+    f.locals.extend(vec![V128; NVEC as usize]); // v0..v31 -> 43..74
+    const NZCV: u32 = X0 + 31;
+    const IDX: u32 = NZCV + 1;
+    const NEXT: u32 = IDX + 1;
+    const STATUS: u32 = NEXT + 1;
+    const ENTRY: u32 = STATUS + 1;
+    const KEY: u32 = ENTRY + 1;
+    const WANT: u32 = KEY + 1;
+    const SLOTV: u32 = WANT + 1;
+    const SLOTA: u32 = SLOTV + 1;
+    const V0: u32 = SLOTA + 1;
 
+    // A resumed run takes the guest state the previous run left in the shadow, which is how the
+    // host hands control back after it has translated the page the guest jumped into.
+    f.lg(2);
+    f.op(IF);
+    f.body.push(0x40);
+    for r in 0..31u32 {
+        f.i32c(SHADOW as i32 + (r as i32) * 8);
+        f.mem(I64_LOAD, 3, 0);
+        f.ls(X0 + r);
+    }
+    f.i32c(SHADOW_SP as i32);
+    f.mem(I64_LOAD, 3, 0);
+    f.ls(SP);
+    f.i32c(SHADOW_NZCV as i32);
+    f.mem(I64_LOAD, 3, 0);
+    f.ls(NZCV);
+    f.i32c(SHADOW_PC as i32);
+    f.mem(I32_LOAD, 2, 0);
+    f.ls(PC);
+    for r in 0..NVEC {
+        f.i32c((SHADOW_V0 + r as u64 * 16) as i32);
+        f.simd_mem(simd::V128_LOAD, 4, 0);
+        f.ls(V0 + r);
+    }
+    f.op(ELSE);
     for i in 0..31u32 {
         f.i64c(0);
-        f.ls(2 + i);
+        f.ls(X0 + i);
     }
     f.i64c(0);
-    f.ls(33);
+    f.ls(NZCV);
     for i in 0..NVEC {
         f.v128c([0; 16]);
         f.ls(V0 + i);
     }
+    f.end();
 
     f.block(); // $exit, depth from inside the loop's ifs = 2
     f.loop_();
     if layout.trace {
         for i in 0..31u32 {
             f.i32c(SHADOW as i32 + (i as i32) * 8);
-            f.lg(2 + i);
+            f.lg(X0 + i);
             f.mem(I64_STORE, 3, 0);
         }
         f.i32c(SHADOW_SP as i32);
-        f.lg(1);
+        f.lg(SP);
         f.mem(I64_STORE, 3, 0);
         for i in 0..NVEC {
             f.i32c((SHADOW_V0 + i as u64 * 16) as i32);
@@ -1042,7 +1115,7 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
             f.simd_mem(simd::V128_STORE, 4, 0);
         }
         f.i32c(SHADOW_PC as i32);
-        f.lg(0);
+        f.lg(PC);
         f.mem(I32_STORE, 2, 0);
         // ring[idx & 255] = pc; idx++
         f.i32c(RING as i32);
@@ -1053,7 +1126,7 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
         f.i32c(4);
         f.op(I32_MUL);
         f.op(I32_ADD);
-        f.lg(0);
+        f.lg(PC);
         f.mem(I32_STORE, 2, 0);
         f.i32c(RING_IDX as i32);
         f.i32c(RING_IDX as i32);
@@ -1065,135 +1138,138 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     // Dispatch: open addressing on `(pc >> 2) & mask`. A slot holds `[payload][tag]`, the payload
     // being region + 1 in the low half and block index in the high half, and an empty slot reads
     // zero. A pc that no block starts at leaves the slot zero, which reports an untranslated jump.
-    f.lg(0);
+    f.lg(PC);
     f.i32c(2);
     f.op(I32_SHR_U);
-    f.lt(38); // key
-    f.lg(38);
+    f.lt(KEY); // key
+    f.lg(KEY);
     f.i32c(1);
     f.op(I32_ADD);
-    f.ls(39); // want
-    f.lg(38);
+    f.ls(WANT); // want
+    f.lg(KEY);
     f.i32c(layout.table_mask as i32);
     f.op(I32_AND);
-    f.ls(34); // slot
+    f.ls(IDX); // slot
 
     f.block(); // $found
     f.loop_();
     f.i32c(TABLE_BASE as i32);
-    f.lg(34);
+    f.lg(IDX);
     f.i32c(3);
     f.op(I32_SHL);
     f.op(I32_ADD);
-    f.lt(41);
-    f.lg(41);
+    f.lt(SLOTA);
+    f.lg(SLOTA);
     f.mem(I64_LOAD, 3, 0);
-    f.lt(40);
+    f.lt(SLOTV);
 
     // tag match: the slot is this block
-    f.lg(40);
+    f.lg(SLOTV);
     f.i64c(32);
     f.op(I64_SHR_U);
     f.wrap_i64();
-    f.lt(38);
-    f.lg(38);
-    f.lg(39);
+    f.lt(KEY);
+    f.lg(KEY);
+    f.lg(WANT);
     f.op(I32_EQ);
     f.op(IF);
     f.body.push(0x40);
-    f.lg(40);
+    f.lg(SLOTV);
     f.wrap_i64();
-    f.ls(34);
+    f.ls(IDX);
     f.br(2); // $found
     f.end();
 
     // empty slot: nothing translated at this pc
-    f.lg(38);
+    f.lg(KEY);
     f.op(I32_EQZ);
     f.op(IF);
     f.body.push(0x40);
     f.i32c(0);
-    f.ls(34);
+    f.ls(IDX);
     f.br(2); // $found
     f.end();
 
-    f.lg(34);
+    f.lg(IDX);
     f.i32c(1);
     f.op(I32_ADD);
     f.i32c(layout.table_mask as i32);
     f.op(I32_AND);
-    f.ls(34);
+    f.ls(IDX);
     f.br(0); // keep probing
     f.end(); // loop
     f.end(); // $found
 
-    f.lg(34);
+    f.lg(IDX);
     f.op(I32_EQZ);
     f.op(IF);
     f.body.push(0x40);
     f.i32c(2);
-    f.ls(36);
+    f.ls(STATUS);
     f.br(2);
     f.end();
 
     // block index = word >> 16, region slot = (word & 0xffff) - 1
-    f.lg(34);
+    f.lg(IDX);
     f.i32c(16);
     f.op(I32_SHR_U);
-    f.ls(37); // entry block
-    f.lg(34);
+    f.ls(ENTRY); // entry block
+    f.lg(IDX);
     f.i32c(0xffff);
     f.op(I32_AND);
     f.i32c(1);
     f.op(I32_SUB);
-    f.ls(34); // table slot
+    f.ls(IDX); // table slot
 
+    f.i32c(SHADOW_PC as i32);
+    f.lg(PC);
+    f.mem(I32_STORE, 2, 0);
     for i in 0..31u32 {
-        f.lg(2 + i);
+        f.lg(X0 + i);
     }
-    f.lg(1); // sp
-    f.lg(33); // nzcv
+    f.lg(SP); // sp
+    f.lg(NZCV); // nzcv
     for i in 0..NVEC {
         f.lg(V0 + i);
     }
-    f.lg(37); // entry block
-    f.lg(34); // table slot, popped by call_indirect last
+    f.lg(ENTRY); // entry block
+    f.lg(IDX); // table slot, popped by call_indirect last
     f.op(CALL_INDIRECT);
     uleb(&mut f.body, ids.ty_region as u64);
     uleb(&mut f.body, 0);
 
-    f.ls(35); // next
+    f.ls(NEXT); // next
     for i in (0..NVEC).rev() {
         f.ls(V0 + i);
     }
-    f.ls(33); // nzcv
-    f.ls(1); // sp
+    f.ls(NZCV); // nzcv
+    f.ls(SP); // sp
     for i in (0..31u32).rev() {
-        f.ls(2 + i);
+        f.ls(X0 + i);
     }
 
-    f.lg(35);
+    f.lg(NEXT);
     f.op(I32_EQZ);
     f.op(IF);
     f.body.push(0x40);
     f.i32c(0);
-    f.ls(36);
+    f.ls(STATUS);
     f.br(2);
     f.end();
 
-    f.lg(35);
-    f.ls(0);
+    f.lg(NEXT);
+    f.ls(PC);
     f.br(0);
     f.end(); // loop
     f.end(); // exit block
 
     for i in 0..31u32 {
         f.i32c(SHADOW as i32 + (i as i32) * 8);
-        f.lg(2 + i);
+        f.lg(X0 + i);
         f.mem(I64_STORE, 3, 0);
     }
     f.i32c(SHADOW_SP as i32);
-    f.lg(1);
+    f.lg(SP);
     f.mem(I64_STORE, 3, 0);
     for i in 0..NVEC {
         f.i32c((SHADOW_V0 + i as u64 * 16) as i32);
@@ -1201,12 +1277,12 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
         f.simd_mem(simd::V128_STORE, 4, 0);
     }
     f.i32c(SHADOW_NZCV as i32);
-    f.lg(33);
+    f.lg(NZCV);
     f.mem(I64_STORE, 3, 0);
     f.i32c(SHADOW_PC as i32);
-    f.lg(0);
+    f.lg(PC);
     f.mem(I32_STORE, 2, 0);
-    f.lg(36);
+    f.lg(STATUS);
     f
 }
 
@@ -1459,6 +1535,88 @@ fn modified_immediate(q: bool, op: bool, cmode: u32, imm8: u32) -> [u8; 16] {
 // Invariant: a register local always holds the architecturally correct 64-bit value, so the top 32
 // bits of a register are zero after any W-register write. An operation knows its own width, and a
 // 32-bit operation masks its result before storing.
+
+/// Emit one region, and when that fails, emit it again with refusals turned into traps.
+///
+/// A stored address that leads to code with one instruction this machine does not translate must
+/// cost that instruction, not the function around it: the first attempt refuses the whole region,
+/// the second traps at the words it cannot translate and leaves the rest working.
+fn region_body(
+    region: &Region,
+    layout: &Layout,
+    ids: &Ids,
+    unsupported: &mut Vec<(u64, String)>,
+) -> Result<Func, String> {
+    let mut first = Vec::new();
+    match RegionEmitter::new(region, layout, ids, &mut first).emit() {
+        Ok(body) => {
+            unsupported.extend(first);
+            Ok(body)
+        }
+        Err(e) if !layout.allow_undefined => {
+            let lenient = Layout { allow_undefined: true, ..*layout };
+            let mut second = Vec::new();
+            match RegionEmitter::new(region, &lenient, ids, &mut second).emit() {
+                Ok(body) => {
+                    unsupported.extend(second);
+                    Ok(body)
+                }
+                Err(e) => {
+                    unsupported.extend(second);
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            unsupported.extend(first);
+            Err(e)
+        }
+    }
+}
+
+/// A region that no amount of retrying can emit becomes a trap that names where it started.
+fn trap_body(ty_region: u32, entry: u64, ids: &Ids) -> Func {
+    let mut f = Func::new(ty_region);
+    f.i32c(3);
+    f.i64c(entry as i64);
+    f.i32c(entry as i32);
+    f.call(ids.trap);
+    f.op(UNREACHABLE);
+    f
+}
+
+/// Emit one region per entry, and remember the ones that could not be emitted.
+///
+/// A region is discovered from one entry and runs on until the next, so an entry that is not code
+/// at all (a stored value, or a word of data that decodes as a call) can swallow real functions
+/// that nothing else marked. Such a region keeps only its first block as a trap: the rest of its
+/// block starts are left out of the dispatch table, so reaching one of them stops the run and the
+/// host translates that address as a page of its own, from the code it really is.
+fn emit_regions(
+    regions: &[Region],
+    layout: &Layout,
+    ids: &Ids,
+    ty_region: u32,
+    unsupported: &mut Vec<(u64, String)>,
+) -> (Vec<Func>, Vec<bool>) {
+    let mut bodies = Vec::with_capacity(regions.len());
+    let mut failed = Vec::with_capacity(regions.len());
+    for region in regions {
+        let entry = region.blocks[0].addr;
+        match region_body(region, layout, ids, unsupported) {
+            Ok(body) => {
+                bodies.push(body);
+                failed.push(false);
+            }
+            Err(e) => {
+                unsupported.push((entry, e));
+                bodies.push(trap_body(ty_region, entry, ids));
+                failed.push(true);
+            }
+        }
+    }
+    (bodies, failed)
+}
 
 struct RegionEmitter<'a> {
     f: Func,
@@ -4099,4 +4257,96 @@ impl<'a> RegionEmitter<'a> {
 
 fn rf(r: u32) -> bool {
     r != 31
+}
+
+// ---------------------------------------------------------------- pages translated at run time
+
+/// One region a page module carries, in the order its dispatch slots were assigned.
+pub struct PageRegion {
+    pub entry: u64,
+    /// Block start addresses, in block index order.
+    pub blocks: Vec<u64>,
+}
+
+pub struct PageOutput {
+    pub wasm: Vec<u8>,
+    pub regions: Vec<PageRegion>,
+    pub unsupported: Vec<(u64, String)>,
+}
+
+/// Translate the code around one address into a module that can be added to a running image.
+///
+/// The module has no memory and no dispatch table of its own: it imports the host's memory and
+/// exports its regions, which the host puts in the running image's table and then dispatches to.
+pub fn translate_page(
+    elf: &Elf,
+    site: &Site,
+    at: u64,
+    cfg: &Config,
+) -> Result<PageOutput, String> {
+    let page = at & !0xfff;
+    let insns = &site.insns;
+    let mut entries = site.entries.clone();
+    let pointer_entries = &site.pointer_entries;
+    if !insns.contains_key(&at) {
+        return Err(format!("0x{at:x} is not an instruction of this image"));
+    }
+    // The address that was reached is an entry point by definition: nothing else in the image has
+    // to branch to it for it to be executed.
+    entries.insert(at);
+
+    let starts: Vec<u64> = std::iter::once(at)
+        .chain(
+            entries
+                .iter()
+                .chain(pointer_entries.iter())
+                .filter(|&&e| e != at && e & !0xfff == page)
+                .copied(),
+        )
+        .collect();
+
+    let mut regions: Vec<Region> = Vec::new();
+    for start in starts {
+        if regions.iter().any(|r| r.blocks[0].addr == start) {
+            continue;
+        }
+        let region = discover_region(start, insns, &entries);
+        if region.blocks.is_empty() {
+            continue;
+        }
+        regions.push(region);
+    }
+    if regions.len() >= TABLE_SLOTS_MAX as usize {
+        return Err(format!("{} regions in one page exceeds the table", regions.len()));
+    }
+
+    let mut m = Module::new();
+    m.mem_import = Some(("env".into(), "mem".into()));
+    let Prelude { ids, ty_region } = prelude(&mut m, cfg);
+    let layout = Layout {
+        table_mask: 0,
+        stack_floor: 0,
+        bounds_check: cfg.bounds_check,
+        trace: cfg.trace,
+        allow_undefined: cfg.allow_undefined,
+        mem_size: cfg.mem_pages as u64 * 65536,
+    };
+    let mut unsupported: Vec<(u64, String)> = Vec::new();
+    let (bodies, failed) = emit_regions(&regions, &layout, &ids, ty_region, &mut unsupported);
+    let mut out_regions = Vec::new();
+    for (i, (region, body)) in regions.iter().zip(bodies).enumerate() {
+        let id = m.add_func(ty_region);
+        *m.func_mut(id) = body;
+        m.exports.push((format!("r{i}"), 0, id));
+        // A region that only became a trap claims its first block and nothing else.
+        let blocks: Vec<u64> = region
+            .blocks
+            .iter()
+            .take(if failed[i] { 1 } else { region.blocks.len() })
+            .map(|b| b.addr)
+            .collect();
+        out_regions.push(PageRegion { entry: region.blocks[0].addr, blocks });
+    }
+    unsupported.sort();
+    Ok(PageOutput { wasm: m.encode(), regions: out_regions, unsupported })
 }

@@ -20,6 +20,8 @@ fn main() -> ExitCode {
 fn usage() -> String {
     "usage: armjit translate <elf> -o <out.wasm> [--bounds=check|trust] [--mem-pages=N] [--trace]\n       \
      [--argv=a,b] [--env=k=v,...] [--rootfs=<dir>] [--interp=<elf>] [--interp-base=0xADDR]\n       \
+     armjit page      (a request per line on stdin, a module back on stdout)\n       \
+     armjit gaps <elf> [--rootfs=<dir>]\n       \
      armjit dump <elf>".into()
 }
 
@@ -29,6 +31,32 @@ fn load_image(path: &str, base: Option<u64>) -> Result<elf::Elf, String> {
     let elf = elf::Elf::parse(image)?;
     let base = base.unwrap_or(if elf.etype == elf::ET_DYN { emit::IMAGE_BASE } else { elf.load_offset() });
     elf.relocated(base).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Hex, because the module travels over the same pipe as the request that asked for it.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// A JSON string literal, with the escaping the messages in this program need.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -112,8 +140,9 @@ fn run(args: &[String]) -> Result<(), String> {
             let meta = format!(
                 concat!(
                     "{{\"entry\":{},\"sp\":{},\"mem_pages\":{},\"code_lo\":{},\"code_hi\":{},",
-                    "\"pte_base\":{},\"heap_base\":{},\"heap_limit\":{},\"mmap_base\":{},",
-                    "\"stack_floor\":{}}}\n"
+                    "\"pte_base\":{},\"table_base\":{},\"table_mask\":{},",
+                    "\"heap_base\":{},\"heap_limit\":{},\"mmap_base\":{},",
+                    "\"stack_floor\":{},\"bounds\":{},\"trace\":{}}}\n"
                 ),
                 res.entry,
                 res.sp,
@@ -121,10 +150,14 @@ fn run(args: &[String]) -> Result<(), String> {
                 res.code_lo,
                 res.code_hi,
                 res.map.pte_base,
+                res.map.table_base,
+                res.map.table_mask,
                 res.map.heap_base,
                 res.map.heap_limit,
                 res.map.mmap_base,
-                res.map.stack_floor
+                res.map.stack_floor,
+                if cfg.bounds_check { 1 } else { 0 },
+                if cfg.trace { 1 } else { 0 }
             );
             let meta_path = format!("{out_path}.json");
             let mut f = std::fs::File::create(&meta_path).map_err(|e| e.to_string())?;
@@ -142,6 +175,94 @@ fn run(args: &[String]) -> Result<(), String> {
                 eprintln!("  unsupported at 0x{addr:x}: {why}");
             }
             Ok(())
+        }
+        "page" => {
+            // Which pages a guest runs is only known while it runs, so the host asks for one page at
+            // a time and gets a module that joins the image already running.
+            //
+            //   cfg bounds=check|trust trace=0|1 mem-pages=N
+            //   page <elf> <base-hex> <address-hex>
+            //
+            // A page answer is one JSON object on one line, with the module in hex.
+            let mut cfg = emit::Config {
+                bounds_check: true,
+                trace: false,
+                mem_pages: emit::DEFAULT_MEM_PAGES,
+                allow_undefined: true,
+            };
+            // Decoding an image's text costs more than translating one page of it, so the sites
+            // of every image asked about are kept.
+            let mut cache: std::collections::HashMap<(String, u64), (elf::Elf, emit::Site)> =
+                std::collections::HashMap::new();
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if stdin.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                    return Ok(());
+                }
+                let req: Vec<&str> = line.split_whitespace().collect();
+                let mut reply = String::new();
+                match req.first().copied() {
+                    Some("cfg") => {
+                        for a in &req[1..] {
+                            if let Some(v) = a.strip_prefix("bounds=") {
+                                cfg.bounds_check = v == "check";
+                            } else if let Some(v) = a.strip_prefix("trace=") {
+                                cfg.trace = v == "1";
+                            } else if let Some(v) = a.strip_prefix("mem-pages=") {
+                                cfg.mem_pages = v.parse().map_err(|_| format!("bad page count {v}"))?;
+                            }
+                        }
+                        reply.push_str("{\"ok\":true}");
+                    }
+                    Some("page") => {
+                        let parsed = (|| -> Result<String, String> {
+                            let path = req.get(1).ok_or("page needs an image")?.to_string();
+                            let base = u64::from_str_radix(req.get(2).ok_or("page needs a base")?, 16)
+                                .map_err(|_| "bad base")?;
+                            let at = u64::from_str_radix(req.get(3).ok_or("page needs an address")?, 16)
+                                .map_err(|_| "bad address")?;
+                            if !cache.contains_key(&(path.clone(), base)) {
+                                let image = load_image(&path, Some(base))?;
+                                let site = emit::sites(&[&image]);
+                                cache.insert((path.clone(), base), (image, site));
+                            }
+                            let (image, site) = &cache[&(path.clone(), base)];
+                            let res = emit::translate_page(image, site, at, &cfg)?;
+                            let regions: Vec<String> = res
+                                .regions
+                                .iter()
+                                .map(|r| {
+                                    let blocks: Vec<String> =
+                                        r.blocks.iter().map(|b| b.to_string()).collect();
+                                    format!("{{\"entry\":{},\"blocks\":[{}]}}", r.entry, blocks.join(","))
+                                })
+                                .collect();
+                            let gaps: Vec<String> = res
+                                .unsupported
+                                .iter()
+                                .map(|(a, why)| format!("[{a},{}]", json_str(why)))
+                                .collect();
+                            Ok(format!(
+                                "{{\"ok\":true,\"wasm\":\"{}\",\"regions\":[{}],\"unsupported\":[{}]}}",
+                                hex(&res.wasm),
+                                regions.join(","),
+                                gaps.join(",")
+                            ))
+                        })();
+                        match parsed {
+                            Ok(text) => reply.push_str(&text),
+                            Err(e) => {
+                                reply.push_str(&format!("{{\"ok\":false,\"error\":{}}}", json_str(&e)))
+                            }
+                        }
+                    }
+                    _ => reply.push_str("{\"ok\":false,\"error\":\"bad request\"}"),
+                }
+                println!("{reply}");
+                std::io::stdout().flush().map_err(|e| e.to_string())?;
+            }
         }
         "gaps" => {
             // Translate what decodes and trap at what does not, then group the gaps by encoding: the
