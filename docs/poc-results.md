@@ -20,8 +20,13 @@ module, plus a host that provides the syscall boundary. `node run.mjs out.wasm` 
   `NZCV` state, so `ccmp`, `adcs` and flags live across blocks all work.
 - One wasm function per region, one nested block per guest block, `br_table` on a local pc. Direct
   branches are plain `br`s. Calls, returns and computed jumps return the next pc to a dispatcher
-  that indexes a word per 4 bytes of code, so wasm stack depth is constant and guest recursion is
-  bounded by the guest stack in linear memory.
+  that looks the pc up in an open-addressed table (a slot is `pc >> 2`'s tag plus `region, block`),
+  so wasm stack depth is constant, guest recursion is bounded by the guest stack in linear memory,
+  and code from images at unrelated addresses costs nothing extra.
+- A fixed address space plan, because the guest's whole map is the linear memory: control block,
+  a soft page table of one byte per 4 KiB page, the dispatch table, images from 4 MiB, heap above
+  the images, stack at the top. The translator fills in the page table for what it maps; `mmap` and
+  `mprotect` will maintain the rest.
 - Syscall boundary shaped like a Linux ABI layer: number in x8, args in x0-x5, result or `-errno` in
   x0, unknown numbers answer `-ENOSYS`. `write`, `read`, `exit`, `exit_group` implemented; the rest
   is a switch away.
@@ -48,16 +53,17 @@ compiled with clang `-O2`; wasm time excludes node startup and module compilatio
 | configuration | time | vs native |
 |---|---|---|
 | native arm64 | 790 ms | 1.00x |
-| wasm, 4 GiB memory, per-access checks off | 1068 ms | 1.35x |
-| wasm, 4 GiB memory, per-access checks on | 1577 ms | 2.00x |
-| wasm, 64 MiB memory, per-access checks on | 1547 ms | 1.96x |
+| wasm, 4 GiB memory, per-access checks off | 1139 ms | 1.39x |
+| wasm, 4 GiB memory, per-access checks on | 1662 ms | 2.03x |
+| wasm, 64 MiB memory, per-access checks on | 1652 ms | 2.01x |
 
-Translation cost: 161 instructions of 1 region in 74 us, 40 KB of wasm from 37 KB of guest. V8
-compiles that module in 0.2 ms.
+Translation cost: 161 instructions of 1 region in 0.7 ms, 43 KB of wasm from 37 KB of guest. V8
+compiles that module in 0.2 ms. Most of the 0.7 ms is one pass over the 1 MiB page table, which is a
+one-off per image.
 
 Two things follow.
 
-1. The register-in-locals thesis holds. 1.35x native with a naive template translation, no peephole
+1. The register-in-locals thesis holds. 1.39x native with a naive template translation, no peephole
    pass, no flag liveness, no block linking, and a dispatcher round trip per call and return. That is
    already inside the band that makes a browser VM usable, and near CheerpX's self-reported *best*
    case (2x-3x) rather than its typical case (5x-10x).

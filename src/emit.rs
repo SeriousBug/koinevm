@@ -41,7 +41,36 @@ pub const SHADOW_TP: u64 = SHADOW_PC + 8;
 /// Trace mode ring buffer of dispatched guest pcs: a count at RING_IDX and 256 slots at RING.
 pub const RING_IDX: u64 = 0x1fc;
 pub const RING: u64 = 0x200;
+/// End of the control block. Everything below IMAGE_BASE is engine memory the guest never sees.
 pub const ENGINE_HI: u64 = 0x1000;
+
+// Address space plan. The guest's whole map is the linear memory, so the layout is fixed and the
+// same for every process: control block, soft page table, dispatch table, images, heap, stack.
+//
+//   0x00000000  control block: register shadow, trace ring
+//   0x00001000  soft page table, one byte per 4 KiB page (1 MiB, covers 4 GiB)
+//   0x00101000  dispatch table arena (sized to the region count)
+//   0x00400000  images: non-PIE ET_EXEC link here, PIE and shared objects are placed here
+//   ...         heap grows up from the end of the images, mmap areas grow down from the stack
+//   mem_size - stack reserve - 4 KiB   stack, growing down
+/// One PTE byte per 4 KiB page.
+pub const PTE_BASE: u64 = ENGINE_HI;
+pub const PTE_PAGES: u64 = 1 << 20;
+pub const TABLE_BASE: u64 = PTE_BASE + PTE_PAGES;
+/// A dispatch slot is `[u32 payload][u32 tag]`: payload 0 is empty, else `block << 16 | region + 1`,
+/// tag is `pc >> 2` plus one so it is never zero.
+pub const TABLE_SLOT: u64 = 8;
+pub const TABLE_MAX_SLOTS: u64 = 1 << 18;
+/// PoC simplification against a real kernel's randomized layout: images start at a fixed 4 MiB.
+pub const IMAGE_BASE: u64 = 0x400000;
+
+pub mod pte {
+    pub const MAPPED: u8 = 1;
+    pub const WRITABLE: u8 = 2;
+    pub const EXECUTABLE: u8 = 4;
+    /// The page holds at least one translated block, so `mprotect` or a write has something to drop.
+    pub const TRANSLATED: u8 = 8;
+}
 
 /// 4 GiB less a page: every guest address is then checked by the engine itself, and an address in
 /// the last page traps rather than aliasing.
@@ -100,6 +129,90 @@ fn page_align(x: u64) -> u64 {
     (x + 0xfff) & !0xfff
 }
 
+/// Kick off at one block start, or any pc inside a block that the dispatcher can resume at.
+/// Open addressing with linear probing; a block start is unique in `pc >> 2`, so no key repeats and
+/// a probe only has to skip slots taken by other blocks that hashed to the same index.
+fn build_dispatch_table(regions: &[Region]) -> Result<(Vec<u8>, u32), String> {
+    let blocks: usize = regions.iter().map(|r| r.blocks.len()).sum();
+    let mut slots = 64u64;
+    while slots < blocks as u64 * 4 {
+        slots *= 2;
+    }
+    if slots > TABLE_MAX_SLOTS {
+        return Err(format!(
+            "{blocks} blocks needs {slots} dispatch slots, more than the arena holds"
+        ));
+    }
+    let mask = (slots - 1) as u32;
+    let mut table = vec![0u8; (slots * TABLE_SLOT) as usize];
+    for (region_idx, region) in regions.iter().enumerate() {
+        for (block_idx, block) in region.blocks.iter().enumerate() {
+            let key = (block.addr >> 2) as u32;
+            let mut slot = (key & mask) as usize;
+            loop {
+                let at = slot * TABLE_SLOT as usize;
+                if table[at] == 0 && table[at + 1] == 0 && table[at + 2] == 0 && table[at + 3] == 0 {
+                    let payload = ((region_idx as u32) + 1) | ((block_idx as u32) << 16);
+                    table[at..at + 4].copy_from_slice(&payload.to_le_bytes());
+                    table[at + 4..at + 8].copy_from_slice(&(key + 1).to_le_bytes());
+                    break;
+                }
+                slot = (slot + 1) & mask as usize;
+            }
+        }
+    }
+    Ok((table, mask))
+}
+
+/// One byte per 4 KiB page for the ranges this translator maps: engine memory, the images and the
+/// stack. `mmap` and `mprotect` maintain the rest of it at run time.
+fn page_table(elf: &Elf, stack_floor: u64, stack_top: u64) -> Vec<u8> {
+    let mut ptes = vec![0u8; PTE_PAGES as usize];
+    let mut set = |lo: u64, hi: u64, bits: u8| {
+        let lo_page = (lo >> 12) as usize;
+        let hi_page = (((hi + 0xfff) >> 12) as usize).min(ptes.len());
+        for p in lo_page..hi_page {
+            ptes[p] |= bits;
+        }
+    };
+    set(0, IMAGE_BASE, pte::MAPPED | pte::WRITABLE);
+    set(stack_floor, stack_top, pte::MAPPED | pte::WRITABLE);
+    for s in &elf.segments {
+        let mut bits = pte::MAPPED;
+        if s.flags & crate::elf::PF_W != 0 {
+            bits |= pte::WRITABLE;
+        }
+        if s.flags & crate::elf::PF_X != 0 {
+            bits |= pte::EXECUTABLE | pte::TRANSLATED;
+        }
+        set(s.vaddr, s.end(), bits);
+    }
+    ptes
+}
+
+/// Data segments for the nonzero runs of `bytes`, so a mostly-empty page table costs its entries
+/// rather than its size: linear memory starts zeroed.
+fn push_sparse(m: &mut Module, base: u64, bytes: &[u8]) {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0 {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut last = i;
+        while i < bytes.len() {
+            if bytes[i] != 0 {
+                last = i;
+            } else if i - last > 16 {
+                break;
+            }
+            i += 1;
+        }
+        m.data.push((base + start as u64, bytes[start..=last].to_vec()));
+    }
+}
+
 pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> Result<Output, String> {
     let (code_lo, code_hi) = elf.code_range().ok_or("no executable segment")?;
     let mem_size = cfg.mem_pages as u64 * 65536;
@@ -153,26 +266,28 @@ pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> R
         return Err(format!("entry point 0x{:x} did not decode", elf.entry));
     }
 
-    let data_limit = elf.data_limit().max(elf.image_end());
-    let table_size = ((code_hi - code_lo) / 4) * 4;
-    let callmap = page_align(data_limit.max(ENGINE_HI));
-    let brk_base = page_align(callmap + table_size);
+    if regions.len() > 0xfffe {
+        return Err(format!("{} regions exceeds the dispatch table encoding", regions.len()));
+    }
+
     let stack_top = (mem_size - 0x1000) & !0xf;
     let stack_floor = stack_top - STACK_RESERVE;
-    if brk_base >= stack_floor {
+    let heap_base = page_align(elf.image_end().max(IMAGE_BASE));
+    if heap_base >= stack_floor {
         return Err("image too large for the fixed layout".into());
     }
     for s in &elf.segments {
-        let overlaps_callmap = s.vaddr < callmap + table_size && s.end() > callmap;
-        if s.vaddr < ENGINE_HI || overlaps_callmap || s.end() > stack_floor {
+        if s.vaddr < IMAGE_BASE || s.end() > stack_floor {
             return Err(format!(
-                "segment 0x{:x}..0x{:x} collides with the engine area, the call table or the stack",
+                "segment 0x{:x}..0x{:x} collides with engine memory or the stack",
                 s.vaddr,
                 s.end()
             ));
         }
     }
-    let _ = brk_base;
+
+    let (table_bytes, table_mask) = build_dispatch_table(&regions)?;
+    let ptes = page_table(&elf, stack_floor, stack_top);
 
     let (stack_bytes, stack_used) = build_initial_stack(elf, argv, envp, stack_top);
     let sp = stack_top - stack_used;
@@ -224,8 +339,13 @@ pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> R
     m.table_min = regions.len() as u32;
     m.elems.push((0, region_func_ids.clone()));
 
-    let layout =
-        Layout { callmap, stack_floor, bounds_check: cfg.bounds_check, trace: cfg.trace, mem_size };
+    let layout = Layout {
+        table_mask,
+        stack_floor,
+        bounds_check: cfg.bounds_check,
+        trace: cfg.trace,
+        mem_size,
+    };
 
     if std::env::var("ARMJIT_DUMP_REGIONS").is_ok() {
         for (i, r) in regions.iter().enumerate() {
@@ -243,26 +363,14 @@ pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> R
         instructions += region.blocks.iter().map(|b| b.insns.len()).sum::<usize>();
         *m.func_mut(region_func_ids[i]) = body;
     }
-    *m.func_mut(run_id) = emit_run(&ids, &layout, code_lo, code_hi, ty_run);
+    *m.func_mut(run_id) = emit_run(&ids, &layout, ty_run);
 
     for s in &elf.segments {
         let bytes = elf.image[s.file_offset as usize..(s.file_offset + s.filesz) as usize].to_vec();
         m.data.push((s.vaddr, bytes));
     }
-    // One word per 4 bytes of code: low half the region index + 1, high half the block index.
-    let mut callmap_bytes = vec![0u8; table_size as usize];
-    for (entry, idx) in &region_index {
-        let region = &regions[*idx];
-        for (block_idx, block) in region.blocks.iter().enumerate() {
-            let off = ((block.addr - code_lo) / 4) as usize * 4;
-            if off + 4 <= callmap_bytes.len() {
-                let word = ((*idx as u32) + 1) | ((block_idx as u32) << 16);
-                callmap_bytes[off..off + 4].copy_from_slice(&word.to_le_bytes());
-            }
-        }
-        let _ = entry;
-    }
-    m.data.push((callmap, callmap_bytes));
+    push_sparse(&mut m, TABLE_BASE, &table_bytes);
+    push_sparse(&mut m, PTE_BASE, &ptes);
     if !stack_bytes.is_empty() {
         m.data.push((sp, stack_bytes));
     }
@@ -285,7 +393,8 @@ pub fn translate(elf: &Elf, cfg: &Config, argv: &[String], envp: &[String]) -> R
 }
 
 struct Layout {
-    callmap: u64,
+    /// Slot count minus one for the open-addressed dispatch table: `slot = (pc >> 2) & table_mask`.
+    table_mask: u32,
     stack_floor: u64,
     bounds_check: bool,
     trace: bool,
@@ -711,7 +820,7 @@ fn emit_rbit(m: &mut Module, ty: u32) -> u32 {
 
 // ---------------------------------------------------------------- dispatcher
 
-fn emit_run(ids: &Ids, layout: &Layout, code_lo: u64, code_hi: u64, ty: u32) -> Func {
+fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     let mut f = Func::new(ty);
     f.locals = vec![I64; 31]; // x0..x30 -> 2..32
     f.locals.push(I64); // nzcv -> 33
@@ -719,6 +828,10 @@ fn emit_run(ids: &Ids, layout: &Layout, code_lo: u64, code_hi: u64, ty: u32) -> 
     f.locals.push(I32); // next -> 35
     f.locals.push(I32); // status -> 36
     f.locals.push(I32); // entry block -> 37
+    f.locals.push(I32); // key: pc >> 2 -> 38
+    f.locals.push(I32); // want tag: key + 1 -> 39
+    f.locals.push(I64); // dispatch slot -> 40
+    f.locals.push(I32); // slot address -> 41
 
     for i in 0..31u32 {
         f.i64c(0);
@@ -759,32 +872,71 @@ fn emit_run(ids: &Ids, layout: &Layout, code_lo: u64, code_hi: u64, ty: u32) -> 
         f.op(I32_ADD);
         f.mem(I32_STORE, 2, 0);
     }
-    // pc outside the translated code range: report an untranslated jump.
+    // Dispatch: open addressing on `(pc >> 2) & mask`. A slot holds `[payload][tag]`, the payload
+    // being region + 1 in the low half and block index in the high half, and an empty slot reads
+    // zero. A pc that no block starts at leaves the slot zero, which reports an untranslated jump.
     f.lg(0);
-    f.i32c(code_lo as i32);
-    f.op(I32_LT_U);
+    f.i32c(2);
+    f.op(I32_SHR_U);
+    f.lt(38); // key
+    f.lg(38);
+    f.i32c(1);
+    f.op(I32_ADD);
+    f.ls(39); // want
+    f.lg(38);
+    f.i32c(layout.table_mask as i32);
+    f.op(I32_AND);
+    f.ls(34); // slot
+
+    f.block(); // $found
+    f.loop_();
+    f.i32c(TABLE_BASE as i32);
+    f.lg(34);
+    f.i32c(3);
+    f.op(I32_SHL);
+    f.op(I32_ADD);
+    f.lt(41);
+    f.lg(41);
+    f.mem(I64_LOAD, 3, 0);
+    f.lt(40);
+
+    // tag match: the slot is this block
+    f.lg(40);
+    f.i64c(32);
+    f.op(I64_SHR_U);
+    f.wrap_i64();
+    f.lt(38);
+    f.lg(38);
+    f.lg(39);
+    f.op(I32_EQ);
     f.op(IF);
     f.body.push(0x40);
-    f.i32c(2);
-    f.ls(36);
-    f.br(2);
-    f.end();
-
-    f.lg(0);
-    f.i32c(code_hi as i32);
-    f.op(I32_GE_U);
-    f.op(IF);
-    f.body.push(0x40);
-    f.i32c(2);
-    f.ls(36);
-    f.br(2);
-    f.end();
-
-    f.lg(0);
-    f.i32c(code_lo as i32);
-    f.op(I32_SUB);
-    f.mem(I32_LOAD, 2, layout.callmap);
+    f.lg(40);
+    f.wrap_i64();
     f.ls(34);
+    f.br(2); // $found
+    f.end();
+
+    // empty slot: nothing translated at this pc
+    f.lg(38);
+    f.op(I32_EQZ);
+    f.op(IF);
+    f.body.push(0x40);
+    f.i32c(0);
+    f.ls(34);
+    f.br(2); // $found
+    f.end();
+
+    f.lg(34);
+    f.i32c(1);
+    f.op(I32_ADD);
+    f.i32c(layout.table_mask as i32);
+    f.op(I32_AND);
+    f.ls(34);
+    f.br(0); // keep probing
+    f.end(); // loop
+    f.end(); // $found
+
     f.lg(34);
     f.op(I32_EQZ);
     f.op(IF);

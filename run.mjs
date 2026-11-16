@@ -93,7 +93,12 @@ const module = new WebAssembly.Module(bytes);
 const instance = new WebAssembly.Instance(module, { env: { syscall, trap, trace2 } });
 memory = instance.exports.mem;
 
+const started = process.hrtime.bigint();
 const status = instance.exports.run(meta.entry, BigInt(meta.sp));
+const elapsed = process.hrtime.bigint();
+if (process.env.ARMJIT_TIME) {
+  console.error(`guest run ${Number(elapsed - started) / 1e6} ms`);
+}
 
 if (status !== 0) {
   const view = new DataView(memory.buffer);
