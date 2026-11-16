@@ -67,6 +67,16 @@ const instance = new WebAssembly.Instance(module, { env: { syscall, trap, trace2
 memory = instance.exports.mem;
 kernel = new Kernel(memory, meta, { rootfs: process.env.ARMJIT_ROOTFS });
 
+if (process.env.ARMJIT_DUMP_STACK) {
+  const view = new DataView(memory.buffer);
+  const at = Number(BigInt(meta.sp));
+  for (let i = 0; i < 16; i++) {
+    const w = view.getBigUint64(at + i * 8, true);
+    const ascii = Buffer.from(new Uint8Array(memory.buffer, at + i * 8, 8)).toString("latin1");
+    console.error(`sp+${i * 8}: 0x${w.toString(16)} ${JSON.stringify(ascii)}`);
+  }
+}
+
 const started = process.hrtime.bigint();
 const status = instance.exports.run(meta.entry, BigInt(meta.sp));
 const elapsed = process.hrtime.bigint();

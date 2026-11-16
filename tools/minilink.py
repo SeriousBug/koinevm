@@ -29,6 +29,7 @@ R_CALL26 = 283
 R_LDST16_ABS_LO12_NC = 284
 R_LDST32_ABS_LO12_NC = 285
 R_LDST64_ABS_LO12_NC = 286
+R_LDST128_ABS_LO12_NC = 299
 
 
 def read_elf(buf):
@@ -106,9 +107,10 @@ def apply_relocs(secs, blobs, section_vaddr, syms, blob_base):
                 word = (word & ~((3 << 29) | (0x7FFFF << 5))) | (immlo << 29) | (immhi << 5)
                 patch32(text, r_offset, word)
             elif rtype in (R_ADD_ABS_LO12_NC, R_LDST8_ABS_LO12_NC, R_LDST16_ABS_LO12_NC,
-                           R_LDST32_ABS_LO12_NC, R_LDST64_ABS_LO12_NC):
+                           R_LDST32_ABS_LO12_NC, R_LDST64_ABS_LO12_NC, R_LDST128_ABS_LO12_NC):
                 imm = ((S + A) & 0xFFF) >> {R_LDST16_ABS_LO12_NC: 1, R_LDST32_ABS_LO12_NC: 2,
-                                            R_LDST64_ABS_LO12_NC: 3}.get(rtype, 0)
+                                            R_LDST64_ABS_LO12_NC: 3,
+                                            R_LDST128_ABS_LO12_NC: 4}.get(rtype, 0)
                 word = (word & ~(0xFFF << 10)) | ((imm & 0xFFF) << 10)
                 patch32(text, r_offset, word)
             elif rtype in (R_CALL26, R_JUMP26):

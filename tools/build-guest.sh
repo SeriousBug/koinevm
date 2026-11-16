@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 OPT=${OPT:--O2}
-GUESTS=${GUESTS:-"hello call flags simd"}
+GUESTS=${GUESTS:-"hello call flags simd bits"}
 
 # Scratch for the oracle build, kept inside the tree so nothing is written outside it.
 tmp=build/guest
@@ -22,6 +22,7 @@ for g in $GUESTS; do
         hello) entry=_start; oracle_entry=guest_main ;;
         call)  entry=_start; oracle_entry=call_main ;;
         flags) entry=_start; oracle_entry=flags_main ;;
+        bits)  entry=_start; oracle_entry=bits_main ;;
         simd)  entry=_start; oracle_entry=simd_main; cflags=$CFLAGS_FP ;;
     esac
 

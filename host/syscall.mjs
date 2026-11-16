@@ -80,6 +80,9 @@ export class Kernel {
   }
 
   call(nr, a0, a1, a2, a3, a4, a5) {
+    if (process.env.ARMJIT_TRACE_SYSCALLS) {
+      console.error(`syscall ${Number(nr)}(${[a0, a1, a2].map((v) => "0x" + BigInt.asUintN(64, v).toString(16)).join(", ")})`);
+    }
     const fn = this.table.get(Number(nr));
     if (!fn) {
       const n = Number(nr);

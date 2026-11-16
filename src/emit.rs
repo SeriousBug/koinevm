@@ -16,7 +16,7 @@
 //!   silently aliasing low memory.
 
 use crate::decode::*;
-use crate::elf::Elf;
+use crate::elf::{Elf, PF_W, PF_X};
 use crate::wasm::op::*;
 use crate::wasm::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -311,11 +311,59 @@ pub fn translate(
             }
         }
     }
+    // Addresses that only a value reaches: built by `adrp` + `add`, or stored in the image's data.
+    // Either can land on a number that is not code, so a region that fails to translate there
+    // becomes a trap rather than failing the image.
+    let mut pointer_entries: BTreeSet<u64> = BTreeSet::new();
+    for (&addr, insn) in &insns {
+        let Insn::AddSubImm { sf: _, sub: false, setflags: false, shift, imm: add, rn, rd } = *insn
+        else {
+            continue;
+        };
+        if rn != rd {
+            continue;
+        }
+        // The `adrp` that a following `add` completes need not be its immediate predecessor: the
+        // compiler interleaves several pairs.
+        let page = (1..=8u64).find_map(|k| match insns.get(&addr.checked_sub(4 * k)?) {
+            Some(Insn::Adrp { rd: base, imm }) if *base == rn => Some((addr - 4 * k, *imm)),
+            _ => None,
+        });
+        let Some((page_addr, page_imm)) = page else { continue };
+        let target = ((page_addr & !0xfff) as i64
+            + (page_imm << 12)
+            + ((add as i64) << (12 * shift))) as u64;
+        if insns.contains_key(&target) {
+            pointer_entries.insert(target);
+        }
+    }
+
+    // A function reached only through a pointer has no branch to discover it: the pointer is what
+    // makes it an entry, so every code address an image stores in its writable data becomes one.
+    // Read-only data is left out: an ELF header holds addresses by construction.
+    for image in images.all() {
+        // The headers are mapped inside the first loadable segment, so their words are not pointers.
+        let headers_end = image.phoff + image.phnum as u64 * image.phentsize as u64;
+        for s in &image.segments {
+            if s.flags & PF_X != 0 || s.filesz < 8 {
+                continue;
+            }
+            let start = s.file_offset.max(headers_end) as usize;
+            let end = (s.file_offset + s.filesz) as usize;
+            let Some(bytes) = image.image.get(start..end) else { continue };
+            for w in bytes.chunks_exact(8) {
+                let v = u64::from_le_bytes(w.try_into().unwrap()).wrapping_add(image.bias);
+                if insns.contains_key(&v) {
+                    pointer_entries.insert(v);
+                }
+            }
+        }
+    }
 
     let mut regions: Vec<Region> = Vec::new();
     let mut region_index: HashMap<u64, usize> = HashMap::new();
     let mut queue: VecDeque<u64> = VecDeque::new();
-    for &e in &entries {
+    for &e in entries.iter().chain(pointer_entries.iter()) {
         queue.push_back(e);
     }
     while let Some(start) = queue.pop_front() {
@@ -446,7 +494,22 @@ pub fn translate(
     let mut instructions = 0usize;
     let mut unsupported: Vec<(u64, String)> = Vec::new();
     for (i, region) in regions.iter().enumerate() {
-        let body = RegionEmitter::new(region, &layout, &ids, &mut unsupported).emit()?;
+        let body = match RegionEmitter::new(region, &layout, &ids, &mut unsupported).emit() {
+            Ok(body) => body,
+            // A stored value that turned out not to be a code address: the dispatch slot stays, so
+            // a jump to it traps with the reason instead of failing the whole translation.
+            Err(e) if pointer_entries.contains(&region.blocks[0].addr) => {
+                unsupported.push((region.blocks[0].addr, e));
+                let mut f = Func::new(ty_region);
+                f.i32c(3);
+                f.i64c(region.blocks[0].addr as i64);
+                f.i32c(region.blocks[0].addr as i32);
+                f.call(ids.trap);
+                f.op(UNREACHABLE);
+                f
+            }
+            Err(e) => return Err(e),
+        };
         instructions += region.blocks.iter().map(|b| b.insns.len()).sum::<usize>();
         *m.func_mut(region_func_ids[i]) = body;
     }
@@ -894,14 +957,17 @@ fn emit_rbit(m: &mut Module, ty: u32) -> u32 {
         f.op(I64_OR);
         f.ls(1);
     }
-    // reverse the byte order of the swapped value
+    // Reverse the byte order of the swapped value, which has to stay put while the result is
+    // assembled in the other local.
+    f.lg(1);
+    f.ls(2);
     f.i64c(0);
     f.ls(1);
     for i in 0..8 {
         let mask_shift = i * 8;
         let out_shift = (7 - i) * 8;
         f.lg(1);
-        f.lg(1);
+        f.lg(2);
         f.i64c(mask_shift as i64);
         f.op(I64_SHR_U);
         f.i64c(0xff);
@@ -1445,6 +1511,7 @@ impl<'a> RegionEmitter<'a> {
         for (addr, insn) in insns {
             next = addr + 4;
             if is_terminator(&insn) {
+                self.emit_trace(addr);
                 self.emit_term(addr, insn)?;
                 ended = true;
                 break;
@@ -2362,9 +2429,10 @@ impl<'a> RegionEmitter<'a> {
 
     // ---- instructions
 
-    fn emit_insn(&mut self, addr: u64, insn: Insn) -> Result<(), String> {
-        self.cur_pc = addr;
-        if let Some(t) = self.ids.trace {
+    /// The register shadow and the call into the host, before the instruction at `addr` runs.
+    fn emit_trace(&mut self, addr: u64) {
+        let Some(t) = self.ids.trace else { return };
+        {
             for r in 0..NR {
                 self.f.i32c(SHADOW as i32 + (r as i32) * 8);
                 self.f.lg(r);
@@ -2382,6 +2450,11 @@ impl<'a> RegionEmitter<'a> {
             self.f.lg(31);
             self.f.call(t);
         }
+    }
+
+    fn emit_insn(&mut self, addr: u64, insn: Insn) -> Result<(), String> {
+        self.cur_pc = addr;
+        self.emit_trace(addr);
         match insn {
             Insn::Hint => {}
             Insn::Undefined => return self.refuse(format!("undecoded instruction at 0x{addr:x}")),
@@ -2629,11 +2702,42 @@ impl<'a> RegionEmitter<'a> {
                         }
                         self.f.ls(rd);
                     }
-                    _ => {
+                    3 => {
+                        // `rev`: reverse the byte order of the whole register.
                         self.f.lg(rn);
                         self.f.call(if sf { self.ids.bswap64 } else { self.ids.bswap32 });
                         self.f.ls(rd);
                     }
+                    5 => {
+                        // `cls` counts the leading bits that repeat the sign, so it is `clz` of the
+                        // value xor its own sign bit, one less.
+                        self.get(rn, sf);
+                        self.f.ls(L_T0);
+                        self.f.lg(L_T0);
+                        self.f.i64c(if sf { 63 } else { 31 });
+                        self.f.op(I64_SHR_U);
+                        self.f.i64c(1);
+                        self.f.op(I64_AND);
+                        self.f.ls(L_T1);
+                        self.f.i64c(0);
+                        self.f.lg(L_T1);
+                        self.f.op(I64_SUB);
+                        if !sf {
+                            self.f.i64c(0xffff_ffff);
+                            self.f.op(I64_AND);
+                        }
+                        self.f.lg(L_T0);
+                        self.f.op(I64_XOR);
+                        if !sf {
+                            self.f.wrap_i64();
+                        }
+                        self.f.op(if sf { I64_CLZ } else { I32_CLZ });
+                        self.to_i64(sf);
+                        self.f.i64c(1);
+                        self.f.op(I64_SUB);
+                        self.set(rd, sf);
+                    }
+                    _ => return self.refuse(format!("unsupported one-source op {op} at 0x{addr:x}")),
                 }
             }
             Insn::Div { sf, signed, rn, rm, rd } => {

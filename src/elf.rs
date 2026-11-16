@@ -47,6 +47,9 @@ pub struct Elf {
     pub segments: Vec<Segment>,
     pub symbols: Vec<Symbol>,
     pub image: Vec<u8>,
+    /// What was added to every address when the image was moved to its load address, so a value
+    /// read out of a data segment can be turned into the address it will point at.
+    pub bias: u64,
 }
 
 fn u16at(b: &[u8], o: usize) -> Result<u16, String> {
@@ -157,7 +160,7 @@ impl Elf {
             }
         }
 
-        Ok(Elf { etype: e_type, entry, phoff, phentsize, phnum, interp, segments, symbols, image })
+        Ok(Elf { etype: e_type, entry, phoff, phentsize, phnum, interp, segments, symbols, image, bias: 0 })
     }
 
     /// Where this image wants to start: what a kernel or a loader has to subtract from a chosen load
@@ -174,6 +177,7 @@ impl Elf {
             return Err(format!("ET_EXEC image cannot be moved to 0x{base:x}"));
         }
         if bias != 0 {
+            self.bias = bias;
             self.entry = self.entry.wrapping_add(bias);
             for s in &mut self.segments {
                 s.vaddr = s.vaddr.wrapping_add(bias);
