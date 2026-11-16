@@ -311,6 +311,16 @@ pub fn translate(
             }
         }
     }
+    // Every function the unwind tables describe, which is the only complete list of entry points a
+    // stripped image has.
+    for image in images.all() {
+        for at in image.function_entries() {
+            if insns.contains_key(&at) {
+                entries.insert(at);
+            }
+        }
+    }
+
     // Addresses that only a value reaches: built by `adrp` + `add`, or stored in the image's data.
     // Either can land on a number that is not code, so a region that fails to translate there
     // becomes a trap rather than failing the image.

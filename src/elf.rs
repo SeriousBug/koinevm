@@ -2,6 +2,7 @@
 
 pub const PT_LOAD: u32 = 1;
 pub const PT_INTERP: u32 = 3;
+pub const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 pub const EM_AARCH64: u16 = 183;
 pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
@@ -45,6 +46,9 @@ pub struct Elf {
     /// `PT_INTERP`'s path, for an image that wants a dynamic loader.
     pub interp: Option<String>,
     pub segments: Vec<Segment>,
+    /// `PT_GNU_EH_FRAME`: the unwind header, which lists every function that can be unwound
+    /// through, including the ones nothing branches to.
+    pub eh_frame_hdr: Option<u64>,
     pub symbols: Vec<Symbol>,
     pub image: Vec<u8>,
     /// What was added to every address when the image was moved to its load address, so a value
@@ -91,6 +95,7 @@ impl Elf {
 
         let mut segments = Vec::new();
         let mut interp = None;
+        let mut eh_frame_hdr = None;
         for i in 0..phnum as usize {
             let o = (phoff as usize) + i * phentsize as usize;
             let p_type = u32at(&image, o)?;
@@ -100,6 +105,10 @@ impl Elf {
                 let raw = image.get(off..off + len).ok_or("PT_INTERP past end of file")?;
                 let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
                 interp = Some(String::from_utf8_lossy(&raw[..end]).into_owned());
+                continue;
+            }
+            if p_type == PT_GNU_EH_FRAME {
+                eh_frame_hdr = Some(u64at(&image, o + 16)?);
                 continue;
             }
             if p_type != PT_LOAD {
@@ -160,7 +169,19 @@ impl Elf {
             }
         }
 
-        Ok(Elf { etype: e_type, entry, phoff, phentsize, phnum, interp, segments, symbols, image, bias: 0 })
+        Ok(Elf {
+            etype: e_type,
+            entry,
+            phoff,
+            phentsize,
+            phnum,
+            interp,
+            segments,
+            symbols,
+            image,
+            bias: 0,
+            eh_frame_hdr,
+        })
     }
 
     /// Where this image wants to start: what a kernel or a loader has to subtract from a chosen load
@@ -182,6 +203,9 @@ impl Elf {
             for s in &mut self.segments {
                 s.vaddr = s.vaddr.wrapping_add(bias);
             }
+            if let Some(h) = &mut self.eh_frame_hdr {
+                *h = h.wrapping_add(bias);
+            }
             for s in &mut self.symbols {
                 if s.shndx != 0 {
                     s.value = s.value.wrapping_add(bias);
@@ -189,6 +213,26 @@ impl Elf {
             }
         }
         Ok(self)
+    }
+
+    /// Every function start the unwind tables know about. The table in `PT_GNU_EH_FRAME` holds one
+    /// entry per function that can be unwound through, which covers the functions nothing branches
+    /// to: the ones a pointer names.
+    pub fn function_entries(&self) -> Vec<u64> {
+        let Some(raw) = self.eh_frame_hdr else { return Vec::new() };
+        let Some(h) = self.vaddr_bytes(raw, 12) else { return Vec::new() };
+        // version 1, count as udata4, table as datarel sdata4, which is what every glibc build uses.
+        if h[0] != 1 || h[2] & 0x0f != 0x03 || h[3] != 0x3b {
+            return Vec::new();
+        }
+        let count = u32::from_le_bytes([h[8], h[9], h[10], h[11]]) as usize;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let Some(bytes) = self.vaddr_bytes(raw + 12 + (i as u64) * 8, 4) else { break };
+            let delta = i32::from_le_bytes(bytes.try_into().unwrap()) as i64;
+            out.push((raw as i64 + delta) as u64);
+        }
+        out
     }
 
     /// Bytes at a guest virtual address, when a segment's file contents cover it.

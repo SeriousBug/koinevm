@@ -147,6 +147,7 @@ export class Kernel {
 
   registerFiles() {
     this.on(56, (k, dirfd, path, flags, mode) => {
+      if (process.env.ARMJIT_TRACE_SYSCALLS) console.error(`  openat ${k.str(path)}`);
       if (!isCwd(dirfd)) return k.fail(ENOSYS);
       return [BigInt(k.files.open(k.str(path), Number(flags), Number(mode))), 0];
     });
@@ -155,6 +156,8 @@ export class Kernel {
 
     this.on(63, (k, fd, buf, count) => {
       const n = Math.min(Number(count), 0x7ffff000);
+      if (process.env.ARMJIT_TRACE_SYSCALLS)
+        console.error(`  read fd=${Number(fd)} at 0x${BigInt.asUintN(64, buf).toString(16)} n=${n}`);
       const got = k.files.read(Number(fd), n);
       if (typeof got === "number") return [BigInt(got), 0];
       if (!k.put(buf, got)) return k.fail(EFAULT);
