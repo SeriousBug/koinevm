@@ -1,13 +1,18 @@
 # PoC results
 
-What exists now: a translator that takes a statically linked AArch64 Linux ELF and emits a wasm
-module, plus a host that provides the syscall boundary. `node run.mjs out.wasm` runs the guest.
+What exists now: a translator that takes an AArch64 Linux ELF (static or dynamically linked, with its
+interpreter) and emits one wasm module, plus a host that provides the kernel: syscalls, a soft page
+table, a root filesystem. `node run.mjs out.wasm` runs the guest.
 
 ## What it does
 
-- ELF64 loader: `PT_LOAD` segments mapped at their link addresses, program headers inside the first
-  segment so `AT_PHDR` names mapped memory, initial stack built as a kernel builds it (argc, argv,
-  envp, auxv with `AT_PHDR`/`AT_ENTRY`/`AT_PAGESZ`/`AT_RANDOM`/`AT_HWCAP`/`AT_SECURE`), fixed layout.
+- ELF64 loader: `ET_EXEC` at its link addresses, `ET_DYN` at a chosen base with the bias applied to
+  segments, entry and symbols, program headers inside the first segment so `AT_PHDR` names mapped
+  memory. `PT_INTERP` loads the interpreter as a second image in the same module: the kernel would
+  have started the loader, not the program, so `AT_BASE` names the loader while `AT_ENTRY`/`AT_PHDR`
+  keep describing the program, and the swap between them is a jump. Initial stack built as a kernel
+  builds it (argc, argv, envp, auxv with `AT_PHDR`/`AT_BASE`/`AT_ENTRY`/`AT_PAGESZ`/`AT_RANDOM`/
+  `AT_PLATFORM`/`AT_HWCAP`/`AT_SECURE`), fixed layout.
 - Decoder for the whole compiler-reachable A64 integer subset: move-wide, adr/adrp, add/sub
   (immediate, shifted, extended, with carry), logical (immediate with full `DecodeBitMasks`,
   shifted), bitfield (`sbfm`/`bfm`/`ubfm` and therefore `lsl`/`lsr`/`asr`/`sxt*`/`uxt*`/`ubfx`), extr,
@@ -28,31 +33,41 @@ module, plus a host that provides the syscall boundary. `node run.mjs out.wasm` 
   the images, stack at the top. The translator fills in the page table for what it maps; `mmap` and
   `mprotect` will maintain the rest.
 - Syscall boundary shaped like a Linux ABI layer: number in x8, args in x0-x5, result or `-errno` in
-  x0, unknown numbers answer `-ENOSYS`. `write`, `read`, `exit`, `exit_group` implemented; the rest
-  is a switch away.
+  x0, unknown numbers answer `-ENOSYS` and say so once on stderr with `ARMJIT_SYSCALLS=1`. Memory:
+  `brk`, `mmap` (anonymous and file-backed, `MAP_FIXED`), `munmap`, `mprotect`, with a free-span
+  allocator and the page table maintained in guest memory. Files: `openat`, `close`, `read`,
+  `pread64`, `write`, `writev`, `lseek`, `fstat`, `newfstatat`, `readlinkat`, `faccessat`, `getcwd`,
+  `ioctl`, resolved inside a root filesystem directory. Start-up: `set_tid_address`,
+  `set_robust_list`, `uname`, `clock_gettime`, `getrandom` (deterministic), `prlimit64`,
+  `sched_getaffinity`, `getuid` family, `rt_sigaction`, `rt_sigprocmask`, `futex`, `madvise`,
+  `membarrier`, `sched_yield`.
 
 ## Correctness
 
-Three guests, each built twice from one source: the aarch64 Linux ELF (translated) and a native
-macOS arm64 program (the oracle). Output and exit status compared byte for byte.
+Each oracle-backed guest is built twice from one source: the aarch64 Linux ELF (translated) and a
+native macOS arm64 program (the oracle). Output and exit status compared byte for byte.
 
 | guest | what it covers | result |
 |---|---|---|
 | `hello` | string setup, a loop, integer division by magic multiply, `umulh`, `strb`, exit code | exact |
 | `call` | recursion (`fib(20)`), a function pointer table called through `blr`, `stp`/`ldp` frames, signed division, printing | exact, exit 7 |
+| `flags` | `tst`/`ccmp` chains, `adcs`/`sbc` multi-word arithmetic, `csel`/`cset` over a matrix, `b.hi` | exact |
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
-20/20 combinations pass: both guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off.
+30/30 oracle cases pass: three guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
+checks on and off. Six more cases have no native oracle and assert the ABI themselves: the loader
+handoff (`tests/dyn.sh`), the memory syscalls (`tests/mem.sh`) and the file syscalls
+(`tests/files.sh`), each in both address-check modes. `bash tests/run.sh` runs all 36.
 
 ## Performance
 
-Integer kernel, 500M mix iterations + 2000 array sweeps, on an M4 Pro. Native is the same source
-compiled with clang `-O2`; wasm time excludes node startup and module compilation.
+`bash tools/bench.sh` measures this: an integer kernel, 500M mix iterations + 2000 array sweeps, on
+an M4 Pro. Native is the same source compiled with clang `-O2`; wasm time excludes node startup and
+module compilation. Run it on an idle machine: contention moved every number here by 2x.
 
 | configuration | time | vs native |
 |---|---|---|
-| native arm64 | 790 ms | 1.00x |
+| native arm64 | 820 ms | 1.00x |
 | wasm, 4 GiB memory, per-access checks off | 1139 ms | 1.39x |
 | wasm, 4 GiB memory, per-access checks on | 1662 ms | 2.03x |
 | wasm, 64 MiB memory, per-access checks on | 1652 ms | 2.01x |
@@ -76,12 +91,24 @@ Two things follow.
 
 ## What this does not prove, in order of how much it matters
 
-- **Dynamic linking.** The loader refuses `PT_INTERP`. An off-the-shelf Debian binary needs `ld.so`,
-  `mmap`, `mprotect` and a page table. This is the next milestone and the biggest one.
+- **Dynamic linking with a real `ld.so`.** Two images at chosen bases load and hand off, and the
+  syscalls a loader uses exist, but no real `ld.so` has run yet: there is no rootfs in the repo and
+  the machine has no Linux oracle. That run is the next milestone.
+- **Code that appears at run time.** Translation is ahead-of-time over the images given to the
+  translator. `ld.so` maps `libc.so.6` while it runs, so the first call into it will stop with
+  "jumped to untranslated address". Making that work needs translation at run time and a resume
+  protocol, not a bigger AOT pass.
+- **Page permissions.** The page table records them and `mprotect` maintains them, but a translated
+  store does not consult them: a write to a read-only page lands instead of faulting.
 - **Self-modifying code and guest JITs.** Nothing invalidates a translation. Node-in-the-tab needs
   page-granular invalidation, which the design allows for but does not implement.
 - **Signals.** A trap kills the run instead of being delivered to a guest handler.
-- **Threads, `fork`/`exec`, file I/O, a real block device.** Single process, stdout/stderr only.
+- **Threads, `fork`/`exec`, a real block device.** One process, one thread, and files come from a host
+  directory rather than a disk image.
+- **The kernel's own memory is guest-addressable.** Guest virtual addresses are linear-memory
+  offsets, so the shadow register file and the page table sit in low memory where a wild guest write
+  can reach them. A real kernel keeps them out of the address space entirely; here the map is
+  documented and the reserved ranges are the ones the guest must not be mapped at.
 - **FP and NEON.** Decoded as `Undefined` and refused at the instruction that reaches them, which is
   honest but means most real code will stop at its first float.
 - **Instruction coverage is compiler output, not the ISA.** Hand-written or obfuscated code that uses
