@@ -122,22 +122,22 @@ def apply_relocs(secs, text, section_vaddr, syms):
 
 
 def emit_elf(text, rodata, entry):
-    phoff = 64
     nph = 2
-    data_off = phoff + nph * 56
-    text_off = data_off
-    rodata_off = (text_off + len(text) + 0xFFF) & ~0xFFF
+    hdr_size = 64 + nph * 56  # e_phoff is 64, so ELF header and phdrs are the segment head
+    rodata_off = (hdr_size + len(text) + 0xFFF) & ~0xFFF
 
     ehdr = bytearray(64)
     ehdr[0:4] = b"\x7fELF"
     ehdr[4], ehdr[5], ehdr[6] = 2, 1, 1  # ELF64, LE, version
     struct.pack_into("<HHI", ehdr, 16, 2, 0xB7, 1)  # ET_EXEC, EM_AARCH64, version
-    struct.pack_into("<QQQ", ehdr, 24, entry, phoff, 0)  # entry, phoff, shoff
+    struct.pack_into("<QQQ", ehdr, 24, entry, 64, 0)  # entry, phoff, shoff
     struct.pack_into("<IHHHHHH", ehdr, 48, 0, 64, 56, nph, 64, 0, 0)  # flags, ehsize, phentsize
 
     ph = bytearray()
-    ph += struct.pack("<IIQQQQQQ", 1, 5, text_off, TEXT_VADDR, TEXT_VADDR, len(text),
-                      len(text), 0x1000)  # PT_LOAD, R+X
+    # first segment starts at file offset 0 so the program headers are mapped, as real
+    # linkers arrange: AT_PHDR must name an address the guest can read.
+    ph += struct.pack("<IIQQQQQQ", 1, 5, 0, TEXT_VADDR, TEXT_VADDR, hdr_size + len(text),
+                      hdr_size + len(text), 0x1000)  # PT_LOAD, R+X
     ph += struct.pack("<IIQQQQQQ", 1, 6, rodata_off, RODATA_VADDR, RODATA_VADDR, len(rodata),
                       len(rodata), 0x1000)  # PT_LOAD, R+W
 
@@ -162,9 +162,9 @@ def main():
         if not (s["flags"] & 0x2) or s["size"] == 0:  # SHF_ALLOC
             continue
         if s["name"] == ".text":
-            section_vaddr[s["name"]] = TEXT_VADDR
+            section_vaddr[s["name"]] = TEXT_VADDR + 64 + 2 * 56
         elif s["name"].startswith(".text"):
-            section_vaddr[s["name"]] = TEXT_VADDR + len(secs_by_name(secs, ".text")["data"])
+            section_vaddr[s["name"]] = TEXT_VADDR + 64 + 2 * 56 + len(secs_by_name(secs, ".text")["data"])
         else:
             section_vaddr[s["name"]] = RODATA_VADDR + len(rodata_blobs)
             rodata_blobs += s["data"]
