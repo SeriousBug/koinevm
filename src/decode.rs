@@ -270,8 +270,10 @@ pub fn decode(w: u32) -> Insn {
 }
 
 fn decode_dp_imm(w: u32, sf: bool, rd: u32, rn: u32) -> Insn {
+    // Bit 23 belongs to the class for add/subtract immediate (0), logical immediate and move wide,
+    // but for ADR/ADRP it is the top bit of immhi, so a negative offset also lands on key 1.
     match (w >> 23) & 7 {
-        0 => {
+        0 | 1 => {
             let immlo = (w >> 29) & 3;
             let immhi = (w >> 5) & 0x7ffff;
             let imm = sx((immhi << 2) | immlo, 21);
@@ -281,7 +283,7 @@ fn decode_dp_imm(w: u32, sf: bool, rd: u32, rn: u32) -> Insn {
                 Insn::Adr { rd, imm }
             }
         }
-        1 | 2 => Insn::AddSubImm {
+        2 => Insn::AddSubImm {
             sf,
             sub: (w >> 30) & 1 != 0,
             setflags: (w >> 29) & 1 != 0,
@@ -612,9 +614,9 @@ fn decode_simd_loadstore(w: u32) -> Insn {
         // Pair: `opc 101 V 01 L imm7 Rt2 Rn Rt`, with bits 24:23 picking the addressing form.
         let opc = (w >> 30) & 3;
         let width = match opc {
-            0 => 32,
-            1 => 64,
-            2 => 128,
+            0 => 4,
+            1 => 8,
+            2 => 16,
             _ => return Insn::Undefined,
         };
         let is_load = (w >> 22) & 1 != 0;
@@ -624,7 +626,7 @@ fn decode_simd_loadstore(w: u32) -> Insn {
             0b11 => PairMode::PreIndex,
             _ => return Insn::Undefined,
         };
-        let offset = sx(((w >> 15) & 0x7f) as u32, 7) * (width / 8) as i64;
+        let offset = sx(((w >> 15) & 0x7f) as u32, 7) * width as i64;
         return Insn::VecLoadStorePair { width, is_load, mode, offset, rn, rt, rt2: (w >> 10) & 31 };
     }
 
@@ -633,8 +635,8 @@ fn decode_simd_loadstore(w: u32) -> Insn {
     let size = (w >> 30) & 3;
     let opc = (w >> 22) & 3;
     let width = match opc {
-        0b00 | 0b01 => 8 << size,
-        0b10 | 0b11 if size == 0 => 128,
+        0b00 | 0b01 => 1 << size,
+        0b10 | 0b11 if size == 0 => 16,
         _ => return Insn::Undefined,
     };
     let is_load = opc & 1 != 0;
@@ -645,7 +647,7 @@ fn decode_simd_loadstore(w: u32) -> Insn {
             width,
             is_load,
             mode: LsMode::Unsigned,
-            offset: imm12 * (width / 8) as i64,
+            offset: imm12 * width as i64,
             rn,
             rt,
             rm: 0,
@@ -772,26 +774,29 @@ fn decode_simd_dp(w: u32) -> Insn {
         return Insn::VecModImm { q, op: u, cmode: (w >> 12) & 0xf, imm8, rd };
     }
 
-    if bit21 == 1 && bit10 == 1 {
-        return Insn::VecThreeSame { q, u, size, op, rn, rm, rd };
-    }
-    if bit21 == 1 && (w >> 11) & 1 == 1 {
-        // One result across the lanes has a marker in bits 21:17 of its own.
-        if (w >> 17) & 0x1f == 0b11000 {
-            return Insn::VecAcross { q, u, size, op: (w >> 12) & 0x1f, rn, rd };
-        }
-        return Insn::VecTwoMisc { q, u, size, op: (w >> 12) & 0x1f, rn, rd };
-    }
     if bit21 == 1 {
+        if bit10 == 1 {
+            return Insn::VecThreeSame { q, u, size, op, rn, rm, rd };
+        }
+        // The two-register and across-the-lanes forms set bit 11, where the opcode of a
+        // three-different form never does, and put a marker in bits 21:17 where those put Rm.
+        if (w >> 11) & 1 == 1 {
+            return match (w >> 17) & 0x1f {
+                0b11000 => Insn::VecAcross { q, u, size, op: (w >> 12) & 0x1f, rn, rd },
+                _ => Insn::VecTwoMisc { q, u, size, op: (w >> 12) & 0x1f, rn, rd },
+            };
+        }
         return Insn::VecThreeDiff { q, u, size, op, rn, rm, rd };
     }
     if bit10 == 1 {
         return Insn::VecCopy { q, op: u, imm5: (w >> 16) & 0x1f, imm4: (w >> 11) & 0xf, rn, rd };
     }
+    // `ext` shares this space with the permutes and with the table forms: it is the only instruction
+    // here with bit 15 clear and U set, and its imm4 occupies bits 14:11.
+    if u && (w >> 15) & 1 == 0 {
+        return Insn::VecExt { q, imm4: (w >> 11) & 0xf, rn, rm, rd };
+    }
     if (w >> 11) & 1 == 1 {
-        if u && op == 0b00101 && (w >> 15) & 1 == 0 {
-            return Insn::VecExt { q, imm4: (w >> 11) & 0xf, rn, rm, rd };
-        }
         return Insn::VecPermute { q, size, op, rn, rm, rd };
     }
     Insn::VecTbl { q, tbx: (w >> 12) & 1 != 0, len: (w >> 13) & 3, rn, rm, rd }
@@ -830,6 +835,12 @@ fn decode_scalar_fp(w: u32) -> Insn {
         // Two source: `fadd`, `fmul`, `fdiv`, `fmax`, `fcmp` share this space with one opcode bit
         // selecting the comparison forms.
         return Insn::FpTwoSource { size, opcode, rn, rm, rd };
+    }
+
+    // The scalar forms of the across-lane reductions live in this space: `addp d2, v0.2d` and
+    // friends carry the same 11000 marker as the vector form and reduce the whole register.
+    if (w >> 17) & 0x1f == 0b11000 {
+        return Insn::VecAcross { q: true, u: (w >> 29) & 1 != 0, size, op: (w >> 12) & 0x1f, rn, rd };
     }
 
     Insn::FpOneSource { size, opcode, rn, rd }

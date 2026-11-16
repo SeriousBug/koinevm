@@ -1,0 +1,507 @@
+/* SIMD/NEON and scalar FP guest, run against a native macOS oracle.
+ *
+ * Every case is an explicit instruction sequence in a noinline function, applied to a table of bit
+ * patterns, so the translated guest and the oracle run literally the same instructions over the
+ * same operands and the results compare as raw bit patterns. Nothing is left to the C compiler:
+ * inputs arrive through volatile stores, results leave through memory or a general register, and no
+ * arithmetic happens outside the asm blocks.
+ *
+ * The moves and conversions get NaN, infinities and denormals as input: their result is defined for
+ * every bit pattern, so feeding them in compares instruction semantics rather than the host's
+ * choice of NaN payload. Arithmetic that produces a NaN is not in this guest, because scalar
+ * floating point arithmetic is not translated yet. */
+
+#ifdef __APPLE__
+extern long write(int, const void *, unsigned long);
+extern void exit(int);
+#define GUEST_WRITE(fd, buf, n) write((fd), (buf), (unsigned long)(n))
+#define GUEST_EXIT(code) exit((int)(code))
+#define GUEST_ENTRY simd_main
+#else
+static inline long guest_syscall3(long nr, long a, long b, long c) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2) : "memory");
+    return x0;
+}
+static void guest_exit(long code) {
+    register long x8 __asm__("x8") = 93;
+    register long x0 __asm__("x0") = code;
+    __asm__ volatile("svc #0" : : "r"(x8), "r"(x0) : "memory");
+    __builtin_unreachable();
+}
+#define GUEST_WRITE(fd, buf, n) guest_syscall3(64, (fd), (long)(buf), (long)(n))
+#define GUEST_EXIT(code) guest_exit(code)
+#define GUEST_ENTRY _start
+#endif
+
+/* ---- output: hex words, one per line, no stdio ---- */
+
+#define OUT_CHUNK 4096
+static char out[OUT_CHUNK];
+static unsigned long out_n;
+
+static void flush(void) {
+    if (out_n) {
+        GUEST_WRITE(1, out, out_n);
+        out_n = 0;
+    }
+}
+
+static void put(char c) {
+    if (out_n == OUT_CHUNK) flush();
+    out[out_n++] = c;
+}
+
+static void put_str(const char *s) {
+    while (*s) put(*s++);
+}
+
+static void put_dec(unsigned long v) {
+    char b[8];
+    int n = 0;
+    if (v == 0) {
+        put('0');
+        return;
+    }
+    while (v) {
+        b[n++] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    while (n) put(b[--n]);
+}
+
+static void put_hex(unsigned long v) {
+    static const char digits[] = "0123456789abcdef";
+    put('0');
+    put('x');
+    for (int i = 0; i < 16; i++) put(digits[(v >> (60 - 4 * i)) & 0xf]);
+    put('\n');
+}
+
+/* ---- inputs ---- */
+
+#define NPAT 5
+#define PAT_BYTES (NPAT * 32)
+
+/* Four words per pattern: 32 bytes, so ldp/stp and the two-vector forms have room. */
+static const unsigned long pat[NPAT][4] = {
+    {0x0000000000000000ul, 0x0000000000000000ul, 0x0000000000000000ul, 0x0000000000000000ul},
+    {0xfffffffffffffffful, 0xfffffffffffffffful, 0xfffffffffffffffful, 0xfffffffffffffffful},
+    {0x8000000000000000ul, 0x8000000000000000ul, 0x8000000000000000ul, 0x8000000000000000ul},
+    {0x0123456789abcdeful, 0xfedcba9876543210ul, 0x0f0f0f0f0f0f0f0ful, 0xf0f0f0f0f0f0f0f0ul},
+    {0x7f0180ff01377f80ul, 0xff007f018000fe7ful, 0x7fff800000010001ul, 0x80007ffffffe0001ul},
+};
+
+#define ARENA 4096
+static unsigned char arena[ARENA] __attribute__((aligned(16)));
+static unsigned char *patr; /* NPAT * 32 bytes of patterns, the inputs */
+static unsigned char *pbuf; /* 32 bytes of results */
+static unsigned char *pscr; /* 64 bytes of scratch the asm blocks store to */
+
+static unsigned char *pa, *pb;
+
+static void zero_results(void) {
+    volatile unsigned long *w = (volatile unsigned long *)pbuf;
+    for (int i = 0; i < 4; i++) w[i] = 0;
+}
+
+/* Two words is the whole destination register; the cases that move two vectors through memory
+ * print four. */
+static void put_results(int words) {
+    const volatile unsigned long *w = (const volatile unsigned long *)pbuf;
+    for (int i = 0; i < words; i++) put_hex(w[i]);
+}
+
+static void put_tag(const char *name, int i, int j) {
+    put_str(name);
+    put(' ');
+    put_dec((unsigned long)i);
+    if (j >= 0) {
+        put(',');
+        put_dec((unsigned long)j);
+    }
+    put('\n');
+}
+
+static void setup(void) {
+    unsigned char *base = (unsigned char *)(((unsigned long)arena + 15ul) & ~15ul);
+    patr = base;
+    pbuf = base + PAT_BYTES;
+    pscr = pbuf + 32;
+    for (int i = 0; i < NPAT; i++) {
+        volatile unsigned long *w = (volatile unsigned long *)(patr + 32 * i);
+        for (int k = 0; k < 4; k++) w[k] = pat[i][k];
+    }
+}
+
+/* ---- case shapes ---- */
+
+/* Live across every case: q0 and q3 are the first input pattern's two vectors, q1 and q4 the
+ * second's, and x9 points at the scratch area, so a body can do its own loads, stores and
+ * post-index without needing another operand. */
+#define VCLOB "v0", "v1", "v2", "v3", "v4", "x9", "x10", "memory"
+
+#define DEF_U(fn, body)                                                       \
+    __attribute__((noinline)) static void fn(void) {                          \
+        __asm__ volatile("ldr q0, [%0]\n mov x9, %2\n" body "\n str q2, [%1]" \
+                         :                                                    \
+                         : "r"(pa), "r"(pbuf), "r"(pscr)                      \
+                         : VCLOB);                                            \
+    }
+
+#define DEF_B(fn, body)                                                        \
+    __attribute__((noinline)) static void fn(void) {                           \
+        __asm__ volatile("ldr q0, [%0]\n ldr q1, [%1]\n ldr q3, [%0, #16]\n"  \
+                         " ldr q4, [%1, #16]\n mov x9, %3\n" body "\n str q2, [%2]" \
+                         :                                                     \
+                         : "r"(pa), "r"(pb), "r"(pbuf), "r"(pscr)              \
+                         : VCLOB);                                             \
+    }
+
+/* The body leaves a general-register result in %0. */
+#define DEF_X(fn, body)                                     \
+    __attribute__((noinline)) static unsigned long fn(void) { \
+        register unsigned long r __asm__("x0") = 0;         \
+        __asm__ volatile("ldr q0, [%1]\n mov x9, %2\n" body \
+                         : "+r"(r)                          \
+                         : "r"(pa), "r"(pscr)               \
+                         : VCLOB);                         \
+        return r;                                           \
+    }
+
+/* Two 32-bit and two 64-bit inputs, all raw bit patterns, one 64-bit result. */
+#define DEF_F(fn, body)                                                                        \
+    __attribute__((noinline)) static unsigned long fn(unsigned int a, unsigned int b,          \
+                                                     unsigned long da, unsigned long db) {     \
+        unsigned long r;                                                                       \
+        __asm__ volatile("fmov s0, %w1\n fmov s1, %w2\n fmov d0, %3\n fmov d1, %4\n" body       \
+                         : "=r"(r)                                                             \
+                         : "r"(a), "r"(b), "r"(da), "r"(db)                                    \
+                         : "v0", "v1", "v2", "v3", "x9", "cc");                                \
+        return r;                                                                              \
+    }
+
+/* A 32-bit FP result goes out through w9 so its bits land in the low half of %0 with zeros above;
+ * x9 is clobbered by every DEF_F, so the compiler cannot have put %0 there. */
+#define S2W "fmov w9, s2\n mov %0, x9"
+#define D2X "fmov %0, d2"
+
+/* The memory cases move two vectors in and out, so they print both. */
+#define L_CASES(X)                                                                              \
+    X(ldr_str_q, "ldr/str q", "str q0, [x9, #16]\n ldr q2, [x9, #16]")                          \
+    X(stur_ldur_q, "stur/ldur q", "add x9, x9, #32\n stur q0, [x9, #-16]\n ldur q2, [x9, #-16]") \
+    X(ldp_stp_q, "ldp/stp q", "stp q0, q1, [x9]\n ldp q2, q3, [x9]\n str q3, [%2, #16]")        \
+    X(ld1_st1_pst, "ld1/st1 16b post-index",                                                     \
+      "st1 {v0.16b}, [x9], #16\n st1 {v1.16b}, [x9], #16\n sub x9, x9, #32\n"                    \
+      " ld1 {v2.16b}, [x9], #16\n ld1 {v3.16b}, [x9], #16\n str q3, [%2, #16]")                  \
+    X(ld1_st1_16b, "ld1/st1 16b", "ld1 {v2.16b}, [%0]\n st1 {v2.16b}, [x9]\n ldr q2, [x9]")
+
+#define U_CASES(X)                                                                              \
+    /* three-same integer */                                                                    \
+    X(not_16b, "not 16b", "not v2.16b, v0.16b")                                                 \
+    X(addv_16b, "addv b, 16b", "addv b2, v0.16b")                                              \
+    X(addv_8h, "addv h, 8h", "addv h2, v0.8h")                                                  \
+    X(addv_4s, "addv s, 4s", "addv s2, v0.4s")                                                  \
+    X(umaxv_16b, "umaxv b, 16b", "umaxv b2, v0.16b")                                           \
+    X(smaxv_8h, "smaxv h, 8h", "smaxv h2, v0.8h")                                               \
+    X(smaxv_4s, "smaxv s, 4s", "smaxv s2, v0.4s")                                               \
+    X(uminv_4s, "uminv s, 4s", "uminv s2, v0.4s")                                               \
+    X(addp_d, "addp d, 2d", "addp d2, v0.2d")                                                   \
+    /* narrows, widens, shifts */                                                               \
+    X(xtn_8b, "xtn 8b", "xtn v2.8b, v0.8h")                                                     \
+    X(xtn_4h, "xtn 4h", "xtn v2.4h, v0.4s")                                                     \
+    X(xtn_2s, "xtn 2s", "xtn v2.2s, v0.2d")                                                     \
+    X(shrn_8b, "shrn 8b #3", "shrn v2.8b, v0.8h, #3")                                           \
+    X(shrn_4h, "shrn 4h #7", "shrn v2.4h, v0.4s, #7")                                           \
+    X(shrn_2s, "shrn 2s #13", "shrn v2.2s, v0.2d, #13")                                         \
+    X(rshrn_8b, "rshrn 8b #3", "rshrn v2.8b, v0.8h, #3")                                        \
+    X(rshrn_4h, "rshrn 4h #7", "rshrn v2.4h, v0.4s, #7")                                        \
+    X(rshrn_2s, "rshrn 2s #13", "rshrn v2.2s, v0.2d, #13")                                      \
+    X(sshll_8h, "sshll 8h #0", "sshll v2.8h, v0.8b, #0")                                        \
+    X(sshll_4s, "sshll 4s #4", "sshll v2.4s, v0.4h, #4")                                        \
+    X(sshll_2d, "sshll 2d #2", "sshll v2.2d, v0.2s, #2")                                        \
+    X(ushll_8h, "ushll 8h #0", "ushll v2.8h, v0.8b, #0")                                        \
+    X(ushll_4s, "ushll 4s #4", "ushll v2.4s, v0.4h, #4")                                        \
+    X(ushll_2d, "ushll 2d #2", "ushll v2.2d, v0.2s, #2")                                        \
+    X(sxtl_8h, "sxtl 8h", "sxtl v2.8h, v0.8b")                                                  \
+    X(sxtl_2d, "sxtl 2d", "sxtl v2.2d, v0.2s")                                                  \
+    X(uxtl_8h, "uxtl 8h", "uxtl v2.8h, v0.8b")                                                  \
+    X(uxtl_4s, "uxtl 4s", "uxtl v2.4s, v0.4h")                                                  \
+    X(ushr_16b, "ushr 16b #3", "ushr v2.16b, v0.16b, #3")                                       \
+    X(ushr_4s, "ushr 4s #7", "ushr v2.4s, v0.4s, #7")                                           \
+    X(sshr_16b, "sshr 16b #3", "sshr v2.16b, v0.16b, #3")                                       \
+    X(sshr_4s, "sshr 4s #7", "sshr v2.4s, v0.4s, #7")                                           \
+    X(sshr_2d, "sshr 2d #13", "sshr v2.2d, v0.2d, #13")                                         \
+    X(shl_16b, "shl 16b #3", "shl v2.16b, v0.16b, #3")                                          \
+    X(shl_4s, "shl 4s #5", "shl v2.4s, v0.4s, #5")                                              \
+    /* copy, move, immediate */                                                                 \
+    X(dup_16b_gpr, "dup 16b, w9", "ldr x9, [%0]\n dup v2.16b, w9")                              \
+    X(dup_8h_gpr, "dup 8h, w10", "ldr w10, [%0, #8]\n dup v2.8h, w10")                          \
+    X(dup_4s_gpr, "dup 4s, w9", "ldr x9, [%0]\n dup v2.4s, w9")                                 \
+    X(dup_2d_gpr, "dup 2d, x9", "ldr x9, [%0]\n dup v2.2d, x9")                                 \
+    X(dup_16b_el, "dup 16b, b[5]", "dup v2.16b, v0.b[5]")                                       \
+    X(dup_8h_el, "dup 8h, h[3]", "dup v2.8h, v0.h[3]")                                          \
+    X(dup_4s_el, "dup 4s, s[2]", "dup v2.4s, v0.s[2]")                                          \
+    X(dup_2d_el, "dup 2d, d[1]", "dup v2.2d, v0.d[1]")                                          \
+    X(movi_16b, "movi 16b #0x5a", "movi v2.16b, #0x5a")                                         \
+    X(movi_8h, "movi 8h #0x5a", "movi v2.8h, #0x5a")                                            \
+    X(movi_8h_lsl, "movi 8h #0x5a, lsl 8", "movi v2.8h, #0x5a, lsl #8")                         \
+    X(movi_4s, "movi 4s #0x12", "movi v2.4s, #0x12")                                            \
+    X(movi_4s_lsl, "movi 4s #0xff, lsl 16", "movi v2.4s, #0xff, lsl #16")                       \
+    X(movi_d, "movi d #ff00ff00ff00ff00", "movi d2, #0xff00ff00ff00ff00")                       \
+    X(movi_d_alt, "movi d #00ff00ff00ff00ff", "movi d2, #0x00ff00ff00ff00ff")                   \
+    X(mvni_8h, "mvni 8h #0x5a", "mvni v2.8h, #0x5a")                                            \
+    X(mvni_4s, "mvni 4s #0x0f", "mvni v2.4s, #0x0f")                                            \
+    X(mvni_4s_lsl, "mvni 4s #0x0f, lsl 8", "mvni v2.4s, #0x0f, lsl #8")                         \
+    X(rev16_16b, "rev16 16b", "rev16 v2.16b, v0.16b")                                           \
+    X(rev32_16b, "rev32 16b", "rev32 v2.16b, v0.16b")                                           \
+    X(rev32_8h, "rev32 8h", "rev32 v2.8h, v0.8h")                                               \
+    X(rev64_16b, "rev64 16b", "rev64 v2.16b, v0.16b")                                           \
+    X(rev64_4s, "rev64 4s", "rev64 v2.4s, v0.4s")                                               \
+    X(cnt_16b, "cnt 16b", "cnt v2.16b, v0.16b")
+
+#define X_CASES(X)                                                                              \
+    X(umov_b3, "umov %w0, b[3]", "umov %w0, v0.b[3]")                                           \
+    X(umov_h1, "umov %w0, h[1]", "umov %w0, v0.h[1]")                                           \
+    X(umov_s2, "umov %w0, s[2]", "umov %w0, v0.s[2]")                                           \
+    X(umov_d1, "umov %0, d[1]", "umov %0, v0.d[1]")                                             \
+    X(smov_b5, "smov %w0, b[5]", "smov %w0, v0.b[5]")                                           \
+    X(smov_h2, "smov %w0, h[2]", "smov %w0, v0.h[2]")                                           \
+    X(smov_s1, "smov %0, s[1]", "smov %0, v0.s[1]")
+
+#define B_CASES(X)                                                                              \
+    /* three-same integer */                                                                    \
+    X(add_16b, "add 16b", "add v2.16b, v0.16b, v1.16b")                                         \
+    X(add_8h, "add 8h", "add v2.8h, v0.8h, v1.8h")                                              \
+    X(add_4s, "add 4s", "add v2.4s, v0.4s, v1.4s")                                              \
+    X(add_2d, "add 2d", "add v2.2d, v0.2d, v1.2d")                                              \
+    X(sub_16b, "sub 16b", "sub v2.16b, v0.16b, v1.16b")                                         \
+    X(sub_8h, "sub 8h", "sub v2.8h, v0.8h, v1.8h")                                              \
+    X(sub_4s, "sub 4s", "sub v2.4s, v0.4s, v1.4s")                                              \
+    X(sub_2d, "sub 2d", "sub v2.2d, v0.2d, v1.2d")                                              \
+    X(mul_16b, "mul 16b", "mul v2.16b, v0.16b, v1.16b")                                         \
+    X(mul_8h, "mul 8h", "mul v2.8h, v0.8h, v1.8h")                                              \
+    X(mul_4s, "mul 4s", "mul v2.4s, v0.4s, v1.4s")                                              \
+    X(and_16b, "and 16b", "and v2.16b, v0.16b, v1.16b")                                         \
+    X(orr_16b, "orr 16b", "orr v2.16b, v0.16b, v1.16b")                                         \
+    X(eor_16b, "eor 16b", "eor v2.16b, v0.16b, v1.16b")                                         \
+    X(bic_16b, "bic 16b", "bic v2.16b, v0.16b, v1.16b")                                         \
+    X(orn_16b, "orn 16b", "orn v2.16b, v0.16b, v1.16b")                                         \
+    X(bsl_16b, "bsl 16b", "mov v2.16b, v0.16b\n bsl v2.16b, v1.16b, v3.16b")                     \
+    X(bit_16b, "bit 16b", "mov v2.16b, v0.16b\n bit v2.16b, v1.16b, v3.16b")                     \
+    X(bif_16b, "bif 16b", "mov v2.16b, v0.16b\n bif v2.16b, v1.16b, v3.16b")                     \
+    X(mla_16b, "mla 16b", "mov v2.16b, v3.16b\n mla v2.16b, v0.16b, v1.16b")                     \
+    X(mla_4s, "mla 4s", "mov v2.16b, v3.16b\n mla v2.4s, v0.4s, v1.4s")                          \
+    X(mls_16b, "mls 16b", "mov v2.16b, v3.16b\n mls v2.16b, v0.16b, v1.16b")                     \
+    X(mls_4s, "mls 4s", "mov v2.16b, v3.16b\n mls v2.4s, v0.4s, v1.4s")                          \
+    X(smax_16b, "smax 16b", "smax v2.16b, v0.16b, v1.16b")                                      \
+    X(smax_8h, "smax 8h", "smax v2.8h, v0.8h, v1.8h")                                           \
+    X(smax_4s, "smax 4s", "smax v2.4s, v0.4s, v1.4s")                                           \
+    X(smin_16b, "smin 16b", "smin v2.16b, v0.16b, v1.16b")                                      \
+    X(smin_8h, "smin 8h", "smin v2.8h, v0.8h, v1.8h")                                           \
+    X(smin_4s, "smin 4s", "smin v2.4s, v0.4s, v1.4s")                                           \
+    X(umax_16b, "umax 16b", "umax v2.16b, v0.16b, v1.16b")                                      \
+    X(umax_8h, "umax 8h", "umax v2.8h, v0.8h, v1.8h")                                           \
+    X(umax_4s, "umax 4s", "umax v2.4s, v0.4s, v1.4s")                                           \
+    X(umin_16b, "umin 16b", "umin v2.16b, v0.16b, v1.16b")                                      \
+    X(umin_8h, "umin 8h", "umin v2.8h, v0.8h, v1.8h")                                           \
+    X(umin_4s, "umin 4s", "umin v2.4s, v0.4s, v1.4s")                                           \
+    X(cmgt_16b, "cmgt 16b", "cmgt v2.16b, v0.16b, v1.16b")                                      \
+    X(cmgt_4s, "cmgt 4s", "cmgt v2.4s, v0.4s, v1.4s")                                           \
+    X(cmgt_2d, "cmgt 2d", "cmgt v2.2d, v0.2d, v1.2d")                                           \
+    X(cmge_16b, "cmge 16b", "cmge v2.16b, v0.16b, v1.16b")                                      \
+    X(cmge_4s, "cmge 4s", "cmge v2.4s, v0.4s, v1.4s")                                           \
+    X(cmeq_16b, "cmeq 16b", "cmeq v2.16b, v0.16b, v1.16b")                                      \
+    X(cmeq_4s, "cmeq 4s", "cmeq v2.4s, v0.4s, v1.4s")                                           \
+    X(cmeq_2d, "cmeq 2d", "cmeq v2.2d, v0.2d, v1.2d")                                           \
+    X(cmhs_16b, "cmhs 16b", "cmhs v2.16b, v0.16b, v1.16b")                                      \
+    X(cmhs_4s, "cmhs 4s", "cmhs v2.4s, v0.4s, v1.4s")                                           \
+    X(cmhs_2d, "cmhs 2d", "cmhs v2.2d, v0.2d, v1.2d")                                           \
+    X(cmhi_16b, "cmhi 16b", "cmhi v2.16b, v0.16b, v1.16b")                                      \
+    X(cmhi_4s, "cmhi 4s", "cmhi v2.4s, v0.4s, v1.4s")                                           \
+    X(umaxp_16b, "umaxp 16b", "umaxp v2.16b, v0.16b, v1.16b")                                   \
+    X(umaxp_4s, "umaxp 4s", "umaxp v2.4s, v0.4s, v1.4s")                                        \
+    X(smaxp_16b, "smaxp 16b", "smaxp v2.16b, v0.16b, v1.16b")                                   \
+    X(smaxp_4s, "smaxp 4s", "smaxp v2.4s, v0.4s, v1.4s")                                        \
+    X(uminp_8h, "uminp 8h", "uminp v2.8h, v0.8h, v1.8h")                                        \
+    X(uminp_4s, "uminp 4s", "uminp v2.4s, v0.4s, v1.4s")                                        \
+    X(addp_16b, "addp 16b", "addp v2.16b, v0.16b, v1.16b")                                      \
+    X(addp_4s, "addp 4s", "addp v2.4s, v0.4s, v1.4s")                                           \
+    X(addp_2d, "addp 2d, v", "addp v2.2d, v0.2d, v1.2d")                                        \
+    /* narrows, widens, shifts */                                                               \
+    X(xtn2_16b, "xtn2 16b", "mov v2.16b, v3.16b\n xtn2 v2.16b, v0.8h")                          \
+    X(xtn2_8h, "xtn2 8h", "mov v2.16b, v3.16b\n xtn2 v2.8h, v0.4s")                             \
+    X(xtn2_4s, "xtn2 4s", "mov v2.16b, v3.16b\n xtn2 v2.4s, v0.2d")                             \
+    X(addhn_8b, "addhn 8b", "addhn v2.8b, v0.8h, v1.8h")                                        \
+    X(addhn_4h, "addhn 4h", "addhn v2.4h, v0.4s, v1.4s")                                        \
+    X(addhn_2s, "addhn 2s", "addhn v2.2s, v0.2d, v1.2d")                                        \
+    X(sli_16b, "sli 16b #3", "mov v2.16b, v3.16b\n sli v2.16b, v0.16b, #3")                     \
+    X(sri_4s, "sri 4s #7", "mov v2.16b, v3.16b\n sri v2.4s, v0.4s, #7")                         \
+    X(usra_16b, "usra 16b #3", "mov v2.16b, v3.16b\n usra v2.16b, v0.16b, #3")                  \
+    X(usra_4s, "usra 4s #7", "mov v2.16b, v3.16b\n usra v2.4s, v0.4s, #7")                      \
+    X(ssra_2d, "ssra 2d #13", "mov v2.16b, v3.16b\n ssra v2.2d, v0.2d, #13")                    \
+    X(ushl_4s, "ushl 4s", "ushl v2.4s, v0.4s, v1.4s")                                           \
+    X(sshl_16b, "sshl 16b", "sshl v2.16b, v0.16b, v1.16b")                                      \
+    /* copy, move, immediate */                                                                 \
+    X(ins_s_el, "ins s[1], s[3]", "mov v2.16b, v0.16b\n ins v2.s[1], v0.s[3]")                  \
+    X(ins_d_el, "ins d[1], d[0]", "mov v2.16b, v3.16b\n ins v2.d[1], v0.d[0]")                  \
+    X(ins_b_el, "ins b[6], b[1]", "mov v2.16b, v0.16b\n ins v2.b[6], v3.b[1]")                  \
+    X(ins_s_gpr, "ins s[1], w9", "mov v2.16b, v0.16b\n ldr w9, [%1]\n ins v2.s[1], w9")         \
+    X(ins_b_gpr, "ins b[2], w9", "mov v2.16b, v0.16b\n ldr w9, [%1, #4]\n ins v2.b[2], w9")     \
+    X(ext_5, "ext 16b #5", "ext v2.16b, v0.16b, v1.16b, #5")                                    \
+    X(ext_11, "ext 16b #11", "ext v2.16b, v0.16b, v1.16b, #11")                                 \
+    X(zip1_16b, "zip1 16b", "zip1 v2.16b, v0.16b, v1.16b")                                      \
+    X(zip2_16b, "zip2 16b", "zip2 v2.16b, v0.16b, v1.16b")                                      \
+    X(zip1_4s, "zip1 4s", "zip1 v2.4s, v0.4s, v1.4s")                                           \
+    X(zip2_4s, "zip2 4s", "zip2 v2.4s, v0.4s, v1.4s")                                           \
+    X(uzp1_16b, "uzp1 16b", "uzp1 v2.16b, v0.16b, v1.16b")                                      \
+    X(uzp2_16b, "uzp2 16b", "uzp2 v2.16b, v0.16b, v1.16b")                                      \
+    X(uzp1_4s, "uzp1 4s", "uzp1 v2.4s, v0.4s, v1.4s")                                           \
+    X(uzp2_4s, "uzp2 4s", "uzp2 v2.4s, v0.4s, v1.4s")                                           \
+    X(trn1_16b, "trn1 16b", "trn1 v2.16b, v0.16b, v1.16b")                                      \
+    X(trn2_16b, "trn2 16b", "trn2 v2.16b, v0.16b, v1.16b")                                      \
+    X(trn1_4s, "trn1 4s", "trn1 v2.4s, v0.4s, v1.4s")                                           \
+    X(trn2_4s, "trn2 4s", "trn2 v2.4s, v0.4s, v1.4s")                                           \
+    X(tbl_1reg, "tbl 16b, 1 table", "tbl v2.16b, {v0.16b}, v1.16b")                             \
+    X(tbl_2reg, "tbl 16b, 2 tables", "tbl v2.16b, {v0.16b, v1.16b}, v4.16b")                    \
+    X(tbx_1reg, "tbx 16b, 1 table", "mov v2.16b, v3.16b\n tbx v2.16b, {v0.16b}, v1.16b")
+
+/* Scalar floating point: moves between the GPR and FP register files, and the integer
+ * conversions. Arithmetic (fadd, fcmp, fcsel, fcvt) is not translated yet, so it is not here. */
+#define FP_CASES(X)                                                                        \
+    X(fmov_w_s, "fmov %w0, s0", "fmov %w0, s0")                                            \
+    X(fmov_x_d, "fmov %0, d0", "fmov %0, d0")                                              \
+    X(fmov_s_w, "fmov s2, w0-in", "fmov s2, %w1\n" S2W)                                    \
+    X(fmov_d_x, "fmov d2, x0-in", "fmov d2, %3\n" D2X)                                     \
+    X(scvtf_s_w, "scvtf s, w0-in", "scvtf s2, %w1\n" S2W)                                  \
+    X(ucvtf_s_w, "ucvtf s, w0-in", "ucvtf s2, %w1\n" S2W)                                  \
+    X(scvtf_d_x, "scvtf d, x0-in", "scvtf d2, %3\n" D2X)                                   \
+    X(ucvtf_d_x, "ucvtf d, x0-in", "ucvtf d2, %3\n" D2X)                                   \
+    X(fcvtzs_w_s, "fcvtzs w, s", "fcvtzs w9, s0\n mov %0, x9")                             \
+    X(fcvtzu_w_s, "fcvtzu w, s", "fcvtzu w9, s0\n mov %0, x9")                             \
+    X(fcvtzs_x_d, "fcvtzs x, d", "fcvtzs %0, d0")                                          \
+    X(fcvtzu_x_d, "fcvtzu x, d", "fcvtzu %0, d0")
+
+struct vcase {
+    void (*fn)(void);
+    const char *name;
+};
+
+struct xcase {
+    unsigned long (*fn)(void);
+    const char *name;
+};
+
+struct fcase {
+    unsigned long (*fn)(unsigned int, unsigned int, unsigned long, unsigned long);
+    const char *name;
+};
+
+#define U_DEF(name, tag, body) DEF_U(u_##name, body)
+#define B_DEF(name, tag, body) DEF_B(b_##name, body)
+#define X_DEF(name, tag, body) DEF_X(x_##name, body)
+#define F_DEF(name, tag, body) DEF_F(f_##name, body)
+#define U_ENTRY(name, tag, body) {u_##name, tag},
+#define B_ENTRY(name, tag, body) {b_##name, tag},
+#define X_ENTRY(name, tag, body) {x_##name, tag},
+#define F_ENTRY(name, tag, body) {f_##name, tag},
+
+L_CASES(B_DEF)
+U_CASES(U_DEF)
+X_CASES(X_DEF)
+B_CASES(B_DEF)
+FP_CASES(F_DEF)
+
+static const struct vcase wide_cases[] = {L_CASES(B_ENTRY)};
+static const struct vcase unary_cases[] = {U_CASES(U_ENTRY)};
+static const struct vcase binary_cases[] = {B_CASES(B_ENTRY)};
+static const struct xcase gpr_cases[] = {X_CASES(X_ENTRY)};
+static const struct fcase fp_cases[] = {FP_CASES(F_ENTRY)};
+
+static const unsigned char pairs[][2] = {{0, 1}, {2, 3}, {4, 0}, {4, 3}};
+
+struct fp_in {
+    unsigned int f;
+    unsigned long d;
+};
+
+static const struct fp_in fp_in[] = {
+    {0x00000000u, 0x0000000000000000ul}, /* +0.0 */
+    {0x80000000u, 0x8000000000000000ul}, /* -0.0 */
+    {0x3f800000u, 0x3ff0000000000000ul}, /* 1.0 */
+    {0xc0200000u, 0xc00c000000000000ul}, /* -2.5 / -3.5 */
+    {0x7149f2cau, 0x47e0c37937e08000ul}, /* 1e30 */
+    {0x7f800000u, 0x7ff0000000000000ul}, /* +inf */
+    {0xff800000u, 0xfff0000000000000ul}, /* -inf */
+    {0x3f400000u, 0x3fe8000000000000ul}, /* 0.75 */
+    {0x4f000000u, 0x4330000000000000ul}, /* 2^31, 2^52 */
+    {0xcf000000u, 0xc330000000000000ul}, /* -2^31, -2^52 */
+    {0x7fc00000u, 0x7ff8000000000000ul}, /* quiet NaN */
+    {0x7f7fffffu, 0x7feffffffffffffful}, /* float max, double max */
+    {0x3fc00000u, 0x3ff8000000000000ul}, /* 1.5 */
+};
+
+static const unsigned char fp_pairs[][2] = {
+    {0, 2}, {2, 3}, {3, 12}, {4, 2}, {5, 6}, {8, 3}, {9, 3}, {6, 5}, {10, 2}, {2, 10},
+};
+
+__attribute__((used)) void GUEST_ENTRY(void) {
+    unsigned long n, p;
+
+    setup();
+
+    for (n = 0; n < sizeof wide_cases / sizeof wide_cases[0]; n++) {
+        for (p = 0; p < sizeof pairs / sizeof pairs[0]; p++) {
+            pa = patr + 32 * pairs[p][0];
+            pb = patr + 32 * pairs[p][1];
+            zero_results();
+            wide_cases[n].fn();
+            put_tag(wide_cases[n].name, pairs[p][0], pairs[p][1]);
+            put_results(4);
+        }
+    }
+
+    for (n = 0; n < sizeof unary_cases / sizeof unary_cases[0]; n++) {
+        for (int i = 0; i < NPAT; i++) {
+            pa = patr + 32 * i;
+            pb = patr + 32 * ((i + 1) % NPAT);
+            zero_results();
+            unary_cases[n].fn();
+            put_tag(unary_cases[n].name, i, -1);
+            put_results(2);
+        }
+    }
+
+    for (n = 0; n < sizeof binary_cases / sizeof binary_cases[0]; n++) {
+        for (p = 0; p < sizeof pairs / sizeof pairs[0]; p++) {
+            pa = patr + 32 * pairs[p][0];
+            pb = patr + 32 * pairs[p][1];
+            zero_results();
+            binary_cases[n].fn();
+            put_tag(binary_cases[n].name, pairs[p][0], pairs[p][1]);
+            put_results(2);
+        }
+    }
+
+    for (n = 0; n < sizeof gpr_cases / sizeof gpr_cases[0]; n++) {
+        for (int i = 0; i < NPAT; i++) {
+            pa = patr + 32 * i;
+            put_tag(gpr_cases[n].name, i, -1);
+            put_hex(gpr_cases[n].fn());
+        }
+    }
+
+    for (n = 0; n < sizeof fp_cases / sizeof fp_cases[0]; n++) {
+        for (p = 0; p < sizeof fp_pairs / sizeof fp_pairs[0]; p++) {
+            put_tag(fp_cases[n].name, fp_pairs[p][0], fp_pairs[p][1]);
+            put_hex(fp_cases[n].fn(fp_in[fp_pairs[p][0]].f, fp_in[fp_pairs[p][1]].f,
+                                   fp_in[fp_pairs[p][0]].d, fp_in[fp_pairs[p][1]].d));
+        }
+    }
+
+    flush();
+    GUEST_EXIT(0);
+}

@@ -210,6 +210,7 @@ pub mod simd {
     pub const I8X16_GE_S: u32 = 0x2b;
     pub const I8X16_GE_U: u32 = 0x2c;
     pub const I16X8_EQ: u32 = 0x2d;
+    pub const I16X8_NE: u32 = 0x2e;
     pub const I16X8_LT_S: u32 = 0x2f;
     pub const I16X8_GT_S: u32 = 0x31;
     pub const I16X8_GT_U: u32 = 0x32;
@@ -217,6 +218,7 @@ pub mod simd {
     pub const I16X8_GE_S: u32 = 0x35;
     pub const I16X8_GE_U: u32 = 0x36;
     pub const I32X4_EQ: u32 = 0x37;
+    pub const I32X4_NE: u32 = 0x38;
     pub const I32X4_LT_S: u32 = 0x39;
     pub const I32X4_GT_S: u32 = 0x3b;
     pub const I32X4_GT_U: u32 = 0x3c;
@@ -331,8 +333,11 @@ pub mod simd {
     pub const I64X2_SUB: u32 = 0xd1;
     pub const I64X2_MUL: u32 = 0xd5;
     pub const I64X2_EQ: u32 = 0xd6;
+    pub const I64X2_NE: u32 = 0xd7;
     pub const I64X2_LT_S: u32 = 0xd8;
     pub const I64X2_GT_S: u32 = 0xd9;
+    pub const I64X2_LE_S: u32 = 0xda;
+    pub const I64X2_GE_S: u32 = 0xdb;
     pub const F32X4_ABS: u32 = 0xe0;
     pub const F32X4_NEG: u32 = 0xe1;
     pub const F32X4_SQRT: u32 = 0xe3;
