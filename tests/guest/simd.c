@@ -270,7 +270,15 @@ static void setup(void) {
     X(umov_d1, "umov %0, d[1]", "umov %0, v0.d[1]")                                             \
     X(smov_b5, "smov %w0, b[5]", "smov %w0, v0.b[5]")                                           \
     X(smov_h2, "smov %w0, h[2]", "smov %w0, v0.h[2]")                                           \
-    X(smov_s1, "smov %0, s[1]", "smov %0, v0.s[1]")
+    X(smov_s1, "smov %0, s[1]", "smov %0, v0.s[1]")                                            \
+    /* The pair forms write the base register back, which is the half of them a load does not read. */ \
+    X(ldp_q_pre_wb, "ldp q pre-index writeback",                                                \
+      "mov %0, x9\n ldr q2, [x9]\n stp q2, q2, [x9, #16]\n ldp q0, q1, [x9, #16]!\n"          \
+      " sub %0, x9, %0")                                                                        \
+    X(ldp_q_pre_neg_wb, "ldp q pre-index writeback back",                                       \
+      "mov %0, x9\n add x9, x9, #32\n ldp q0, q1, [x9, #-16]!\n sub %0, x9, %0")               \
+    X(stp_q_post_wb, "stp q post-index writeback",                                              \
+      "mov %0, x9\n ldr q2, [x9]\n stp q2, q2, [x9], #32\n sub %0, x9, %0")
 
 #define B_CASES(X)                                                                              \
     /* three-same integer */                                                                    \
@@ -315,6 +323,10 @@ static void setup(void) {
     X(cmge_16b, "cmge 16b", "cmge v2.16b, v0.16b, v1.16b")                                      \
     X(cmge_4s, "cmge 4s", "cmge v2.4s, v0.4s, v1.4s")                                           \
     X(cmeq_16b, "cmeq 16b", "cmeq v2.16b, v0.16b, v1.16b")                                      \
+    X(cmeq_8b, "cmeq 8b", "cmeq v2.8b, v0.8b, v1.8b")                                           \
+    X(cmeq_4h, "cmeq 4h", "cmeq v2.4h, v0.4h, v1.4h")                                           \
+    X(cmeqz_16b, "cmeq 16b #0", "cmeq v2.16b, v0.16b, #0")                                      \
+    X(cmeqz_8b, "cmeq 8b #0", "cmeq v2.8b, v0.8b, #0")                                          \
     X(cmeq_4s, "cmeq 4s", "cmeq v2.4s, v0.4s, v1.4s")                                           \
     X(cmeq_2d, "cmeq 2d", "cmeq v2.2d, v0.2d, v1.2d")                                           \
     X(cmhs_16b, "cmhs 16b", "cmhs v2.16b, v0.16b, v1.16b")                                      \
@@ -326,6 +338,7 @@ static void setup(void) {
     X(umaxp_4s, "umaxp 4s", "umaxp v2.4s, v0.4s, v1.4s")                                        \
     X(smaxp_16b, "smaxp 16b", "smaxp v2.16b, v0.16b, v1.16b")                                   \
     X(smaxp_4s, "smaxp 4s", "smaxp v2.4s, v0.4s, v1.4s")                                        \
+    X(uminp_16b, "uminp 16b", "uminp v2.16b, v0.16b, v1.16b")                                   \
     X(uminp_8h, "uminp 8h", "uminp v2.8h, v0.8h, v1.8h")                                        \
     X(uminp_4s, "uminp 4s", "uminp v2.4s, v0.4s, v1.4s")                                        \
     X(addp_16b, "addp 16b", "addp v2.16b, v0.16b, v1.16b")                                      \

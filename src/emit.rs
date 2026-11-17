@@ -169,6 +169,34 @@ fn is_terminator(i: &Insn) -> bool {
     )
 }
 
+/// Whether an instruction's destination is a 64-bit form, which writes the low half and leaves the
+/// upper half zero. Lane inserts are not in this list: they leave the rest of the register alone.
+fn narrows_to_low_half(i: &Insn) -> bool {
+    match *i {
+        Insn::VecLd1 { q, .. }
+        | Insn::VecLd1r { q, .. }
+        | Insn::VecThreeSame { q, .. }
+        | Insn::VecTwoMisc { q, .. }
+        | Insn::VecAcross { q, .. }
+        | Insn::VecThreeDiff { q, .. }
+        | Insn::VecModImm { q, .. }
+        | Insn::VecPermute { q, .. }
+        | Insn::VecExt { q, .. }
+        | Insn::VecTbl { q, .. } => !q,
+        // sshll and ushll widen into the whole destination even with the q bit clear.
+        Insn::VecShiftImm { q, op, .. } => !q && op != 0b10100,
+        _ => false,
+    }
+}
+
+/// Whether control can continue at the next instruction after this one. The branch emitters end a
+/// block with the taken path, so the fallthrough has to be emitted as a jump of its own when the
+/// next instruction is not the region's next block: a page region reaches its blocks in the order
+/// the control flow graph finds them, which is not the order the code runs in.
+fn falls_through(i: &Insn) -> bool {
+    matches!(i, Insn::BCond { .. } | Insn::Cbz { .. } | Insn::Tbz { .. })
+}
+
 fn page_align(x: u64) -> u64 {
     (x + 0xfff) & !0xfff
 }
@@ -1626,6 +1654,9 @@ struct RegionEmitter<'a> {
     unsupported: &'a mut Vec<(u64, String)>,
     open: u32,
     cur_pc: u64,
+    /// Whether the instruction being emitted is a 64-bit vector form, whose destination keeps the
+    /// upper half clear.
+    narrow: bool,
 }
 
 impl<'a> RegionEmitter<'a> {
@@ -1637,7 +1668,7 @@ impl<'a> RegionEmitter<'a> {
     ) -> Self {
         let mut f = Func::new(ids.ty_region);
         f.locals = vec![I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128];
-        RegionEmitter { f, region, layout, ids, unsupported, open: 0, cur_pc: 0 }
+        RegionEmitter { f, region, layout, ids, unsupported, open: 0, cur_pc: 0, narrow: false }
     }
 
     fn emit(mut self) -> Result<Func, String> {
@@ -1679,23 +1710,22 @@ impl<'a> RegionEmitter<'a> {
     fn emit_block(&mut self, i: usize) -> Result<(), String> {
         let insns = self.region.blocks[i].insns.clone();
         let mut next = self.region.blocks[i].addr;
-        let mut ended = false;
         for (addr, insn) in insns {
             next = addr + 4;
             if is_terminator(&insn) {
                 self.emit_trace(addr);
                 self.emit_term(addr, insn)?;
-                ended = true;
+                if !falls_through(&insn) {
+                    return Ok(());
+                }
                 break;
             }
             self.emit_insn(addr, insn)?;
         }
-        if !ended {
-            let n = self.region.blocks.len();
-            let falls = i + 1 < n && self.region.blocks[i + 1].addr == next;
-            if !falls {
-                self.emit_jump(next);
-            }
+        let n = self.region.blocks.len();
+        let falls = i + 1 < n && self.region.blocks[i + 1].addr == next;
+        if !falls {
+            self.emit_jump(next);
         }
         Ok(())
     }
@@ -2174,6 +2204,16 @@ impl<'a> RegionEmitter<'a> {
     }
 
     fn setv(&mut self, r: u32) {
+        if self.narrow {
+            // The 64-bit forms write the low half only. Guest code reads the register whole, so the
+            // upper half has to be zero rather than whatever the operation left there.
+            self.f.ls(L_V3);
+            self.f.lg(L_V3);
+            self.f.v128c([
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]);
+            self.f.simd(simd::V128_AND);
+        }
         self.f.ls(NVEC0 + r);
     }
 
@@ -2626,6 +2666,7 @@ impl<'a> RegionEmitter<'a> {
 
     fn emit_insn(&mut self, addr: u64, insn: Insn) -> Result<(), String> {
         self.cur_pc = addr;
+        self.narrow = narrows_to_low_half(&insn);
         self.emit_trace(addr);
         match insn {
             Insn::Hint => {}
@@ -3421,8 +3462,13 @@ impl<'a> RegionEmitter<'a> {
                     self.vstore(width, L_T1, rt2);
                 }
                 match mode {
+                    // L_T2 holds the address the pair was accessed at, so a pre-indexed writeback
+                    // is that address and a post-indexed one is the address plus the offset.
                     PairMode::PostIndex => self.writeback(rn, L_T2, offset),
-                    PairMode::PreIndex => self.writeback(rn, L_T2, offset),
+                    PairMode::PreIndex => {
+                        self.f.lg(L_T2);
+                        self.f.ls(rn);
+                    }
                     PairMode::Offset => {}
                 }
             }

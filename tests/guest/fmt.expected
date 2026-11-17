@@ -1,0 +1,15 @@
+str 1 strchrnul=0 char=0x25 strchr=0 strlen=8
+str 2 strchrnul=22 char=0x0 strchr=-1 strlen=22
+str 3 strchrnul=67 char=0x25 strchr=67 strlen=68
+str 4 strchrnul=0 char=0x25 strchr=0 strlen=1
+str 5 strchrnul=1 char=0x0 strchr=-1 strlen=1
+str 6 strchrnul=0 char=0x0 strchr=-1 strlen=0
+str 7 strchrnul=32 char=0x25 strchr=32 strlen=49
+fmt 1 query=9 write=9 text="dash: 1: "
+fmt 2 query=33 write=33 text="dash: 1: nosuchcommand: not found"
+fmt 3 query=2 write=2 text="42"
+fmt 4 query=5 write=5 text="hello"
+fmt 5 query=13 write=13 text="1234567890123"
+fmt 6 query=7 write=7 text="dash: x"
+fmt 7 query=5 write=5 text="plain"
+fmt 8 query=1 write=1 text="A"

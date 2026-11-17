@@ -118,6 +118,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             let out_path = out.ok_or("missing -o <out.wasm>")?;
             let main = load_image(path, None)?;
+            let mut interp_host: Option<String> = None;
             let interp = match &main.interp {
                 None => None,
                 Some(want) => {
@@ -127,6 +128,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     let resolved = resolved.ok_or_else(|| {
                         format!("{path} wants {want} as its interpreter: pass --rootfs=<dir> or --interp=<elf>")
                     })?;
+                    interp_host = Some(resolved.clone());
                     Some(load_image(&resolved, Some(interp_base))?)
                 }
             };
@@ -137,12 +139,26 @@ fn run(args: &[String]) -> Result<(), String> {
             let elapsed = started.elapsed();
 
             std::fs::write(&out_path, &res.wasm).map_err(|e| format!("{out_path}: {e}"))?;
+            // The images placed here, so the host can translate a page of one that a run reaches
+            // after the scan is over: a jump table names code nothing in the image branches to.
+            let placed: Vec<String> = std::iter::once((path.clone(), &main))
+                .chain(interp_host.clone().zip(interp.as_ref()))
+                .map(|(host, image)| {
+                    format!(
+                        "{{\"host\":{},\"base\":{},\"lo\":{},\"hi\":{}}}",
+                        json_str(&host),
+                        image.load_offset(),
+                        image.load_offset(),
+                        image.image_end()
+                    )
+                })
+                .collect();
             let meta = format!(
                 concat!(
                     "{{\"entry\":{},\"sp\":{},\"mem_pages\":{},\"code_lo\":{},\"code_hi\":{},",
                     "\"pte_base\":{},\"table_base\":{},\"table_mask\":{},",
                     "\"heap_base\":{},\"heap_limit\":{},\"mmap_base\":{},",
-                    "\"stack_floor\":{},\"bounds\":{},\"trace\":{}}}\n"
+                    "\"stack_floor\":{},\"bounds\":{},\"trace\":{},\"images\":[{}]}}\n"
                 ),
                 res.entry,
                 res.sp,
@@ -157,7 +173,8 @@ fn run(args: &[String]) -> Result<(), String> {
                 res.map.mmap_base,
                 res.map.stack_floor,
                 if cfg.bounds_check { 1 } else { 0 },
-                if cfg.trace { 1 } else { 0 }
+                if cfg.trace { 1 } else { 0 },
+                placed.join(",")
             );
             let meta_path = format!("{out_path}.json");
             let mut f = std::fs::File::create(&meta_path).map_err(|e| e.to_string())?;

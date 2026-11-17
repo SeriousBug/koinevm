@@ -70,6 +70,21 @@ export class Mach {
     this.view = new DataView(memory.buffer);
   }
 
+  /// What the dispatch table says about a pc, for checking an insert against the answer.
+  lookup(pc) {
+    const key = pc >>> 2;
+    const want = key + 1;
+    const mask = this.meta.table_mask >>> 0;
+    let at = (key & mask) >>> 0;
+    for (;;) {
+      const addr = this.meta.table_base + at * TABLE_SLOT;
+      const tag = this.view.getUint32(addr + 4, true);
+      if (tag === want) return this.view.getUint32(addr, true);
+      if (tag === 0) return 0;
+      at = (at + 1) & mask;
+    }
+  }
+
   /// Open-addressing insert, the same probe the translator uses to build the table.
   dispatch(pc, slot, block) {
     const key = pc >>> 2;
@@ -83,6 +98,9 @@ export class Mach {
       if (tag === 0) {
         this.view.setUint32(addr, ((slot + 1) | (block << 16)) >>> 0, true);
         this.view.setUint32(addr + 4, want, true);
+        if (process.env.ARMJIT_DISPATCH_PC && pc === Number(process.env.ARMJIT_DISPATCH_PC)) {
+          console.error(`dispatch 0x${pc.toString(16)} -> slot 0x${slot.toString(16)} block ${block}`);
+        }
         return;
       }
       at = (at + 1) & mask;
@@ -139,6 +157,13 @@ export class Mach {
       page.instance = new WebAssembly.Instance(mod, {
         env: { ...this.imports, mem: this.memory },
       });
+      // The dispatch entry packs the region slot and the block index into 16 bits each, so a run
+      // that translates enough pages to need more than 65535 slots corrupts every later entry.
+      if (this.slots + page.regions.length > 0xffff) {
+        throw new Error(
+          `region slots exhausted: ${this.slots} in use, ${page.regions.length} more for 0x${pc.toString(16)}`,
+        );
+      }
       this.growTo(this.slots + page.regions.length);
       page.base = this.slots;
       for (let i = 0; i < page.regions.length; i++) {
@@ -161,8 +186,13 @@ export class Mach {
 
   /// Run until the guest exits, or a jump lands where nothing has been translated yet.
   async run() {
+    const after = process.env.ARMJIT_WATCHDOG ? Number(process.env.ARMJIT_WATCHDOG) * 1000 : 0;
+    const startedAt = Date.now();
     let status = this.instance.exports.run(this.meta.entry, BigInt(this.meta.sp), 0);
     while (status === 2) {
+      // A run that never ends is only observable from here: the guest's wasm call does not return
+      // while it spins, so the loop that translates pages is the one place time can be checked.
+      if (after && Date.now() - startedAt > after) return 4;
       const pc = this.view.getUint32(SHADOW_PC, true) >>> 0;
       if (process.env.ARMJIT_TRACE_PAGES) {
       console.error(`images: ${JSON.stringify(this.kernel.space.images.map((m) => [m.lo.toString(16), m.hi.toString(16), m.base.toString(16), m.host]))}`);

@@ -475,7 +475,16 @@ fn decode_dp_reg(w: u32, sf: bool, rd: u32, rn: u32, rm: u32) -> Insn {
                     rn,
                 }
             }
-            0b0100 => Insn::CondSelect { sf, op2: (w >> 10) & 3, rm, cond: (w >> 12) & 0xf, rn, rd },
+            // op2 is two bits in two places: bit 30 says invert instead of select, bit 10 says
+            // increment or negate the else operand.
+            0b0100 => Insn::CondSelect {
+                sf,
+                op2: (((w >> 30) & 1) << 1) | ((w >> 10) & 1),
+                rm,
+                cond: (w >> 12) & 0xf,
+                rn,
+                rd,
+            },
             0b0110 => {
                 let opcode = (w >> 10) & 0x3f;
                 if (w >> 29) & 3 == 0b10 {
@@ -617,7 +626,7 @@ fn decode_simd_loadstore(w: u32) -> Insn {
         };
         let is_load = (w >> 22) & 1 != 0;
         let mode = match (w >> 23) & 3 {
-            0b00 => PairMode::PostIndex,
+            0b01 => PairMode::PostIndex,
             0b10 => PairMode::Offset,
             0b11 => PairMode::PreIndex,
             _ => return Insn::Undefined,
