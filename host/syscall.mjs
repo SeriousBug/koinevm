@@ -110,7 +110,7 @@ export class Kernel {
   /// The two `struct timespec` a `utimensat` caller passes, as seconds: a nanosecond field of
   /// UTIME_OMIT or UTIME_NOW is the marker that says the value is not a time at all.
   timespecPair(addr) {
-    const at = this.addr(addr);
+    const at = BigInt(this.addr(addr));
     const one = (offset) => {
       const sec = Number(this.u64(at + BigInt(offset)));
       const nsec = Number(this.u64(at + BigInt(offset) + 8n));
@@ -384,8 +384,10 @@ export class Kernel {
     this.on(55, () => [0n, 0]); // fchown
 
     this.on(88, (k, dirfd, path, times, flags) => {
-      const at = k.str(path);
       const wanted = Number(times) === 0 ? null : k.timespecPair(times);
+      // A null path is `futimens`: the descriptor is the file, not a name in a directory.
+      if (k.addr(path) === 0) return [BigInt(k.files.utimensFd(Number(dirfd), wanted)), 0];
+      const at = k.str(path);
       return [BigInt(k.files.utimens(at, Number(dirfd), wanted, (Number(flags) & 0x100) === 0)), 0];
     });
 
@@ -475,9 +477,10 @@ export class Kernel {
       if (n > 1024) return k.fail(EINVAL);
       let total = 0;
       for (let i = 0; i < n; i++) {
-        const base = k.u64(iov) + BigInt(i) * 16n;
-        const len = Number(k.u64(base + 8n));
-        const at = k.u64(base);
+        // A `struct iovec` is the address and then the length, and the array is at `iov`.
+        const entry = k.addr(iov) + i * 16;
+        const at = k.u64(entry);
+        const len = Number(k.u64(entry + 8));
         const bytes = k.read(at, len);
         if (bytes === null) {
           if (process.env.ARMJIT_TRACE_SYSCALLS)
@@ -561,8 +564,10 @@ export class Kernel {
       } catch {
         return [BigInt(-ENOENT), 0];
       }
-      const put = (off, v) => k.put64(buf + BigInt(off), BigInt(v));
-      put(0, st.type);
+      const put = (off, v) => k.put64(buf + BigInt(off), BigInt(v ?? 0));
+      // The filesystem type a Linux program expects to see, and the name limit it plans around;
+      // the host's answer has neither under the same names.
+      put(0, 0xef53); // EXT2_SUPER_MAGIC
       put(8, st.bsize);
       put(16, st.blocks);
       put(24, st.bfree);
@@ -570,7 +575,7 @@ export class Kernel {
       put(40, st.files);
       put(48, st.ffree);
       put(56, 0);
-      put(64, st.namelen);
+      put(64, 255);
       put(72, st.frsize ?? st.bsize);
       put(80, 0);
       for (let i = 0; i < 4; i++) put(88 + i * 8, 0);
@@ -602,8 +607,10 @@ export class Kernel {
     this.put64(addr + 8n, st.ino ?? 0n);
     this.put32(addr + 16n, Number(st.mode ?? 0n));
     this.put32(addr + 20n, Number(st.nlink ?? 0n));
-    this.put32(addr + 24n, Number(st.uid ?? 0n));
-    this.put32(addr + 28n, Number(st.gid ?? 0n));
+    // Every file belongs to the one user this machine has, which is the id `getuid` answers:
+    // a stat that reported the host's ids would say the tree belongs to someone the guest is not.
+    this.put32(addr + 24n, 0);
+    this.put32(addr + 28n, 0);
     this.put64(addr + 32n, st.rdev ?? 0n);
     this.put64(addr + 40n, 0n);
     this.put64(addr + 48n, st.size ?? 0n);

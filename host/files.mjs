@@ -84,8 +84,11 @@ export class Files {
   /// A `*at` call's path: an absolute one is the guest's root, a relative one is the directory
   /// descriptor it was given, which is either the process's own directory or an open one.
   resolveAt(name, dirfd) {
-    if (name.startsWith("/") || dirfd === AT_FDCWD) return this.resolve(name);
-    const entry = this.map.get(dirfd);
+    // A descriptor is a 32-bit int in the ABI, and AT_FDCWD arrives as -100 in whichever width the
+    // caller used for it.
+    const fd = Number(BigInt.asIntN(32, BigInt(dirfd)));
+    if (name.startsWith("/") || fd === AT_FDCWD) return this.resolve(name);
+    const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     if (entry.kind !== "dir") return -ENOTDIR;
     const clean = path.posix.normalize(name);
