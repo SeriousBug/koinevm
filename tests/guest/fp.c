@@ -215,6 +215,51 @@ static float s_fcvt_from_double(double a) {
     return r;
 }
 
+/* A conversion to an integer, one per rounding mode the instruction names, plus the two that
+ * round ties away from zero. */
+#define CVT_D(name, insn)                                                                     \
+    static unsigned long name(double a) {                                                     \
+        long r;                                                                               \
+        __asm__ volatile(insn " %0, %d1" : "=r"(r) : "w"(a));                                  \
+        return (unsigned long)r;                                                              \
+    }
+#define CVT_S(name, insn)                                                                     \
+    static unsigned long name(float a) {                                                      \
+        unsigned int r;                                                                       \
+        __asm__ volatile(insn " %w0, %s1" : "=r"(r) : "w"(a));                                 \
+        return r;                                                                             \
+    }
+
+CVT_D(d_fcvtns, "fcvtns")
+CVT_D(d_fcvtnu, "fcvtnu")
+CVT_D(d_fcvtps, "fcvtps")
+CVT_D(d_fcvtpu, "fcvtpu")
+CVT_D(d_fcvtms, "fcvtms")
+CVT_D(d_fcvtmu, "fcvtmu")
+CVT_D(d_fcvtzs, "fcvtzs")
+CVT_D(d_fcvtzu, "fcvtzu")
+CVT_D(d_fcvtas, "fcvtas")
+CVT_D(d_fcvtau, "fcvtau")
+CVT_S(s_fcvtns, "fcvtns")
+CVT_S(s_fcvtnu, "fcvtnu")
+CVT_S(s_fcvtps, "fcvtps")
+CVT_S(s_fcvtpu, "fcvtpu")
+CVT_S(s_fcvtms, "fcvtms")
+CVT_S(s_fcvtmu, "fcvtmu")
+CVT_S(s_fcvtzs, "fcvtzs")
+CVT_S(s_fcvtzu, "fcvtzu")
+CVT_S(s_fcvtas, "fcvtas")
+CVT_S(s_fcvtau, "fcvtau")
+
+/* The comparisons against zero that leave a mask in the lane rather than the flags. */
+#define CMPZ_D(name, insn)                                                                    \
+    static unsigned long name(double a) {                                                     \
+        unsigned long r;                                                                      \
+        __asm__ volatile(insn " %d0, %d0, #0" : "=w"(a) : "0"(a));                             \
+        __asm__ volatile("fmov %0, d0" : "=r"(r) : "w"(a));                                    \
+        return r;                                                                             \
+    }
+
 /* The eight-bit immediate, which is the one place the encoding of a constant is not the bit
  * pattern of anything. */
 #define IMM(name, imm)                                                                        \
@@ -422,6 +467,33 @@ __attribute__((used)) void GUEST_ENTRY(void) {
     put_name("fcvt s<-d");
     for (unsigned long i = 0; i < ND; i++)
         put_bits32(u_of_f(s_fcvt_from_double(d_of(dvals[i]))));
+
+    put_name("fcvt to int");
+    for (unsigned long i = 0; i < ND; i++) {
+        put_bits(d_fcvtns(d_of(dvals[i])));
+        put_bits(d_fcvtnu(d_of(dvals[i])));
+        put_bits(d_fcvtps(d_of(dvals[i])));
+        put_bits(d_fcvtpu(d_of(dvals[i])));
+        put_bits(d_fcvtms(d_of(dvals[i])));
+        put_bits(d_fcvtmu(d_of(dvals[i])));
+        put_bits(d_fcvtzs(d_of(dvals[i])));
+        put_bits(d_fcvtzu(d_of(dvals[i])));
+        put_bits(d_fcvtas(d_of(dvals[i])));
+        put_bits(d_fcvtau(d_of(dvals[i])));
+    }
+    put_name("fcvt to int s");
+    for (unsigned long i = 0; i < NF; i++) {
+        put_bits(s_fcvtns(f_of(fvals[i])));
+        put_bits(s_fcvtnu(f_of(fvals[i])));
+        put_bits(s_fcvtps(f_of(fvals[i])));
+        put_bits(s_fcvtpu(f_of(fvals[i])));
+        put_bits(s_fcvtms(f_of(fvals[i])));
+        put_bits(s_fcvtmu(f_of(fvals[i])));
+        put_bits(s_fcvtzs(f_of(fvals[i])));
+        put_bits(s_fcvtzu(f_of(fvals[i])));
+        put_bits(s_fcvtas(f_of(fvals[i])));
+        put_bits(s_fcvtau(f_of(fvals[i])));
+    }
 
     put_name("fmov imm");
     put_bits(d_imm_1());

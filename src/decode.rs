@@ -129,7 +129,7 @@ pub enum Insn {
     /// `tbl`/`tbx`: byte permutation through a table of one to four registers.
     VecTbl { q: bool, tbx: bool, len: u32, rn: u32, rm: u32, rd: u32 },
     /// Scalar FP between the vector file and the general registers: `fmov`, `fcvtzs`, ...
-    FpToGpr { sf: bool, signed: bool, size: u32, rmode: u32, opcode: u32, rn: u32, rd: u32 },
+    FpToGpr { sf: bool, signed: bool, size: u32, round: u32, fmov: bool, rn: u32, rd: u32 },
     GprToFp { sf: bool, signed: bool, size: u32, rmode: u32, opcode: u32, rn: u32, rd: u32 },
     /// `fcvtzs`/`fcvtzu` with a fraction-bit count: the fixed-point conversion a scaled cast uses.
     FpToGprFixed { sf: bool, unsigned: bool, size: u32, fbits: u32, rn: u32, rd: u32 },
@@ -142,6 +142,9 @@ pub enum Insn {
     FpCompare { size: u32, signaling: bool, zero: bool, rn: u32, rm: u32 },
     /// The fused multiply-add group: `fmadd`, `fmsub`, `fnmadd`, `fnmsub`.
     FpFused { size: u32, negate_product: bool, subtract: bool, rn: u32, rm: u32, ra: u32, rd: u32 },
+    /// A scalar `fcmge`/`fcmgt`/`fcmle`/`fcmlt`/`fcmeq` against `#0.0`, which writes a mask into the
+    /// destination lane rather than the condition flags. `op` is 0 eq, 1 ge, 2 gt, 3 le, 4 lt.
+    FpCompareZero { double: bool, op: u32, integer: bool, rn: u32, rd: u32 },
     /// `fcsel`: a conditional select between two FP registers.
     FpCondSelect { size: u32, cond: u32, rn: u32, rm: u32, rd: u32 },
     /// Scalar FP with an immediate: `fmov s0, #1.0`.
@@ -785,6 +788,16 @@ fn decode_simd_multi(w: u32) -> Insn {
     }
 }
 
+/// How a conversion to an integer rounds, which the two-bit field of the instruction names, except
+/// for the two that ask for ties away from zero.
+pub mod round {
+    pub const ZERO: u32 = 0;
+    pub const NEAREST: u32 = 1;
+    pub const UP: u32 = 2;
+    pub const DOWN: u32 = 3;
+    pub const AWAY: u32 = 4;
+}
+
 /// Vector data processing (bit 28 clear) and scalar FP (bit 28 set).
 fn decode_simd_dp(w: u32) -> Insn {
     if (w >> 28) & 1 == 1 {
@@ -862,11 +875,62 @@ fn decode_scalar_fp(w: u32) -> Insn {
     // one. The direction is a property of those codes, not of a direction bit.
     if (w >> 21) & 1 == 1 && (w >> 10) & 0x3f == 0 {
         let code = (w >> 16) & 0x1f;
-        return match code {
-            6 | 24..=31 => Insn::FpToGpr { sf, signed: code != 6 && code & 1 == 0, size, rmode, opcode: code, rn, rd },
-            7 | 2..=3 => Insn::GprToFp { sf, signed: code != 7 && code == 2, size, rmode, opcode: code, rn, rd },
-            _ => Insn::Undefined,
+        let opcode = code & 7;
+        // The top two bits of the field are the rounding mode: nearest, towards +inf, towards
+        // -inf, towards zero. Opcode 100 and 101 name ties away from zero, which no mode does.
+        let round = match opcode {
+            0b100 | 0b101 => round::AWAY,
+            _ => match code >> 3 {
+                0 => round::NEAREST,
+                1 => round::UP,
+                2 => round::DOWN,
+                _ => round::ZERO,
+            },
         };
+        return match code {
+            6 => Insn::FpToGpr { sf, signed: false, size, round: round::ZERO, fmov: true, rn, rd },
+            7 | 2..=3 => Insn::GprToFp { sf, signed: code != 7 && code == 2, size, rmode, opcode: code, rn, rd },
+            _ => match opcode {
+                0b000 | 0b001 | 0b100 | 0b101 => Insn::FpToGpr {
+                    sf,
+                    signed: opcode & 1 == 0,
+                    size,
+                    round,
+                    fmov: false,
+                    rn,
+                    rd,
+                },
+                _ => Insn::Undefined,
+            },
+        };
+    }
+
+    // Scalar FP compare against zero. Bit 23 is set where the other scalar forms of this shape leave
+    // it clear, so the type is bit 22, and the four bits at 15:12 pick which comparison it is: the
+    // two that are not `gt` differ in the U bit as well.
+    if (w >> 23) & 1 == 1 && (w >> 16) & 0x1f == 0 && (w >> 10) & 7 == 0b010 {
+        // Comparisons against zero come in the same shape twice: bit 14 set is the floating point
+        // family, clear is the integer one on the 64-bit lane.
+        let u = (w >> 29) & 1 == 1;
+        let integer = (w >> 14) & 1 == 0;
+        let base = if integer { 0b1000 } else { 0b1100 };
+        let op = match ((w >> 12) & 0xf, u) {
+            (b, true) if b == base => Some(1),
+            (b, false) if b == base => Some(2),
+            (b, true) if b == base + 1 => Some(3),
+            (b, false) if b == base + 1 => Some(0),
+            (b, false) if b == base + 2 => Some(4),
+            _ => None,
+        };
+        if let Some(op) = op {
+            return Insn::FpCompareZero {
+                double: (w >> 22) & 1 == 1,
+                op,
+                integer,
+                rn,
+                rd,
+            };
+        }
     }
 
     // The fused multiply-add group: bits 28:24 are 11111 and the rounding-mode field holds the two

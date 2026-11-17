@@ -56,7 +56,8 @@ function ring(n) {
 function trap(kind, addr, at) {
   throw new Error(
     `guest pc trail: ${ring(24).map(where).join(" -> ")}\n` +
-      `guest trap ${Number(kind)} at address 0x${Number(addr).toString(16)} from 0x${(at >>> 0).toString(16)}\n` +
+      `guest trap ${Number(kind)} at address ${where(Number(addr) >>> 0)}` +
+      ` (0x${(Number(addr) >>> 0).toString(16)}) from ${where(at >>> 0)}\n` +
       state() +
       "\n" + backtrace() +
       memory_dump(),

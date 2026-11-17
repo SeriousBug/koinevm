@@ -4500,13 +4500,37 @@ impl<'a> RegionEmitter<'a> {
                 self.close_if();
                 self.set_loaded(rs, L_T0);
             }
-            Insn::FpToGpr { sf, signed, size, opcode, rn, rd, .. } => {
-                // `fmov Wd, Sn` reinterprets the bits; `fcvtzs` and friends saturate to the integer
-                // range, which is what the truncating conversion in wasm does.
+            Insn::FpToGpr { sf, signed, size, round, fmov, rn, rd } => {
+                // `fmov Wd, Sn` reinterprets the bits; the conversions round first and then
+                // saturate to the integer range, which is what the truncating conversion does.
                 let double = size == 1;
-                self.getv(rn);
-                self.f.simd_lane(if double { simd::F64X2_EXTRACT_LANE } else { simd::F32X4_EXTRACT_LANE }, 0);
-                if opcode == 6 {
+                match (fmov, round) {
+                    (true, _) | (_, round::ZERO) => {
+                        self.getv(rn);
+                        self.f.simd_lane(
+                            if double { simd::F64X2_EXTRACT_LANE } else { simd::F32X4_EXTRACT_LANE },
+                            0,
+                        );
+                    }
+                    // Ties away from zero is a round of its own, which the scalar sequence builds.
+                    (false, round::AWAY) => self.fp_round_away(rn, double),
+                    (false, _) => {
+                        self.getv(rn);
+                        self.f.simd_lane(
+                            if double { simd::F64X2_EXTRACT_LANE } else { simd::F32X4_EXTRACT_LANE },
+                            0,
+                        );
+                        self.f.op(match (double, round) {
+                            (true, round::UP) => F64_CEIL,
+                            (true, round::DOWN) => F64_FLOOR,
+                            (true, _) => F64_NEAREST,
+                            (false, round::UP) => F32_CEIL,
+                            (false, round::DOWN) => F32_FLOOR,
+                            (false, _) => F32_NEAREST,
+                        });
+                    }
+                }
+                if fmov {
                     self.f.op(if double { I64_REINTERPRET_F64 } else { I32_REINTERPRET_F32 });
                     if !double {
                         self.f.op(I64_EXTEND_I32_U);
@@ -4655,6 +4679,55 @@ impl<'a> RegionEmitter<'a> {
                     self.f.op(if double { F64_ADD } else { F32_ADD });
                 }
                 self.fp_put(rd, double);
+            }
+            Insn::FpCompareZero { double, op, integer, rn, rd } => {
+                // A comparison against zero that leaves a mask in the lane instead of flags: all
+                // ones where it holds, and the rest of the register clear.
+                self.getv(rn);
+                if integer {
+                    self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
+                    self.f.i64c(0);
+                    self.f.op(match op {
+                        0 => I64_EQ,
+                        1 => I64_GE_S,
+                        2 => I64_GT_S,
+                        3 => I64_LE_S,
+                        _ => I64_LT_S,
+                    });
+                } else if double {
+                    self.f.simd_lane(simd::F64X2_EXTRACT_LANE, 0);
+                    self.f.f64c(0f64.to_bits());
+                    self.f.op(match op {
+                        0 => F64_EQ,
+                        1 => F64_GE,
+                        2 => F64_GT,
+                        3 => F64_LE,
+                        _ => F64_LT,
+                    });
+                } else {
+                    self.f.simd_lane(simd::F32X4_EXTRACT_LANE, 0);
+                    self.f.f32c(0f32.to_bits());
+                    self.f.op(match op {
+                        0 => F32_EQ,
+                        1 => F32_GE,
+                        2 => F32_GT,
+                        3 => F32_LE,
+                        _ => F32_LT,
+                    });
+                }
+                let width = if double || integer { 8 } else { 4 };
+                let mut yes = [0u8; 16];
+                for b in yes.iter_mut().take(width) {
+                    *b = 0xff;
+                }
+                // The typed if is what wasm gives a vector result: `select` on its own is numeric.
+                self.f.op(IF);
+                self.f.body.push(V128);
+                self.f.v128c(yes);
+                self.f.op(ELSE);
+                self.f.v128c([0u8; 16]);
+                self.f.end();
+                self.setv(rd);
             }
             Insn::FpCompare { size, zero, rn, rm, .. } => {
                 if size > 1 {
