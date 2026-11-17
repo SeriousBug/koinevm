@@ -4384,21 +4384,37 @@ impl<'a> RegionEmitter<'a> {
                         self.vec_narrow(size, L_V0, rd, false);
                     }
                     0b10100 => {
-                        // sshll/ushll: widen the low half, then shift left.
-                        let wide = if u {
-                            self.lanes_op(size, [
-                                simd::I16X8_EXTEND_LOW_I8X16_U,
-                                simd::I32X4_EXTEND_LOW_I16X8_U,
-                                simd::I64X2_EXTEND_LOW_I32X4_U,
-                                simd::I64X2_EXTEND_LOW_I32X4_U,
-                            ])
-                        } else {
-                            self.lanes_op(size, [
-                                simd::I16X8_EXTEND_LOW_I8X16_S,
-                                simd::I32X4_EXTEND_LOW_I16X8_S,
-                                simd::I64X2_EXTEND_LOW_I32X4_S,
-                                simd::I64X2_EXTEND_LOW_I32X4_S,
-                            ])
+                        // sshll/ushll widen one half of the source, and the q bit, which is what
+                        // the `2` suffix says, picks the high half.
+                        let low_u = [
+                            simd::I16X8_EXTEND_LOW_I8X16_U,
+                            simd::I32X4_EXTEND_LOW_I16X8_U,
+                            simd::I64X2_EXTEND_LOW_I32X4_U,
+                            simd::I64X2_EXTEND_LOW_I32X4_U,
+                        ];
+                        let high_u = [
+                            simd::I16X8_EXTEND_HIGH_I8X16_U,
+                            simd::I32X4_EXTEND_HIGH_I16X8_U,
+                            simd::I64X2_EXTEND_HIGH_I32X4_U,
+                            simd::I64X2_EXTEND_HIGH_I32X4_U,
+                        ];
+                        let low_s = [
+                            simd::I16X8_EXTEND_LOW_I8X16_S,
+                            simd::I32X4_EXTEND_LOW_I16X8_S,
+                            simd::I64X2_EXTEND_LOW_I32X4_S,
+                            simd::I64X2_EXTEND_LOW_I32X4_S,
+                        ];
+                        let high_s = [
+                            simd::I16X8_EXTEND_HIGH_I8X16_S,
+                            simd::I32X4_EXTEND_HIGH_I16X8_S,
+                            simd::I64X2_EXTEND_HIGH_I32X4_S,
+                            simd::I64X2_EXTEND_HIGH_I32X4_S,
+                        ];
+                        let wide = match (u, q) {
+                            (true, false) => self.lanes_op(size, low_u),
+                            (true, true) => self.lanes_op(size, high_u),
+                            (false, false) => self.lanes_op(size, low_s),
+                            (false, true) => self.lanes_op(size, high_s),
                         };
                         let wide = wide.ok_or_else(|| format!("bad widening shift at 0x{addr:x}"))?;
                         let shl_wide = self.lanes_op(size, [simd::I16X8_SHL, simd::I32X4_SHL, simd::I64X2_SHL, simd::I64X2_SHL]);
