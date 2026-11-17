@@ -115,7 +115,7 @@ export class Files {
 
   /// A pipe: one description with a byte buffer, and one descriptor on each end.
   pipe(cloexec) {
-    const desc = { data: Buffer.alloc(0), readers: 1, writers: 1 };
+    const desc = { id: (this.seed += 1), data: Buffer.alloc(0), readers: 1, writers: 1 };
     const read = this.add({ kind: "pipe", end: "read", desc, cloexec });
     const write = this.add({ kind: "pipe", end: "write", desc, cloexec });
     this.note(`pipe ${read},${write}`, desc);
@@ -345,7 +345,8 @@ export class Files {
     return Buffer.concat(chunks);
   }
 
-  write(fd, data) {    const entry = this.map.get(fd);
+  write(fd, data) {
+    const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     if (entry.kind === "stdout" || entry.kind === "stderr") {
       (fd === 1 ? process.stdout : process.stderr).write(data);
@@ -356,6 +357,10 @@ export class Files {
       const desc = entry.desc;
       if (desc.readers === 0) return -EPIPE;
       desc.data = desc.data.length ? Buffer.concat([desc.data, data]) : Buffer.from(data);
+      if (process.env.ARMJIT_TRACE_PIPES) {
+        const head = Buffer.from(data.subarray(0, 16)).toString("latin1");
+        console.error(`  pipe ${desc.id}: +${data.length} bytes ${JSON.stringify(head)}`);
+      }
       return data.length;
     }
     if (entry.kind === "null") return data.length;

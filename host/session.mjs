@@ -19,9 +19,16 @@ import { Mach } from "./pages.mjs";
 const SHADOW = 0x0;
 const SHADOW_PC = 0x108;
 const SHADOW_RESUME = 0x118;
+const SHADOW_TP = 0x110;
+/// The part of the control block a thread owns: x0..x30, sp, nzcv, pc, tls and the resume address.
+const THREAD_STATE = 0x118 + 8;
+const SHADOW_V0 = 0x600;
+const NVEC = 32;
 
 const CLONE_VFORK = 0x4000;
+const CLONE_SETTLS = 0x00080000;
 const CLONE_PARENT_SETTID = 0x00100000;
+const CLONE_CHILD_CLEARTID = 0x00200000;
 const CLONE_CHILD_SETTID = 0x01000000;
 const WNOHANG = 1;
 const ENOEXEC = 8;
@@ -36,23 +43,67 @@ export class Session {
     this.root = null;
   }
 
-  /// A process running an image from its entry point.
+  /// A process running an image from its entry point. Its first thread has the process's own id,
+  /// the way `gettid` reports one for a program that never asked for a second.
   spawn({ module, meta }, parent = null) {
     const proc = {
       pid: this.nextPid++,
       ppid: parent ? parent.pid : 0,
       module,
       meta,
-      entry: true,
+      state: "runnable",
+      code: null,
+      threads: [],
+      current: null,
+    };
+    this.instantiate(proc);
+    proc.threads.push(this.newThread(proc, proc.pid, { entry: true }));
+    proc.current = proc.threads[0];
+    this.processes.push(proc);
+    if (!parent) this.root = proc;
+    return proc;
+  }
+
+  /// A thread of a process: its own registers, its own place in the code, and its own reason to be
+  /// waiting. The memory, the descriptor table and the page table are the process's, not its own.
+  newThread(proc, tid, { entry = false, clearTid = 0 } = {}) {
+    return {
+      tid,
+      entry,
+      clearTid,
       state: "runnable",
       code: null,
       blockedOn: 0,
       waitingFor: null,
+      pending: null,
+      regs: new Uint8Array(THREAD_STATE),
+      vecs: new Uint8Array(16 * NVEC),
     };
-    this.instantiate(proc);
-    this.processes.push(proc);
-    if (!parent) this.root = proc;
-    return proc;
+  }
+
+  /// The registers of the thread that is in the wasm instance are the control block's, so a thread
+  /// switch is a copy of them out and the next one's in. A resumed run reads all of it back, which
+  /// is the same path a page translation resumes through.
+  saveThread(proc, t) {
+    const bytes = new Uint8Array(proc.memory.buffer);
+    t.regs.set(bytes.subarray(0, THREAD_STATE));
+    t.vecs.set(bytes.subarray(SHADOW_V0, SHADOW_V0 + 16 * NVEC));
+  }
+
+  loadThread(proc, t) {
+    const bytes = new Uint8Array(proc.memory.buffer);
+    bytes.set(t.regs, 0);
+    bytes.set(t.vecs, SHADOW_V0);
+  }
+
+  /// Make `t` the thread whose registers the instance holds, saving the one that had them. The
+  /// thread that is already current is the one whose registers are live in the control block, so
+  /// loading it back from the copy would restore the state from before its last run.
+  switchTo(proc, t) {
+    if (proc.current === t) return;
+    if (proc.current) this.saveThread(proc, proc.current);
+    this.loadThread(proc, t);
+    proc.current = t;
   }
 
   /// Build the instance for a process's current image, and the kernel state that goes with it. An
@@ -69,6 +120,7 @@ export class Session {
       ppid: proc.ppid,
       files,
       wake: () => this.poll(),
+      futexWake: (addr, n) => this.futexWake(proc, addr, n),
     });
     for (const image of proc.meta.images ?? []) proc.kernel.space.images.push(image);
     proc.mach = new Mach({
@@ -88,33 +140,45 @@ export class Session {
     const startedAt = Date.now();
     for (;;) {
       if (this.root.state === "exited") return this.root.code;
-      const proc = this.processes.find((p) => p.state === "runnable");
-      if (!proc) return this.stuck();
+      const pick = this.pick();
+      if (!pick) return this.stuck();
       if (after && Date.now() - startedAt > after) return 4;
-      const verdict = await this.step(proc);
+      const verdict = await this.step(pick.proc, pick.thread);
       if (verdict !== 0) return verdict;
     }
   }
 
+  /// The next thread to run, and the process it belongs to. Threads are what a scheduler picks:
+  /// a process whose threads are all waiting is waiting, and one with a runnable thread runs it.
+  pick() {
+    for (const proc of this.processes) {
+      if (proc.state === "exited") continue;
+      const thread = proc.threads.find((t) => t.state === "runnable");
+      if (thread) return { proc, thread };
+    }
+    return null;
+  }
+
   /// One entry into the guest, run until it exits, asks the host, or jumps somewhere untranslated.
-  async step(proc) {
+  async step(proc, thread) {
+    this.switchTo(proc, thread);
     if (process.env.ARMJIT_TRACE_STEPS) {
       const v = new DataView(proc.memory.buffer);
       console.error(
-        `step: ${proc.pid} entry=${proc.entry} pc=0x${v.getUint32(SHADOW_PC, true).toString(16)}` +
+        `step: ${proc.pid}/${thread.tid} entry=${thread.entry} pc=0x${v.getUint32(SHADOW_PC, true).toString(16)}` +
           ` resume=0x${v.getUint32(SHADOW_RESUME, true).toString(16)} x0=0x${v.getBigUint64(0, true).toString(16)}`,
       );
     }
     // A syscall that was waiting is answered here, not by running the guest's code again: the
     // function it was in pushed a frame before the svc, and a second entry would push another.
-    if (proc.pending) {
-      const request = proc.pending;
-      proc.pending = null;
-      return this.answer(proc, request);
+    if (thread.pending) {
+      const request = thread.pending;
+      thread.pending = null;
+      return this.answer(proc, thread, request);
     }
     let status;
-    if (proc.entry) {
-      proc.entry = false;
+    if (thread.entry) {
+      thread.entry = false;
       status = proc.instance.exports.run(proc.meta.entry, BigInt(proc.meta.sp), 0);
     } else {
       status = proc.instance.exports.run(0, 0n, 1);
@@ -127,35 +191,53 @@ export class Session {
       }
       status = await proc.mach.translateAndResume(pc);
     }
-    if (status === 1) return this.serve(proc);
-    if (status === 0) return this.exit(proc, proc.kernel.exited ?? 0);
+    if (status === 1) return this.serve(proc, thread);
+    if (status === 0) return this.exitedBySyscall(proc, thread, proc.kernel.exited ?? 0);
     console.error(`armjit: pid ${proc.pid} stopped with status ${status}`);
     return 1;
   }
 
   /// A syscall gave up the wasm call: do what it asked, then answer it.
-  serve(proc) {
+  serve(proc, thread) {
     const kernel = proc.kernel;
     const request = kernel.pending;
     kernel.pending = null;
-    if (kernel.exited !== null) return this.exit(proc, kernel.exited);
+    if (kernel.exited !== null) return this.exitedBySyscall(proc, thread, kernel.exited);
     if (!request) {
       console.error(`armjit: pid ${proc.pid} returned from a syscall with no request`);
       return 1;
     }
-    return this.answer(proc, request);
+    return this.answer(proc, thread, request);
   }
 
-  answer(proc, request) {
+  /// The guest stopped itself: `exit` ends the thread that called it, and the process when it was
+  /// the last one, while `exit_group` ends all of them. Either way the answers are the same.
+  ///
+  /// The request belongs to the thread that made it, so it is consumed here: a process where one
+  /// thread has ended is a process that keeps running, and a flag left set on the kernel would end
+  /// the next thread to make a call of its own.
+  exitedBySyscall(proc, thread, code) {
+    const group = proc.kernel.exitedGroup;
+    proc.kernel.exited = null;
+    proc.kernel.exitedGroup = false;
+    if (group) return this.exit(proc, code);
+    return this.exitThread(proc, thread, code);
+  }
+
+  answer(proc, thread, request) {
     switch (request.kind) {
       case "fork":
-        return this.fork(proc, request);
+        return this.fork(proc, thread, request);
+      case "clone":
+        return this.clone(proc, thread, request);
       case "exec":
-        return this.exec(proc, request);
+        return this.exec(proc, thread, request);
       case "wait":
-        return this.wait(proc, request);
+        return this.wait(proc, thread, request);
       case "read":
-        return this.read(proc, request);
+        return this.read(proc, thread, request);
+      case "futex":
+        return this.futex(proc, thread, request);
       default:
         console.error(`armjit: pid ${proc.pid} asked for an unknown host action ${request.kind}`);
         return 1;
@@ -165,7 +247,7 @@ export class Session {
   /// x0 is the syscall's answer and the guest continues after the `svc`. The address to continue at
   /// is the one the syscall stored, not the block the run went out through, and it is a block start
   /// because a syscall ends the block it is in.
-  resume(proc, value) {
+  resume(proc, thread, value) {
     const view = new DataView(proc.memory.buffer);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
       console.error(
@@ -174,32 +256,36 @@ export class Session {
     }
     view.setBigInt64(SHADOW, BigInt.asIntN(64, BigInt(value)), true);
     view.setUint32(SHADOW_PC, view.getUint32(SHADOW_RESUME, true), true);
-    proc.state = "runnable";
+    thread.state = "runnable";
     return 0;
   }
 
-  fork(parent, request) {
+  fork(parent, parentThread, request) {
     const child = {
       pid: this.nextPid++,
       ppid: parent.pid,
       module: parent.module,
       meta: parent.meta,
-      entry: false,
       state: "runnable",
       code: null,
-      blockedOn: 0,
-      waitingFor: null,
+      threads: [],
+      current: null,
     };
     this.instantiate(child);
     child.kernel.adopt(parent.kernel.forkState());
     this.copyMemory(parent, child);
     child.mach.adopt(parent.mach.lineage, parent.mach);
 
-    // The child's fork returns zero, from the instruction after the svc.
+    // A child has one thread, and its memory already holds the parent's registers: a fork returns
+    // zero in it, from the instruction after the svc.
+    const childThread = this.newThread(child, child.pid);
+    child.threads.push(childThread);
+    child.current = childThread;
     const from = new DataView(parent.memory.buffer);
     const view = new DataView(child.memory.buffer);
     view.setBigInt64(SHADOW, 0n, true);
     view.setUint32(SHADOW_PC, view.getUint32(SHADOW_RESUME, true), true);
+    childThread.regs.set(new Uint8Array(child.memory.buffer).subarray(0, THREAD_STATE));
     if (request.flags & CLONE_CHILD_SETTID && request.ctid) {
       view.setUint32(request.ctid, child.pid, true);
     }
@@ -213,11 +299,63 @@ export class Session {
           ` sp=0x${from.getBigUint64(0xf8, true).toString(16)}`,
       );
     }
-    const verdict = this.resume(parent, child.pid);
+    const verdict = this.resume(parent, parentThread, child.pid);
     // vfork suspends the parent until the child execs or exits, and the child runs on the stack the
     // parent is using, so it must not get a turn while it is still inside the fork.
-    if (request.flags & CLONE_VFORK && !process.env.ARMJIT_NO_WAIT_VFORK) this.block(parent, child.pid);
+    if (request.flags & CLONE_VFORK && !process.env.ARMJIT_NO_WAIT_VFORK) this.block(parentThread, child.pid);
     return verdict;
+  }
+
+  /// A second thread of the same process: the same memory, descriptor table and page table, with
+  /// its own registers and its own stack. One linear memory cannot be two threads at once, so a
+  /// thread is a coroutine: it runs until it asks the host for something, and the scheduler runs
+  /// whichever of the process's threads is unimpeded next.
+  clone(proc, thread, request) {
+    if (proc.kernel.exited !== null) return this.exitedBySyscall(proc, thread, proc.kernel.exited);
+    // A thread id and a process id come from the same space, so a `gettid` answer is unique and a
+    // wait for a thread and a wait for a process cannot be confused.
+    const tid = this.nextPid++;
+    const child = this.newThread(proc, tid, {
+      clearTid: request.flags & CLONE_CHILD_CLEARTID ? request.ctid : 0,
+    });
+    this.saveThread(proc, thread);
+    child.regs.set(thread.regs);
+    child.vecs.set(thread.vecs);
+    // The new thread starts on the stack `clone` was given, at the instruction after the svc, with
+    // zero as its answer: that is what the function `pthread_create` hands to it reads.
+    const regs = new DataView(child.regs.buffer);
+    regs.setBigInt64(0, 0n, true);
+    regs.setBigUint64(0xf8, BigInt(request.stack), true);
+    regs.setUint32(SHADOW_PC, regs.getUint32(SHADOW_RESUME, true), true);
+    if (request.flags & CLONE_SETTLS) regs.setBigUint64(0x110, BigInt.asUintN(64, request.tls), true);
+    proc.threads.push(child);
+    const view = new DataView(proc.memory.buffer);
+    if (request.flags & CLONE_PARENT_SETTID && request.ptid) view.setUint32(request.ptid, tid, true);
+    if (request.flags & CLONE_CHILD_SETTID && request.ctid) view.setUint32(request.ctid, tid, true);
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      const at = (a) => (a ? view.getUint32(a, true) : "none");
+      console.error(
+        `clone: ${proc.pid} thread ${tid} on stack 0x${request.stack.toString(16)} flags=0x${request.flags.toString(16)}` +
+          ` ptid=0x${request.ptid.toString(16)}(${at(request.ptid)}) ctid=0x${request.ctid.toString(16)}(${at(request.ctid)})`,
+      );
+    }
+    return this.resume(proc, thread, tid);
+  }
+
+  /// FUTEX_WAIT and FUTEX_WAKE, which is how one thread of a process waits for another.
+  futex(proc, thread, request) {
+    const view = new DataView(proc.memory.buffer);
+    if (view.getInt32(request.addr, true) !== request.value) {
+      return this.resume(proc, thread, -11); // EAGAIN: the value changed before the wait
+    }
+    thread.state = "blocked";
+    thread.blockedOn = request.addr;
+    thread.waitingFor = "futex";
+    thread.pending = request;
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(`futex: ${proc.pid}/${thread.tid} waits on 0x${request.addr.toString(16)}`);
+    }
+    return 0;
   }
 
   /// The whole of the parent's memory that exists: the engine area, which holds the page and
@@ -243,31 +381,31 @@ export class Session {
     }
   }
 
-  async exec(proc, request) {
+  async exec(proc, thread, request) {
     const path = request.path.toString("latin1");
     const host = proc.kernel.files.resolve(path);
-    if (typeof host === "number") return this.resume(proc, host);
+    if (typeof host === "number") return this.resume(proc, thread, host);
     let answer;
     try {
       const st = fs.statSync(host);
       // A directory and a file without the execute bit are both EACCES, and a path that is not
       // there is ENOENT: `execvp` walks PATH on ENOENT and EACCES, and runs the file through a
       // shell on ENOEXEC, so answering the wrong one turns a missing program into a shell script.
-      if (!st.isFile()) return this.resume(proc, -EACCES);
+      if (!st.isFile()) return this.resume(proc, thread, -EACCES);
       fs.accessSync(host, fs.constants.X_OK);
     } catch (e) {
       if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${path}: ${e.code}`);
-      return this.resume(proc, -(e.code === "ENOENT" ? ENOENT : EACCES));
+      return this.resume(proc, thread, -(e.code === "ENOENT" ? ENOENT : EACCES));
     }
     try {
       answer = await this.translator.image(host, request.argv, request.envp);
     } catch (e) {
       if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${path}: ${e.message}`);
-      return this.resume(proc, -ENOEXEC);
+      return this.resume(proc, thread, -ENOEXEC);
     }
     if (!answer.ok) {
       console.error(`armjit: cannot run ${path}: ${answer.error}`);
-      return this.resume(proc, -ENOEXEC);
+      return this.resume(proc, thread, -ENOEXEC);
     }
     const meta = answer.meta;
     // What survives an exec: the descriptor table (less close-on-exec entries) and the cwd. The
@@ -277,67 +415,102 @@ export class Session {
     proc.module = new WebAssembly.Module(Buffer.from(answer.wasm, "hex"));
     proc.meta = meta;
     this.instantiate(proc, files);
-    proc.entry = true;
-    proc.state = "runnable";
+    // An exec leaves one thread behind: the one that called it, with the others gone with the
+    // address space they were in.
+    proc.threads.forEach((t) => {
+      t.state = "exited";
+    });
+    proc.threads = [thread];
+    proc.current = thread;
+    thread.entry = true;
+    thread.state = "runnable";
+    thread.regs.fill(0);
+    thread.vecs.fill(0);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
       console.error(`exec: ${proc.pid} ${path} at 0x${meta.entry.toString(16)}`);
+      for (const [fd, entry] of [...files.map].sort((a, b) => a[0] - b[0])) {
+        const what = entry.kind === "pipe" ? `pipe ${entry.desc.id} ${entry.end}` : entry.host ?? entry.kind;
+        console.error(`  pid ${proc.pid} fd ${fd} -> ${what}`);
+      }
     }
     this.wake(proc);
     return 0;
   }
 
-  wait(proc, request) {
+  wait(proc, thread, request) {
     const kids = this.processes.filter(
       (c) => c.ppid === proc.pid && (request.pid <= 0 || c.pid === request.pid),
     );
-    if (kids.length === 0) return this.resume(proc, -ECHILD);
+    if (kids.length === 0) return this.resume(proc, thread, -ECHILD);
     const done = kids.find((c) => c.state === "exited" && !c.reaped);
     if (done) {
       this.reap(proc, done, request);
-      return this.resume(proc, done.pid);
+      return this.resume(proc, thread, done.pid);
     }
-    if (request.options & WNOHANG) return this.resume(proc, 0);
-    this.block(proc, request.pid);
-    proc.pending = request;
+    if (request.options & WNOHANG) return this.resume(proc, thread, 0);
+    this.block(thread, request.pid);
+    thread.pending = request;
     return 0;
   }
 
-  block(proc, on, waitingFor = "child") {
-    proc.state = "blocked";
-    proc.blockedOn = on;
-    proc.waitingFor = waitingFor;
+  block(thread, on, waitingFor = "child") {
+    thread.state = "blocked";
+    thread.blockedOn = on;
+    thread.waitingFor = waitingFor;
     if (process.env.ARMJIT_TRACE_PROCESSES) {
-      const what = waitingFor === "pipe" ? "a pipe" : on <= 0 ? "any child" : on;
-      console.error(`block: ${proc.pid} waits for ${what}`);
+      const what =
+        waitingFor === "pipe" ? "a pipe" : waitingFor === "futex" ? `futex 0x${on.toString(16)}` : on <= 0 ? "any child" : on;
+      console.error(`block: thread ${thread.tid} waits for ${what}`);
     }
   }
 
   /// A pipe read that had nothing in it: answer it now, or keep waiting.
-  read(proc, request) {
+  read(proc, thread, request) {
     const got = proc.kernel.files.read(request.fd, request.len);
     if (got === WOULD_BLOCK) {
-      this.block(proc, 0, "pipe");
-      proc.pending = request;
+      this.block(thread, 0, "pipe");
+      thread.pending = request;
       return 0;
     }
-    if (typeof got === "number") return this.resume(proc, got);
+    if (typeof got === "number") return this.resume(proc, thread, got);
     proc.kernel.put(request.buf, got);
-    return this.resume(proc, got.length);
+    return this.resume(proc, thread, got.length);
   }
 
-  /// Something a process may be waiting for happened, or a pipe has data in it.
+  /// Something a thread may be waiting for happened, or a pipe has data in it.
   poll() {
     for (const proc of this.processes) {
-      if (proc.state !== "blocked" || proc.waitingFor !== "pipe") continue;
-      if (proc.kernel.files.readReady(proc.pending.fd)) proc.state = "runnable";
+      for (const thread of proc.threads) {
+        if (thread.state !== "blocked" || thread.waitingFor !== "pipe") continue;
+        if (proc.kernel.files.readReady(thread.pending.fd)) thread.state = "runnable";
+      }
     }
+  }
+
+  /// Every thread waiting on a futex word, woken: that is how one thread of a process tells another
+  /// that what it waited for has happened. A wake of -1 is every waiter.
+  futexWake(proc, addr, n) {
+    let woken = 0;
+    for (const thread of proc.threads) {
+      if (thread.state !== "blocked" || thread.waitingFor !== "futex") continue;
+      if (thread.blockedOn !== addr) continue;
+      if (n >= 0 && woken >= n) break;
+      thread.state = "runnable";
+      woken++;
+    }
+    if (woken && process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(`futex wake 0x${addr.toString(16)}: ${woken} thread(s)`);
+    }
+    return woken;
   }
 
   /// A parent waiting for this process, whether for its exit or for the exec that ends a vfork.
   wake(proc) {
     for (const q of this.processes) {
-      if (q.state !== "blocked" || q.waitingFor !== "child" || proc.ppid !== q.pid) continue;
-      if (q.blockedOn <= 0 || q.blockedOn === proc.pid) q.state = "runnable";
+      for (const thread of q.threads) {
+        if (thread.state !== "blocked" || thread.waitingFor !== "child" || proc.ppid !== q.pid) continue;
+        if (thread.blockedOn <= 0 || thread.blockedOn === proc.pid) thread.state = "runnable";
+      }
     }
   }
 
@@ -355,9 +528,30 @@ export class Session {
     }
   }
 
+  /// A thread that ended: the process goes with the last one, and `CLONE_CHILD_CLEARTID` is how a
+  /// joining thread learns that it did.
+  exitThread(proc, thread, code) {
+    thread.state = "exited";
+    thread.code = code & 0xff;
+    if (thread.clearTid) {
+      new DataView(proc.memory.buffer).setUint32(thread.clearTid, 0, true);
+      this.futexWake(proc, thread.clearTid, -1);
+    }
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(
+        `exit: thread ${thread.tid} of ${proc.pid} status ${thread.code} clearTid=0x${thread.clearTid.toString(16)}`,
+      );
+    }
+    const live = proc.threads.filter((t) => t.state !== "exited");
+    if (live.length === 0) return this.exit(proc, code);
+    thread.pending = null;
+    return 0;
+  }
+
   exit(proc, code) {
     proc.state = "exited";
     proc.code = code & 0xff;
+    for (const t of proc.threads) t.state = "exited";
     proc.kernel.files.closeAll();
     if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exit: ${proc.pid} status ${proc.code}`);
     // A parent that was waiting for this one has something to see now, and a pipe this process
@@ -368,12 +562,14 @@ export class Session {
   }
 
   stuck() {
-    const blocked = this.processes.filter((p) => p.state === "blocked");
-    console.error(`armjit: nothing left to run but ${blocked.length} blocked process(es)`);
-    for (const p of blocked) {
-      console.error(
-        `  pid ${p.pid} waits for ${p.waitingFor === "pipe" ? "a pipe" : p.blockedOn <= 0 ? "any child" : p.blockedOn}`,
-      );
+    const blocked = this.processes.flatMap((p) =>
+      p.threads.filter((t) => t.state === "blocked").map((t) => ({ p, t })),
+    );
+    console.error(`armjit: nothing left to run but ${blocked.length} blocked thread(s)`);
+    for (const { p, t } of blocked) {
+      const what =
+        t.waitingFor === "pipe" ? "a pipe" : t.waitingFor === "futex" ? `futex 0x${t.blockedOn.toString(16)}` : t.blockedOn <= 0 ? "any child" : t.blockedOn;
+      console.error(`  pid ${p.pid} thread ${t.tid} waits for ${what}`);
     }
     return 1;
   }

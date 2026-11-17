@@ -29,6 +29,8 @@ export class Kernel {
     this.space = new AddressSpace(memory, meta);
     this.files = options.files ?? new Files(options.rootfs);
     this.exited = null;
+    /// `exit` ends one thread and `exit_group` ends them all, so the host has to know which.
+    this.exitedGroup = false;
     this.missing = new Set();
     this.table = new Map();
     this.random = 0;
@@ -37,6 +39,8 @@ export class Kernel {
     this.pending = null;
     /// Called when something a process may be waiting for has happened.
     this.wake = options.wake ?? (() => {});
+    /// Called to wake the threads asleep on a futex word; answers how many woke.
+    this.futexWake = options.futexWake ?? (() => 0);
     this.register();
   }
 
@@ -155,8 +159,11 @@ export class Kernel {
       k.exited = Number(code) & 0xff;
       return [0n, 1];
     };
-    this.on(93, exit); // exit
-    this.on(94, exit); // exit_group
+    this.on(93, exit); // exit: this thread, and the process when it was the last one
+    this.on(94, (k, code) => {
+      k.exitedGroup = true;
+      return exit(k, code);
+    }); // exit_group
 
     this.on(64, (k, fd, buf, count) => {
       const n = Number(fd);
@@ -239,12 +246,23 @@ export class Kernel {
   }
 
   registerProcess() {
-    this.on(220, (k, flags, stack, ptid, ctid, tls) => {
+    // aarch64's clone takes the thread pointer before the child's tid word, which is where every
+    // other 64-bit architecture puts them the other way round.
+    this.on(220, (k, flags, stack, ptid, tls, ctid) => {
       const f = Number(flags);
-      // A thread shares its memory with its creator, which one linear memory per process cannot
-      // express. vfork also asks for shared memory, but on the one stack it already has, and it
-      // promises not to touch anything but that stack before it execs, so a copy is enough.
-      if (f & CLONE_THREAD) return k.fail(ENOSYS);
+      // A thread shares the memory of the process it is made in, which is the instance the process
+      // runs: it is a coroutine with its own stack, not a second address space.
+      if (f & CLONE_THREAD) {
+        if (k.addr(stack) === 0) return k.fail(EINVAL);
+        return k.ask({
+          kind: "clone",
+          flags: f,
+          stack: k.addr(stack),
+          ptid: k.addr(ptid),
+          ctid: k.addr(ctid),
+          tls,
+        });
+      }
       // A new stack without shared memory is a coroutine, which has nowhere to run here.
       if (k.addr(stack) !== 0 && !(f & CLONE_VM)) return k.fail(ENOSYS);
       return k.ask({
@@ -682,10 +700,23 @@ export class Kernel {
       if (Number(old) !== 0) k.put64(old, 0n);
       return [0n, 0];
     });
-    this.on(98, (k, uaddr, op) => {
+    this.on(98, (k, uaddr, op, val) => {
+      // The private flag and the realtime clock are bits above the command, and the bitset forms
+      // wait and wake on the same word as the plain ones do.
       const cmd = Number(op) & 0x7f;
-      if (cmd === 0) return k.fail(11); // FUTEX_WAIT with one thread: nothing to wait for
-      return [0n, 0];
+      const at = k.addr(uaddr);
+      if (cmd === 0 || cmd === 9) {
+        // FUTEX_WAIT: the host checks the word and parks the thread, so that a wake that arrives
+        // between the check and the sleep cannot be lost.
+        return k.ask({ kind: "futex", addr: at, value: Number(BigInt.asIntN(32, BigInt.asUintN(32, val))) });
+      }
+      if (cmd === 1 || cmd === 10) {
+        // FUTEX_WAKE
+        const want = Number(BigInt.asIntN(32, BigInt.asUintN(32, val)));
+        return [BigInt(k.futexWake(at, want < 0 ? -1 : want)), 0];
+      }
+      if (cmd === 2 || cmd === 3) return [0n, 0]; // FUTEX_FD / FUTEX_REQUEUE: nothing to do
+      return k.fail(ENOSYS);
     });
     this.on(233, () => [0n, 0]); // madvise
     this.on(324, () => [0n, 0]); // membarrier: one thread, nothing to synchronise
