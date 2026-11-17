@@ -170,11 +170,14 @@ export class Mach {
     if (!page) {
       const answer = await this.translator.page(image.host, image.base, pc);
       if (!answer.ok) throw new Error(`translating 0x${pc.toString(16)}: ${answer.error}`);
-      page = {
-        module: new WebAssembly.Module(Buffer.from(answer.wasm, "hex")),
-        regions: answer.regions,
-        unsupported: answer.unsupported,
-      };
+      let module;
+      try {
+        module = new WebAssembly.Module(Buffer.from(answer.wasm, "hex"));
+      } catch (e) {
+        const where = `${image.host.split("/").pop()}+0x${(pc - image.base).toString(16)}`;
+        throw new Error(`the page at ${where} does not validate: ${e.message}`);
+      }
+      page = { module, regions: answer.regions, unsupported: answer.unsupported };
       pageModules.set(key, page);
       if (process.env.ARMJIT_TRACE_PAGES) {
         const where = `${image.host.split("/").pop()}+0x${(pc - image.base).toString(16)}`;
