@@ -182,6 +182,43 @@ __asm__(
     "  ret\n"
     ".size vlong, .-vlong\n");
 
+// The widening adds: a half of the source extends into lanes as wide as the destination and is
+// added to or subtracted from it, over both halves of the sources and both signs.
+void vwide(const unsigned char *vn, const unsigned char *vm, unsigned char *out);
+__asm__(
+    ".text\n"
+    ".globl vwide\n"
+    ".type vwide, %function\n"
+    "vwide:\n"
+    "  ldr q0, [x0]\n"
+    "  ldr q1, [x1]\n"
+    "  mov v2.16b, v0.16b\n"
+    "  saddw v2.2d, v2.2d, v1.2s\n"
+    "  str q2, [x2], #16\n"
+    "  mov v2.16b, v0.16b\n"
+    "  uaddw v2.2d, v2.2d, v1.2s\n"
+    "  str q2, [x2], #16\n"
+    "  mov v2.16b, v0.16b\n"
+    "  ssubw v2.2d, v2.2d, v1.2s\n"
+    "  str q2, [x2], #16\n"
+    "  mov v2.16b, v0.16b\n"
+    "  usubw v2.2d, v2.2d, v1.2s\n"
+    "  str q2, [x2], #16\n"
+    "  mov v2.16b, v0.16b\n"
+    "  saddw2 v2.2d, v2.2d, v1.4s\n"
+    "  str q2, [x2], #16\n"
+    "  mov v2.16b, v0.16b\n"
+    "  uaddw2 v2.2d, v2.2d, v1.4s\n"
+    "  str q2, [x2], #16\n"
+    "  mov v2.16b, v0.16b\n"
+    "  ssubw v2.4s, v2.4s, v1.4h\n"
+    "  str q2, [x2], #16\n"
+    "  mov v2.16b, v0.16b\n"
+    "  usubw2 v2.4s, v2.4s, v1.8h\n"
+    "  str q2, [x2], #16\n"
+    "  ret\n"
+    ".size vwide, .-vwide\n");
+
 static void hex(const char *what, const unsigned char *p, int n) {
     printf("%s", what);
     for (int i = 0; i < n; i++) printf(" %02x", p[i]);
@@ -235,6 +272,9 @@ int main(void) {
     const char *names[] = {"umlal2d", "smlal2d", "umlsl2d", "umlal2_2d", "smlal2_2d",
                            "umlal4s", "smlal4s", "umlsl4s", "umlal2_4s", "smlal2_4s"};
     for (int i = 0; i < 10; i++) hex(names[i], out + i * 16, 16);
+    vwide(a, b, out);
+    const char *widen[] = {"saddw", "uaddw", "ssubw", "usubw", "saddw2", "uaddw2", "ssubw4s", "usubw2_4s"};
+    for (int i = 0; i < 8; i++) hex(widen[i], out + i * 16, 16);
     printf("vops: done\n");
     return 0;
 }

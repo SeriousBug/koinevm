@@ -201,7 +201,9 @@ fn narrows_to_low_half(i: &Insn) -> bool {
         | Insn::VecTbl { q, .. } => !q,
         // The long multiplies write the whole destination even with the q bit clear, and so do
         // sshll and ushll: q picks which half of the sources widen, not how much is written.
-        Insn::VecThreeDiff { q, op, .. } => !q && op & 0b10011 != 0b10000,
+        Insn::VecThreeDiff { q, op, .. } => {
+            !q && !matches!(op, 0b00010 | 0b00110) && op & 0b10011 != 0b10000
+        }
         Insn::VecShiftImm { q, op, .. } => !q && op != 0b10100,
         _ => false,
     }
@@ -4195,6 +4197,41 @@ impl<'a> RegionEmitter<'a> {
                 }
             }
             Insn::VecThreeDiff { q, u, size, op, rn, rm, rd } => {
+                // saddw/uaddw and ssubw/usubw: a half of the source widens into lanes as wide as
+                // the destination's and is added to it. Opcode bit 2 subtracts, and the q bit takes
+                // the high half of the source.
+                if op == 0b00010 || op == 0b00110 {
+                    let (ext, acc) = match (size, q, u, op == 0b00110) {
+                        (1, false, false, false) => (simd::I32X4_EXTEND_LOW_I16X8_S, simd::I32X4_ADD),
+                        (1, true, false, false) => (simd::I32X4_EXTEND_HIGH_I16X8_S, simd::I32X4_ADD),
+                        (1, false, true, false) => (simd::I32X4_EXTEND_LOW_I16X8_U, simd::I32X4_ADD),
+                        (1, true, true, false) => (simd::I32X4_EXTEND_HIGH_I16X8_U, simd::I32X4_ADD),
+                        (2, false, false, false) => (simd::I64X2_EXTEND_LOW_I32X4_S, simd::I64X2_ADD),
+                        (2, true, false, false) => (simd::I64X2_EXTEND_HIGH_I32X4_S, simd::I64X2_ADD),
+                        (2, false, true, false) => (simd::I64X2_EXTEND_LOW_I32X4_U, simd::I64X2_ADD),
+                        (2, true, true, false) => (simd::I64X2_EXTEND_HIGH_I32X4_U, simd::I64X2_ADD),
+                        (1, false, false, true) => (simd::I32X4_EXTEND_LOW_I16X8_S, simd::I32X4_SUB),
+                        (1, true, false, true) => (simd::I32X4_EXTEND_HIGH_I16X8_S, simd::I32X4_SUB),
+                        (1, false, true, true) => (simd::I32X4_EXTEND_LOW_I16X8_U, simd::I32X4_SUB),
+                        (1, true, true, true) => (simd::I32X4_EXTEND_HIGH_I16X8_U, simd::I32X4_SUB),
+                        (2, false, false, true) => (simd::I64X2_EXTEND_LOW_I32X4_S, simd::I64X2_SUB),
+                        (2, true, false, true) => (simd::I64X2_EXTEND_HIGH_I32X4_S, simd::I64X2_SUB),
+                        (2, false, true, true) => (simd::I64X2_EXTEND_LOW_I32X4_U, simd::I64X2_SUB),
+                        (2, true, true, true) => (simd::I64X2_EXTEND_HIGH_I32X4_U, simd::I64X2_SUB),
+                        _ => {
+                            return self.refuse(format!("widening add of size {size} at 0x{addr:x}"))
+                        }
+                    };
+                    self.getv(rm);
+                    self.f.simd(ext);
+                    self.f.ls(L_V0);
+                    self.getv(rn);
+                    self.f.lg(L_V0);
+                    self.f.simd(acc);
+                    self.setv(rd);
+                    return Ok(());
+                }
+
                 // smlal/umlal and smlsl/umlsl, and the `2` forms: half-width lanes multiply into
                 // full-width ones and accumulate. The q bit takes the high half of each source, the
                 // way the `2` suffix says, and opcode bit 2 subtracts instead of adding. The

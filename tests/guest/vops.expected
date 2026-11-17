@@ -331,4 +331,12 @@ smlal4s f7 36 a6 5c 7d bc 19 d1 9b 73 27 46 51 e4 46 b8
 umlsl4s 17 11 cb 3d 79 74 1e 90 43 a6 d5 df 75 1c f2 b7
 umlal2_4s cf 0b 9b 65 b5 35 59 e0 33 91 b1 5b 49 1d 8c bc
 smlal2_4s cf 0b 93 5a b5 35 4b cf 33 91 9d 44 49 1d 8c bc
+saddw 01 16 2a 3e fd ff 02 05 5d 71 85 99 13 17 1a 1d
+uaddw 01 16 2a 3e fd ff 02 05 5d 71 85 99 14 17 1a 1d
+ssubw df d1 c3 b5 fc ff 02 05 b3 a4 96 88 14 17 1a 1d
+usubw df d1 c3 b5 fc ff 02 05 b3 a4 96 88 13 17 1a 1d
+saddw2 89 9e b2 c6 fc ff 02 05 e5 f9 0d 22 14 17 1a 1d
+uaddw2 89 9e b2 c6 fd ff 02 05 e5 f9 0d 22 14 17 1a 1d
+ssubw4s df d1 f6 f9 c9 bb 02 05 b3 a4 0d 11 9d 8e 1a 1d
+usubw2_4s 57 49 f6 f9 41 33 02 05 2b 1c 0d 11 15 06 1a 1d
 vops: done
