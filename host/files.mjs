@@ -18,6 +18,10 @@ export const ESPIPE = 29;
 export const ELOOP = 40;
 export const ENAMETOOLONG = 36;
 export const ENOSPC = 28;
+export const EPIPE = 32;
+
+/// What a read of a pipe with writers but no data answers: the process has to wait for one.
+export const WOULD_BLOCK = Symbol("would block");
 
 export const AT_FDCWD = -100;
 
@@ -81,6 +85,40 @@ export class Files {
     return this.map.get(fd);
   }
 
+  /// What the descriptor table did, for a run that has to explain a pipe that never closes.
+  note(text, desc) {
+    if (!process.env.ARMJIT_TRACE_FDS) return;
+    const ends = desc && desc.readers !== undefined ? ` r=${desc.readers} w=${desc.writers}` : "";
+    console.error(`fds: ${text}${ends}`);
+  }
+
+  /// A pipe: one description with a byte buffer, and one descriptor on each end.
+  pipe(cloexec) {
+    const desc = { data: Buffer.alloc(0), readers: 1, writers: 1 };
+    const read = this.add({ kind: "pipe", end: "read", desc, cloexec });
+    const write = this.add({ kind: "pipe", end: "write", desc, cloexec });
+    this.note(`pipe ${read},${write}`, desc);
+    return [read, write];
+  }
+
+  /// A second descriptor on the same open file description, as a fork or a dup makes one.
+  copyEntry(entry, cloexec = entry.cloexec) {
+    const copy = { ...entry, cloexec };
+    if (entry.kind === "pipe") {
+      if (entry.end === "read") entry.desc.readers++;
+      else entry.desc.writers++;
+      this.note(`dup ${entry.end} end`, entry.desc);
+    }
+    return copy;
+  }
+
+  /// Whether a read of this descriptor would return now instead of waiting.
+  readReady(fd) {
+    const entry = this.map.get(fd);
+    if (!entry || entry.kind !== "pipe") return true;
+    return entry.desc.data.length > 0 || entry.desc.writers === 0;
+  }
+
   /// Bytes from a generator that starts from a fixed point, so a run reproduces.
   randomBytes(len) {
     const out = Buffer.alloc(len);
@@ -97,7 +135,7 @@ export class Files {
     if (!entry) return -EBADF;
     let n = Math.max(from, 0);
     while (this.map.has(n)) n++;
-    this.map.set(n, { ...entry, cloexec });
+    this.map.set(n, this.copyEntry(entry, cloexec));
     return n;
   }
 
@@ -106,15 +144,23 @@ export class Files {
     const entry = this.map.get(oldfd);
     if (!entry) return -EBADF;
     if (oldfd === newfd) return -EINVAL;
-    this.map.set(newfd, { ...entry, cloexec });
+    this.close(newfd);
+    this.map.set(newfd, this.copyEntry(entry, cloexec));
     if (newfd >= this.next) this.next = newfd + 1;
     return newfd;
   }
 
-  /// What survives an exec: the descriptors whose entry was not opened close-on-exec.
+  /// Every descriptor, for a process that exited: whoever was waiting on a pipe has to see the
+  /// last writer go away.
+  closeAll() {
+    for (const fd of [...this.map.keys()]) this.close(fd);
+  }
+
+  /// What survives an exec: the descriptors whose entry was not opened close-on-exec. The others
+  /// are closed, which matters for a pipe: the program that execs is no longer a reader of it.
   keepAcrossExec() {
     for (const [fd, entry] of this.map) {
-      if (fd > 2 && entry.cloexec) this.map.delete(fd);
+      if (entry.cloexec) this.close(fd);
     }
   }
 
@@ -161,7 +207,12 @@ export class Files {
   close(fd) {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
-    if (fd > 2) this.map.delete(fd);
+    this.map.delete(fd);
+    if (entry.kind === "pipe") {
+      if (entry.end === "read") entry.desc.readers--;
+      else entry.desc.writers--;
+      this.note(`close fd ${fd} ${entry.end} end`, entry.desc);
+    }
     return 0;
   }
 
@@ -184,6 +235,14 @@ export class Files {
     if (entry.kind === "null") return Buffer.alloc(0);
     if (entry.kind === "zero" || entry.kind === "full") return Buffer.alloc(len);
     if (entry.kind === "random") return this.randomBytes(len);
+    if (entry.kind === "pipe") {
+      if (entry.end !== "read") return -EBADF;
+      const desc = entry.desc;
+      if (!desc.data.length) return desc.writers === 0 ? Buffer.alloc(0) : WOULD_BLOCK;
+      const out = desc.data.subarray(0, len);
+      desc.data = desc.data.subarray(out.length);
+      return Buffer.from(out);
+    }
     const out = this.bytes(entry, entry.desc.pos, len);
     entry.desc.pos += out.length;
     return out;
@@ -270,6 +329,13 @@ export class Files {
       (fd === 1 ? process.stdout : process.stderr).write(data);
       return data.length;
     }
+    if (entry.kind === "pipe") {
+      if (entry.end !== "write") return -EBADF;
+      const desc = entry.desc;
+      if (desc.readers === 0) return -EPIPE;
+      desc.data = desc.data.length ? Buffer.concat([desc.data, data]) : Buffer.from(data);
+      return data.length;
+    }
     if (entry.kind === "null") return data.length;
     if (entry.kind === "zero") return data.length;
     if (entry.kind === "full") return -ENOSPC;
@@ -333,6 +399,13 @@ export class Files {
     }
     if (entry.rdev) {
       return { mode: BigInt(entry.mode), nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: BigInt(entry.rdev) };
+    }
+    if (entry.kind === "pipe") {
+      // A pipe is a FIFO of no size, and a program that stats one has to see that.
+      return { mode: 0o010600n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
+    }
+    if (entry.kind === "dir") {
+      return { mode: 0o040755n, nlink: 2n, size: BigInt(entry.size ?? 0), ino: BigInt(fd + 1), dev: 0n, rdev: 0n };
     }
     try {
       return fs.statSync(entry.host, { bigint: true });

@@ -13,6 +13,7 @@
 
 import fs from "node:fs";
 import { Kernel, ECHILD } from "./syscall.mjs";
+import { WOULD_BLOCK } from "./files.mjs";
 import { Mach } from "./pages.mjs";
 
 const SHADOW = 0x0;
@@ -46,6 +47,7 @@ export class Session {
       state: "runnable",
       code: null,
       blockedOn: 0,
+      waitingFor: null,
     };
     this.instantiate(proc);
     this.processes.push(proc);
@@ -66,6 +68,7 @@ export class Session {
       pid: proc.pid,
       ppid: proc.ppid,
       files,
+      wake: () => this.poll(),
     });
     for (const image of proc.meta.images ?? []) proc.kernel.space.images.push(image);
     proc.mach = new Mach({
@@ -151,6 +154,8 @@ export class Session {
         return this.exec(proc, request);
       case "wait":
         return this.wait(proc, request);
+      case "read":
+        return this.read(proc, request);
       default:
         console.error(`armjit: pid ${proc.pid} asked for an unknown host action ${request.kind}`);
         return 1;
@@ -183,6 +188,7 @@ export class Session {
       state: "runnable",
       code: null,
       blockedOn: 0,
+      waitingFor: null,
     };
     this.instantiate(child);
     child.kernel.adopt(parent.kernel.forkState());
@@ -286,18 +292,41 @@ export class Session {
     return 0;
   }
 
-  block(proc, on) {
+  block(proc, on, waitingFor = "child") {
     proc.state = "blocked";
     proc.blockedOn = on;
+    proc.waitingFor = waitingFor;
     if (process.env.ARMJIT_TRACE_PROCESSES) {
-      console.error(`wait: ${proc.pid} blocks on ${on <= 0 ? "any child" : on}`);
+      const what = waitingFor === "pipe" ? "a pipe" : on <= 0 ? "any child" : on;
+      console.error(`block: ${proc.pid} waits for ${what}`);
+    }
+  }
+
+  /// A pipe read that had nothing in it: answer it now, or keep waiting.
+  read(proc, request) {
+    const got = proc.kernel.files.read(request.fd, request.len);
+    if (got === WOULD_BLOCK) {
+      this.block(proc, 0, "pipe");
+      proc.pending = request;
+      return 0;
+    }
+    if (typeof got === "number") return this.resume(proc, got);
+    proc.kernel.put(request.buf, got);
+    return this.resume(proc, got.length);
+  }
+
+  /// Something a process may be waiting for happened, or a pipe has data in it.
+  poll() {
+    for (const proc of this.processes) {
+      if (proc.state !== "blocked" || proc.waitingFor !== "pipe") continue;
+      if (proc.kernel.files.readReady(proc.pending.fd)) proc.state = "runnable";
     }
   }
 
   /// A parent waiting for this process, whether for its exit or for the exec that ends a vfork.
   wake(proc) {
     for (const q of this.processes) {
-      if (q.state !== "blocked" || proc.ppid !== q.pid) continue;
+      if (q.state !== "blocked" || q.waitingFor !== "child" || proc.ppid !== q.pid) continue;
       if (q.blockedOn <= 0 || q.blockedOn === proc.pid) q.state = "runnable";
     }
   }
@@ -319,9 +348,12 @@ export class Session {
   exit(proc, code) {
     proc.state = "exited";
     proc.code = code & 0xff;
+    proc.kernel.files.closeAll();
     if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exit: ${proc.pid} status ${proc.code}`);
-    // A parent that was waiting for this one has something to see now.
+    // A parent that was waiting for this one has something to see now, and a pipe this process
+    // held the last writer of has reached its end.
     this.wake(proc);
+    this.poll();
     return 0;
   }
 
@@ -329,7 +361,9 @@ export class Session {
     const blocked = this.processes.filter((p) => p.state === "blocked");
     console.error(`armjit: nothing left to run but ${blocked.length} blocked process(es)`);
     for (const p of blocked) {
-      console.error(`  pid ${p.pid} waits for ${p.blockedOn <= 0 ? "any child" : p.blockedOn}`);
+      console.error(
+        `  pid ${p.pid} waits for ${p.waitingFor === "pipe" ? "a pipe" : p.blockedOn <= 0 ? "any child" : p.blockedOn}`,
+      );
     }
     return 1;
   }

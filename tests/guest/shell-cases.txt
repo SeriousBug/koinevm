@@ -34,4 +34,20 @@ test 3 -gt 2; echo $?
 x=2; y=3; echo $((x*y)) $((x<y))
 echo "${x:-q}${x:+r}"
 : ${x=assigned}; echo $x
-# echo abc | while read l; do echo $l; done -- needs a pipe, which needs fork
+/bin/echo hi
+/bin/true; echo $?
+/bin/false; echo $?
+/bin/ls /nope; echo $?
+/bin/ls /nope 2>/dev/null; echo $?
+echo $(/bin/echo sub)
+x=$(/bin/echo a; /bin/echo b); echo "$x"
+echo one two three | /usr/bin/wc -w
+/bin/echo a | /usr/bin/tr a-z A-Z
+echo $(/bin/ls /etc | /usr/bin/wc -l)
+/bin/ls /etc | /usr/bin/head -2
+for i in 1 2 3; do /bin/echo $i; done
+/bin/sh -c 'echo nested'
+exec /bin/echo replaced
+/bin/cat /etc/fstab
+/bin/cat /etc/fstab /etc/fstab | /usr/bin/wc -c
+echo abc | while read l; do echo "line $l"; done

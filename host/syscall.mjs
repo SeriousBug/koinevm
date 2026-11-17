@@ -6,7 +6,7 @@
 
 import fs from "node:fs";
 import { AddressSpace, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
-import { Files, AT_FDCWD, ENOENT } from "./files.mjs";
+import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK } from "./files.mjs";
 
 export const ENOSYS = 38;
 export const EBADF = 9;
@@ -35,6 +35,8 @@ export class Kernel {
     // What a syscall that cannot finish inside the guest's wasm call leaves for the host: the run
     // returns, this is served, and the process is resumed with x0 as the answer.
     this.pending = null;
+    /// Called when something a process may be waiting for has happened.
+    this.wake = options.wake ?? (() => {});
     this.register();
   }
 
@@ -93,10 +95,12 @@ export class Kernel {
 
   put32(x, v) {
     new DataView(this.memory.buffer).setUint32(this.addr(x), v >>> 0, true);
+    return true;
   }
 
   put64(x, v) {
     new DataView(this.memory.buffer).setBigUint64(this.addr(x), BigInt(v), true);
+    return true;
   }
 
   on(nr, fn) {
@@ -197,7 +201,7 @@ export class Kernel {
       brk: this.space.brk,
       free: this.space.free.map((s) => ({ ...s })),
       images: this.space.images.map((i) => ({ ...i })),
-      fds: new Map(this.files.map),
+      fds: new Map([...this.files.map].map(([fd, entry]) => [fd, this.files.copyEntry(entry)])),
       nextFd: this.files.next,
       cwd: this.files.cwd,
       random: this.random,
@@ -221,8 +225,8 @@ export class Kernel {
       // express. vfork also asks for shared memory, but on the one stack it already has, and it
       // promises not to touch anything but that stack before it execs, so a copy is enough.
       if (f & CLONE_THREAD) return k.fail(ENOSYS);
-      if (process.env.ARMJIT_NO_VFORK && f & CLONE_VM) return k.fail(ENOSYS);
-      if (k.addr(stack) !== 0 && k.addr(stack) !== Number(k.u64(0xf8n))) return k.fail(ENOSYS);
+      // A new stack without shared memory is a coroutine, which has nowhere to run here.
+      if (k.addr(stack) !== 0 && !(f & CLONE_VM)) return k.fail(ENOSYS);
       return k.ask({
         kind: "fork",
         flags: f,
@@ -240,7 +244,7 @@ export class Kernel {
       const flags = Number(k.u64(at));
       const stack = k.addr(k.u64(at + 40n));
       if (flags & CLONE_THREAD) return k.fail(ENOSYS);
-      if (stack !== 0 && stack !== Number(k.u64(0xf8n))) return k.fail(ENOSYS);
+      if (stack !== 0 && !(flags & CLONE_VM)) return k.fail(ENOSYS);
       return k.ask({
         kind: "fork",
         flags,
@@ -287,7 +291,11 @@ export class Kernel {
       return [BigInt(k.files.open(k.str(path), Number(flags), Number(mode))), 0];
     });
 
-    this.on(57, (k, fd) => [BigInt(k.files.close(Number(fd))), 0]);
+    this.on(57, (k, fd) => {
+      const closed = k.files.close(Number(fd));
+      k.wake();
+      return [BigInt(closed), 0];
+    });
 
     this.on(23, (k, fd) => [BigInt(k.files.dup(Number(fd), 0, false)), 0]); // dup
 
@@ -321,6 +329,8 @@ export class Kernel {
       if (process.env.ARMJIT_TRACE_SYSCALLS)
         console.error(`  read fd=${Number(fd)} at 0x${BigInt.asUintN(64, buf).toString(16)} n=${n}`);
       const got = k.files.read(Number(fd), n);
+      // A pipe with writers and nothing in it yet: the host waits and answers this again.
+      if (got === WOULD_BLOCK) return k.ask({ kind: "read", fd: Number(fd), buf: k.addr(buf), len: n });
       if (typeof got === "number") return [BigInt(got), 0];
       if (!k.put(buf, got)) return k.fail(EFAULT);
       return [BigInt(got.length), 0];
@@ -338,6 +348,7 @@ export class Kernel {
       const bytes = k.read(buf, Math.min(Number(count), 0x7ffff000));
       if (bytes === null) return k.fail(EFAULT);
       const wrote = k.files.write(Number(fd), Buffer.from(bytes));
+      if (wrote > 0) k.wake();
       return [BigInt(wrote), 0];
     });
 
@@ -413,6 +424,15 @@ export class Kernel {
       if (typeof got === "number") return [BigInt(got), 0];
       if (!k.put(buf, got)) return k.fail(EFAULT);
       return [BigInt(got.length), 0];
+    });
+
+    this.on(59, (k, fds, flags) => {
+      const cloexec = (Number(flags) & 0x80000) !== 0;
+      const [read, write] = k.files.pipe(cloexec);
+      const ok = k.put32(fds, read) && k.put32(k.addr(fds) + 4, write);
+      if (process.env.ARMJIT_TRACE_SYSCALLS) console.error(`  pipe2 fds=${read},${write} ok=${ok}`);
+      if (!ok) return k.fail(EFAULT);
+      return [0n, 0];
     });
 
     this.on(43, (k, path, buf) => {
