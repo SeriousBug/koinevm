@@ -1,0 +1,37 @@
+# One `dash -c` script per line, run translated and on a real kernel, compared on stdout, stderr and
+# exit status. Nothing here may need a program to be started: there is no fork yet, so only the
+# builtins, the expansion and the control flow are in reach.
+echo hi
+echo hi;echo bye
+echo $?
+true;echo $?
+false;echo $?
+nosuchcommand
+exit 7
+:;exit 7
+x=5; echo $x
+echo $x
+echo ${x:-d}
+x=5; unset x; echo ${x:-unset}
+echo ${x:=new} $x
+x=abcdef; echo ${x#abc} ${x%def}
+x=abcdef; echo ${#x}
+echo $#; set -- a b c; echo $2 $#
+echo "$0"
+echo $((1+2*3))
+echo $((7/2)) $((7%2)) $((0-7))
+i=0; while [ $i -lt 3 ]; do echo $i; i=$((i+1)); done
+for x in a b c; do echo $x; done
+if [ 1 -eq 1 ]; then echo yes; else echo no; fi
+case abc in a*) echo match;; *) echo no;; esac
+f() { echo "in f $1"; }; f hello
+echo 'single $x'
+echo "double $x"
+echo a  b   c
+printf '%s-%d\n' a 5
+[ -n "" ]; echo $?
+test 3 -gt 2; echo $?
+x=2; y=3; echo $((x*y)) $((x<y))
+echo "${x:-q}${x:+r}"
+: ${x=assigned}; echo $x
+# echo abc | while read l; do echo $l; done -- needs a pipe, which needs fork

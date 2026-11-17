@@ -70,6 +70,12 @@ checks on and off. Eight more cases have no native oracle and assert the ABI the
 handoff (`tests/dyn.sh`), the memory syscalls (`tests/mem.sh`) and the file syscalls
 (`tests/files.sh`), each in both address-check modes. `bash tests/run.sh` runs all 66.
 
+Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
+`printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
+a container and records the oracle there) through the translated `ld-linux` and `libc.so.6`, in both
+address-check modes. `bash tests/shell.sh` runs Debian's own `dash` under 33 `-c` scripts, translated
+and inside `chroot` on a container's kernel, and compares stdout, stderr and exit status of each.
+
 ## Performance
 
 `bash tools/bench.sh` measures this: an integer kernel, 500M mix iterations + 2000 array sweeps, on
@@ -109,12 +115,10 @@ Two things follow.
   dash: `-c true` exits 0, `-c 'echo hi'` prints `hi`, `-c 'nosuchcommand'` prints
   `dash: 1: nosuchcommand: not found` and exits 127, `-c ':;exit 7'` exits 7, all matching the same
   binary on a real kernel.
-- **Variable expansion.** `echo $?` prints the parse tree's own text, `!?=`, instead of `0`, and
-  every parameter and variable does the same: `!` + name + `=`. The marker byte dash's parser puts
-  in front of an expansion (`CTLVAR`, `0x82`) is missing from the tree text that the expander reads:
-  the four bytes `82 21 3f 3d` sit at `0x4327c8` in guest memory, and the four that get copied to the
-  buffer the expander walks start at `0x4327c9`. The copy is a four-byte `mempcpy` in
-  `makestrspace`/`stnputs`, so the source pointer dash computed is one byte past the text.
+- **Variable expansion and control flow.** Parameters, substrings, defaults, assignments,
+  arithmetic, quotes, `if`/`while`/`for`/`case`, functions and `printf` all behave: 33 `-c` scripts
+  print what the same binary prints on a real kernel and exit the same way. What is left is what
+  needs a second process: a pipe, a subshell, or any external command other than a builtin.
 - **Scalar floating point arithmetic.** The vector register file is translated and compared against
   the oracle case by case, as are the moves and conversions between the general and FP registers.
   `fadd`, `fmul`, `fdiv`, `fsqrt`, `fcmp`, `fcsel`, `fneg`/`fabs`/`fmax`/`fmin` and `fcvt` between
