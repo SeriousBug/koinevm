@@ -19,6 +19,11 @@ export const ELOOP = 40;
 export const ENAMETOOLONG = 36;
 export const ENOSPC = 28;
 export const EPIPE = 32;
+export const EEXIST = 17;
+export const EPERM = 1;
+export const ENOTEMPTY = 39;
+export const EXDEV = 18;
+export const ENOSYS = 38;
 
 /// What a read of a pipe with writers but no data answers: the process has to wait for one.
 export const WOULD_BLOCK = Symbol("would block");
@@ -54,6 +59,7 @@ export class Files {
     this.next = 3;
     this.seed = 1;
     this.cwd = "/";
+    this.umask = 0o022;
     this.map.set(0, { kind: "stdin" });
     this.map.set(1, { kind: "stdout" });
     this.map.set(2, { kind: "stderr" });
@@ -71,6 +77,21 @@ export class Files {
     const clean = this.guestPath(guestPath);
     if (clean.includes("\0")) return -ENOENT;
     const host = path.join(this.rootfs, clean);
+    if (host !== this.rootfs && !host.startsWith(this.rootfs + path.sep)) return -EACCES;
+    return host;
+  }
+
+  /// A `*at` call's path: an absolute one is the guest's root, a relative one is the directory
+  /// descriptor it was given, which is either the process's own directory or an open one.
+  resolveAt(name, dirfd) {
+    if (name.startsWith("/") || dirfd === AT_FDCWD) return this.resolve(name);
+    const entry = this.map.get(dirfd);
+    if (!entry) return -EBADF;
+    if (entry.kind !== "dir") return -ENOTDIR;
+    const clean = path.posix.normalize(name);
+    if (clean === ".." || clean.startsWith("../")) return -EACCES;
+    const host = path.join(entry.host, clean);
+    if (host !== entry.host && !host.startsWith(entry.host + path.sep)) return -EACCES;
     if (host !== this.rootfs && !host.startsWith(this.rootfs + path.sep)) return -EACCES;
     return host;
   }
@@ -164,10 +185,10 @@ export class Files {
     }
   }
 
-  open(guestPath, flags, mode) {
+  open(guestPath, flags, mode, dirfd = AT_FDCWD) {
     const device = DEVICES.get(this.guestPath(guestPath));
     if (device) return this.add({ ...device, desc: { pos: 0 }, cloexec: (flags & O_CLOEXEC) !== 0 });
-    const host = this.resolve(guestPath);
+    const host = this.resolveAt(guestPath, dirfd);
     if (host < 0) return host;
     const access = flags & O_ACCMODE;
     try {
@@ -184,9 +205,10 @@ export class Files {
         },
         cloexec: (flags & O_CLOEXEC) !== 0,
       };
+      if ((flags & O_CREAT) && (flags & O_EXCL) && fs.existsSync(host)) return -EEXIST;
       if ((flags & O_CREAT) && !fs.existsSync(host)) {
         fs.mkdirSync(path.dirname(host), { recursive: true });
-        fs.writeFileSync(host, Buffer.alloc(0), { mode: mode || 0o644 });
+        fs.writeFileSync(host, Buffer.alloc(0), { mode: this.mask(mode || 0o666) });
       }
       const st = fs.statSync(host);
       if ((flags & O_DIRECTORY) && !st.isDirectory()) return -ENOTDIR;
@@ -371,8 +393,8 @@ export class Files {
     return this.bytes(entry, off, len);
   }
 
-  statPath(guestPath) {
-    const host = this.resolve(guestPath);
+  statPath(guestPath, dirfd = AT_FDCWD) {
+    const host = this.resolveAt(guestPath, dirfd);
     if (host < 0) return host;
     try {
       return fs.lstatSync(host, { bigint: true });
@@ -381,8 +403,8 @@ export class Files {
     }
   }
 
-  statFile(guestPath) {
-    const host = this.resolve(guestPath);
+  statFile(guestPath, dirfd = AT_FDCWD) {
+    const host = this.resolveAt(guestPath, dirfd);
     if (host < 0) return host;
     try {
       return fs.statSync(host, { bigint: true });
@@ -414,14 +436,197 @@ export class Files {
     }
   }
 
-  readlink(guestPath) {
-    const host = this.resolve(guestPath);
+  readlink(guestPath, dirfd = AT_FDCWD) {
+    const host = this.resolveAt(guestPath, dirfd);
     if (host < 0) return host;
     try {
       return fs.readlinkSync(host);
     } catch (e) {
       return fromErrno(e, -EINVAL);
     }
+  }
+
+  // ---- changing the tree. `dpkg` unpacks a package with these, so each one answers 0 or -errno
+  // the way the syscall does, and the mode a new node gets is the mode with the umask taken out.
+
+  mask(mode) {
+    return (mode & 0o7777) & ~this.umask;
+  }
+
+  mkdir(name, dirfd, mode) {
+    const host = this.resolveAt(name, dirfd);
+    if (host < 0) return host;
+    try {
+      fs.mkdirSync(host, { mode: this.mask(mode) | 0o700 });
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -EEXIST);
+    }
+  }
+
+  rmdir(name, dirfd) {
+    const host = this.resolveAt(name, dirfd);
+    if (host < 0) return host;
+    try {
+      fs.rmdirSync(host);
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -ENOTEMPTY);
+    }
+  }
+
+  unlink(name, dirfd) {
+    const host = this.resolveAt(name, dirfd);
+    if (host < 0) return host;
+    try {
+      fs.unlinkSync(host);
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -ENOENT);
+    }
+  }
+
+  rename(from, fromDir, to, toDir) {
+    const a = this.resolveAt(from, fromDir);
+    if (a < 0) return a;
+    const b = this.resolveAt(to, toDir);
+    if (b < 0) return b;
+    try {
+      fs.renameSync(a, b);
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -EXDEV);
+    }
+  }
+
+  symlink(target, name, dirfd) {
+    const host = this.resolveAt(name, dirfd);
+    if (host < 0) return host;
+    try {
+      fs.symlinkSync(target, host);
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -EEXIST);
+    }
+  }
+
+  link(from, fromDir, to, toDir) {
+    const a = this.resolveAt(from, fromDir);
+    if (a < 0) return a;
+    const b = this.resolveAt(to, toDir);
+    if (b < 0) return b;
+    try {
+      fs.linkSync(a, b);
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -EXDEV);
+    }
+  }
+
+  chmod(name, dirfd, mode, follow) {
+    if (name === null) return -EINVAL;
+    const host = this.resolveAt(name, dirfd);
+    if (host < 0) return host;
+    try {
+      (follow ? fs.chmodSync : fs.lchmodSync)(host, mode & 0o7777);
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -EPERM);
+    }
+  }
+
+  chmodFd(fd, mode) {
+    const entry = this.map.get(fd);
+    if (!entry) return -EBADF;
+    if (!entry.host) return 0;
+    try {
+      fs.chmodSync(entry.host, mode & 0o7777);
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -EPERM);
+    }
+  }
+
+  /// Ownership is one user's throughout: a rootfs unpacked on this machine has one owner, and the
+  /// guest's ids are all zero, so the change is already true.
+  chown() {
+    return 0;
+  }
+
+  utimens(name, dirfd, times, follow) {
+    const host = this.resolveAt(name, dirfd);
+    if (host < 0) return host;
+    return this.utimensHost(host, times, follow);
+  }
+
+  utimensFd(fd, times) {
+    const entry = this.map.get(fd);
+    if (!entry || !entry.host) return -EBADF;
+    return this.utimensHost(entry.host, times, true);
+  }
+
+  utimensHost(host, times, follow) {
+    try {
+      // A null field is `UTIME_OMIT`: that timestamp keeps the value it already has.
+      if (times === null || times.atime === null || times.mtime === null) {
+        const st = fs.lstatSync(host);
+        const atime = times && times.atime !== null ? times.atime : st.atimeMs / 1000;
+        const mtime = times && times.mtime !== null ? times.mtime : st.mtimeMs / 1000;
+        (follow ? fs.utimesSync : fs.lutimesSync)(host, atime, mtime);
+      } else {
+        (follow ? fs.utimesSync : fs.lutimesSync)(host, times.atime, times.mtime);
+      }
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -ENOENT);
+    }
+  }
+
+  truncate(name, dirfd, len) {
+    const host = this.resolveAt(name, dirfd);
+    if (host < 0) return host;
+    try {
+      fs.truncateSync(host, len);
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -EINVAL);
+    }
+  }
+
+  truncateFd(fd, len) {
+    const entry = this.map.get(fd);
+    if (!entry) return -EBADF;
+    if (entry.kind !== "file") return -EINVAL;
+    try {
+      fs.truncateSync(entry.host, len);
+      if (entry.desc && entry.desc.pos > len) entry.desc.pos = len;
+      return 0;
+    } catch (e) {
+      return fromErrno(e, -EINVAL);
+    }
+  }
+
+  chdir(name) {
+    const host = this.resolve(name);
+    if (host < 0) return host;
+    let st;
+    try {
+      st = fs.statSync(host);
+    } catch (e) {
+      return fromErrno(e, -ENOENT);
+    }
+    if (!st.isDirectory()) return -ENOTDIR;
+    this.cwd = this.guestPath(name);
+    return 0;
+  }
+
+  chdirFd(fd) {
+    const entry = this.map.get(fd);
+    if (!entry) return -EBADF;
+    if (entry.kind !== "dir") return -ENOTDIR;
+    const rel = path.relative(this.rootfs, entry.host);
+    this.cwd = "/" + rel.split(path.sep).join("/");
+    return 0;
   }
 }
 

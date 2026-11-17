@@ -103,6 +103,20 @@ export class Kernel {
     return true;
   }
 
+  /// The two `struct timespec` a `utimensat` caller passes, as seconds: a nanosecond field of
+  /// UTIME_OMIT or UTIME_NOW is the marker that says the value is not a time at all.
+  timespecPair(addr) {
+    const at = this.addr(addr);
+    const one = (offset) => {
+      const sec = Number(this.u64(at + BigInt(offset)));
+      const nsec = Number(this.u64(at + BigInt(offset) + 8n));
+      if (nsec === 0x3fffffff) return null;
+      if (nsec === 0x3ffffffe) return Date.now() / 1000;
+      return sec + nsec / 1e9;
+    };
+    return { atime: one(0), mtime: one(16) };
+  }
+
   on(nr, fn) {
     this.table.set(nr, fn);
   }
@@ -287,8 +301,8 @@ export class Kernel {
   registerFiles() {
     this.on(56, (k, dirfd, path, flags, mode) => {
       if (process.env.ARMJIT_TRACE_SYSCALLS) console.error(`  openat ${k.str(path)}`);
-      if (!isCwd(dirfd)) return k.fail(ENOSYS);
-      return [BigInt(k.files.open(k.str(path), Number(flags), Number(mode))), 0];
+      const fd = k.files.open(k.str(path), Number(flags), Number(mode), Number(dirfd));
+      return [BigInt(fd), 0];
     });
 
     this.on(57, (k, fd) => {
@@ -298,6 +312,71 @@ export class Kernel {
     });
 
     this.on(23, (k, fd) => [BigInt(k.files.dup(Number(fd), 0, false)), 0]); // dup
+
+    // ---- changing the tree, which is what unpacking a package is made of
+
+    this.on(34, (k, dirfd, path, mode) => [BigInt(k.files.mkdir(k.str(path), Number(dirfd), Number(mode))), 0]);
+
+    this.on(35, (k, dirfd, path, flags) => {
+      const at = k.str(path);
+      // AT_REMOVEDIR asks for a directory, and anything else for a file, exactly as on Linux.
+      const removed = (Number(flags) & 0x200) !== 0
+        ? k.files.rmdir(at, Number(dirfd))
+        : k.files.unlink(at, Number(dirfd));
+      return [BigInt(removed), 0];
+    });
+
+    this.on(36, (k, target, dirfd, path) => [BigInt(k.files.symlink(k.str(target), k.str(path), Number(dirfd))), 0]);
+
+    this.on(37, (k, olddir, oldpath, newdir, newpath) => [
+      BigInt(k.files.link(k.str(oldpath), Number(olddir), k.str(newpath), Number(newdir))),
+      0,
+    ]);
+
+    this.on(38, (k, olddir, oldpath, newdir, newpath) => [
+      BigInt(k.files.rename(k.str(oldpath), Number(olddir), k.str(newpath), Number(newdir))),
+      0,
+    ]);
+
+    // renameat2 differs by the flags, which say whether to replace an existing target; the tree it
+    // names is the same one, and the only flag `dpkg` uses is the default.
+    this.on(276, (k, olddir, oldpath, newdir, newpath) => [
+      BigInt(k.files.rename(k.str(oldpath), Number(olddir), k.str(newpath), Number(newdir))),
+      0,
+    ]);
+
+    this.on(45, (k, path, len) => [BigInt(k.files.truncate(k.str(path), AT_FDCWD, Number(len))), 0]);
+
+    this.on(46, (k, fd, len) => [BigInt(k.files.truncateFd(Number(fd), Number(len))), 0]);
+
+    this.on(52, (k, fd, mode) => [BigInt(k.files.chmodFd(Number(fd), Number(mode))), 0]);
+
+    this.on(53, (k, dirfd, path, mode, flags) => [
+      BigInt(k.files.chmod(k.str(path), Number(dirfd), Number(mode), (Number(flags) & 0x100) === 0)),
+      0,
+    ]);
+
+    this.on(54, () => [0n, 0]); // fchownat: one owner for the whole tree
+    this.on(55, () => [0n, 0]); // fchown
+
+    this.on(88, (k, dirfd, path, times, flags) => {
+      const at = k.str(path);
+      const wanted = Number(times) === 0 ? null : k.timespecPair(times);
+      return [BigInt(k.files.utimens(at, Number(dirfd), wanted, (Number(flags) & 0x100) === 0)), 0];
+    });
+
+    this.on(49, (k, path) => [BigInt(k.files.chdir(k.str(path))), 0]); // chdir
+    this.on(50, (k, fd) => [BigInt(k.files.chdirFd(Number(fd))), 0]); // fchdir
+    this.on(166, (k, mask) => {
+      const old = k.files.umask;
+      k.files.umask = Number(mask) & 0o777;
+      return [BigInt(old), 0];
+    });
+
+    // Every write is already on the host's disk when it returns, so there is nothing to flush: the
+    // call is the confirmation the caller waits for.
+    this.on(82, (k, fd) => (k.files.get(Number(fd)) ? [0n, 0] : k.fail(EBADF))); // fsync
+    this.on(83, (k, fd) => (k.files.get(Number(fd)) ? [0n, 0] : k.fail(EBADF))); // fdatasync
 
     this.on(24, (k, oldfd, newfd, flags) => [
       BigInt(k.files.dup3(Number(oldfd), Number(newfd), (Number(flags) & 0x80000) !== 0)),
@@ -410,17 +489,17 @@ export class Kernel {
         k.fillStat(buf, st);
         return [0n, 0];
       }
-      if (!isCwd(dirfd)) return k.fail(ENOSYS);
       const follow = (Number(flags) & 0x100) === 0; // AT_SYMLINK_NOFOLLOW is 0x100
-      const st = follow ? k.files.statFile(k.str(path)) : k.files.statPath(k.str(path));
+      const st = follow
+        ? k.files.statFile(k.str(path), Number(dirfd))
+        : k.files.statPath(k.str(path), Number(dirfd));
       if (typeof st === "number") return [BigInt(st), 0];
       k.fillStat(buf, st);
       return [0n, 0];
     });
 
     this.on(78, (k, dirfd, path, buf, size) => {
-      if (!isCwd(dirfd)) return k.fail(ENOSYS);
-      const target = k.files.readlink(k.str(path));
+      const target = k.files.readlink(k.str(path), Number(dirfd));
       if (typeof target === "number") return [BigInt(target), 0];
       const bytes = Buffer.from(target);
       if (bytes.length > Number(size)) return [BigInt(bytes.length), 0];
@@ -429,8 +508,7 @@ export class Kernel {
     });
 
     this.on(48, (k, dirfd, path, mode) => {
-      if (!isCwd(dirfd)) return k.fail(ENOSYS);
-      const st = k.files.statFile(k.str(path));
+      const st = k.files.statFile(k.str(path), Number(dirfd));
       return [typeof st === "number" ? BigInt(st) : 0n, 0];
     });
 
@@ -609,7 +687,6 @@ export class Kernel {
   }
 }
 
-const isCwd = (x) => Number(BigInt.asIntN(64, x)) === AT_FDCWD;
 
 export { EFAULT, ENOMEM, EINVAL };
 
