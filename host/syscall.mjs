@@ -319,10 +319,22 @@ export class Kernel {
           return [0n, 0];
         case 3: // F_GETFL
           return [BigInt(entry.desc?.append ? 0x400 : 0), 0];
+        // One process holds every lock it asks for, so a lock request succeeds and a query finds
+        // nothing in the way. A query has to say so: `l_type` is `F_UNLCK`, or the caller reads
+        // whatever it put there and reports that someone else holds the database.
+        case 5: // F_GETLK
+          if (!k.put(arg, Buffer.from([2, 0]))) return k.fail(EFAULT);
+          return [0n, 0];
+        case 6: // F_SETLK
+        case 7: // F_SETLKW
+          return [0n, 0];
         default:
           return [0n, 0];
       }
     });
+
+    // flock is the other lock package managers take, on the same single-process model as fcntl.
+    this.on(32, (k, fd) => (k.files.get(Number(fd)) ? [0n, 0] : k.fail(EBADF)));
 
     this.on(63, (k, fd, buf, count) => {
       const n = Math.min(Number(count), 0x7ffff000);
@@ -558,10 +570,17 @@ export class Kernel {
     });
 
     this.on(261, (k, pid, resource, newLimit, oldLimit) => {
+      // RLIMIT_NOFILE is what `sysconf(_SC_OPEN_MAX)` reads, and a program that closes every
+      // descriptor below it walks the whole number: apt's `ExecFork` does that before each child.
+      // Infinite would mean two billion iterations, so the file limit is what a Debian container
+      // reports. Everything else is unlimited, which one process can honour.
+      const [soft, hard] =
+        Number(resource) === 7 // RLIMIT_NOFILE
+          ? [20480n, 1048576n]
+          : [0xffffffffffffffffn, 0xffffffffffffffffn];
       if (oldLimit !== 0n && Number(oldLimit) !== 0) {
-        // RLIM_INFINITY for both, which is what a single-process runner can honour.
-        k.put64(oldLimit, 0xffffffffffffffffn);
-        k.put64(oldLimit + 8n, 0xffffffffffffffffn);
+        k.put64(oldLimit, soft);
+        k.put64(oldLimit + 8n, hard);
       }
       return [0n, 0];
     });
