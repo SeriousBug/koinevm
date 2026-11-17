@@ -115,8 +115,9 @@ pub struct Config {
     pub mem_pages: u32,
     /// Write the register shadow on every dispatch, so a trap can report guest state.
     pub trace: bool,
-    /// Report only the backward branches, which is enough to find a loop that never ends without
-    /// the cost of tracing every instruction.
+    /// Report every branch and return the guest takes, which is enough to find a loop that never
+    /// ends without the cost of tracing every instruction. A loop needs a transfer backwards, and
+    /// a transfer is a branch or a return, however the guest reached it.
     pub trace_loops: bool,
     /// Translate what decodes and trap at what does not, instead of refusing the whole image. This
     /// is how `scan` measures the gap, and how a run gets far enough to say what it is missing.
@@ -1769,7 +1770,7 @@ impl<'a> RegionEmitter<'a> {
         for (addr, insn) in insns {
             next = addr + 4;
             if is_terminator(&insn) {
-                self.emit_trace(addr);
+                self.emit_trace(addr, self.layout.trace);
                 self.emit_term(addr, insn)?;
                 if !falls_through(&insn) {
                     return Ok(());
@@ -1931,9 +1932,7 @@ impl<'a> RegionEmitter<'a> {
     fn emit_term(&mut self, addr: u64, insn: Insn) -> Result<(), String> {
         match insn {
             Insn::B { offset } => {
-                let t = (addr as i64 + offset) as u64;
-                self.trace_backedge(addr, t);
-                self.emit_jump(t)
+                self.emit_jump((addr as i64 + offset) as u64)
             }
             Insn::Bl { offset } => {
                 let t = (addr as i64 + offset) as u64;
@@ -1943,7 +1942,6 @@ impl<'a> RegionEmitter<'a> {
             }
             Insn::BCond { cond, offset } => {
                 let t = (addr as i64 + offset) as u64;
-                self.trace_backedge(addr, t);
                 self.push_cond(cond);
                 self.open_if();
                 self.emit_jump(t);
@@ -1951,7 +1949,6 @@ impl<'a> RegionEmitter<'a> {
             }
             Insn::Cbz { sf, nonzero, rt, offset } => {
                 let t = (addr as i64 + offset) as u64;
-                self.trace_backedge(addr, t);
                 self.get(rt, sf);
                 self.f.op(if sf { I64_EQZ } else { I32_EQZ });
                 if nonzero {
@@ -1963,7 +1960,6 @@ impl<'a> RegionEmitter<'a> {
             }
             Insn::Tbz { nonzero, bit, rt, offset } => {
                 let t = (addr as i64 + offset) as u64;
-                self.trace_backedge(addr, t);
                 self.f.lg(rt);
                 self.f.i64c(bit as i64);
                 self.f.op(I64_SHR_U);
@@ -2914,17 +2910,13 @@ impl<'a> RegionEmitter<'a> {
 
     // ---- instructions
 
-    /// A branch that jumps back is a loop, and a run that never returns is inside one.
-    fn trace_backedge(&mut self, addr: u64, target: u64) {
-        if self.layout.trace_loops && target <= addr {
-            self.emit_trace(addr);
-        }
-    }
-
     /// The register shadow and the call into the host, before the instruction at `addr` runs.
-    fn emit_trace(&mut self, addr: u64) {
+    /// `state` says whether the register file goes with it: finding a loop that never ends needs
+    /// the address alone, and writing all 63 registers at every branch would make the module ten
+    /// times the size of the image for it.
+    fn emit_trace(&mut self, addr: u64, state: bool) {
         let Some(t) = self.ids.trace else { return };
-        {
+        if state {
             for r in 0..NR {
                 self.f.i32c(SHADOW as i32 + (r as i32) * 8);
                 self.f.lg(r);
@@ -2938,16 +2930,18 @@ impl<'a> RegionEmitter<'a> {
             self.f.i32c(SHADOW_PC as i32);
             self.f.i32c(addr as i32);
             self.f.mem(I32_STORE, 2, 0);
-            self.f.i32c(addr as i32);
-            self.f.lg(31);
-            self.f.call(t);
         }
+        self.f.i32c(addr as i32);
+        self.f.lg(31);
+        self.f.call(t);
     }
 
     fn emit_insn(&mut self, addr: u64, insn: Insn) -> Result<(), String> {
         self.cur_pc = addr;
         self.narrow = narrows_to_low_half(&insn);
-        self.emit_trace(addr);
+        if self.layout.trace {
+            self.emit_trace(addr, true);
+        }
         match insn {
             Insn::Hint => {}
             // The terminator table handles a syscall: it ends the block it is in.
