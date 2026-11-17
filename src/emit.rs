@@ -1734,10 +1734,20 @@ impl<'a> RegionEmitter<'a> {
         let n = self.region.blocks.len();
         self.f.lg(P_ENTRY);
         self.f.ls(L_PC);
-        // Stack overflow is caught at region entry, which every guest call and return passes.
+        // The stack pointer has to name a page the guest mapped writable, which is what a kernel's
+        // guard page answers and what holds for a thread's own stack as much as for the process's.
+        // A stack that ran off the end of its mapping traps here, at region entry, which every
+        // guest call and return passes.
+        self.f.i32c(PTE_BASE as i32);
         self.f.lg(31);
-        self.f.i64c(self.layout.stack_floor as i64);
-        self.f.op(I64_LT_U);
+        self.f.i64c(12);
+        self.f.op(I64_SHR_U);
+        self.f.wrap_i64();
+        self.f.op(I32_ADD);
+        self.f.mem(I32_LOAD8_U, 0, 0);
+        self.f.i32c((pte::MAPPED | pte::WRITABLE) as i32);
+        self.f.op(I32_AND);
+        self.f.op(I32_EQZ);
         self.f.op(IF);
         self.f.body.push(0x40);
         self.f.i32c(2);
