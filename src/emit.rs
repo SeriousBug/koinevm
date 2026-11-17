@@ -131,6 +131,7 @@ pub struct Stats {
     pub instructions: usize,
     pub regions: usize,
     pub wasm_bytes: usize,
+    pub guest_bytes: usize,
 }
 
 pub struct Output {
@@ -142,6 +143,8 @@ pub struct Output {
     pub code_lo: u64,
     pub code_hi: u64,
     pub unsupported: Vec<(u64, String)>,
+    /// Where the dynamic loader was placed, or zero when the program has none.
+    pub interp_base: u64,
     /// The map the host has to maintain: where the page table is, where the heap and `mmap` areas
     /// start, and where the stack ends. The host reports these rather than assuming them.
     pub map: MapInfo,
@@ -483,8 +486,8 @@ fn prelude(m: &mut Module, cfg: &Config) -> Prelude {
 pub fn translate(
     images: Images,
     cfg: &Config,
-    argv: &[String],
-    envp: &[String],
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
 ) -> Result<Output, String> {
     let elf = images.main;
     let (code_lo, code_hi) = elf.code_range().ok_or("no executable segment")?;
@@ -621,7 +624,13 @@ pub fn translate(
         entry,
         sp,
         mem_pages: cfg.mem_pages,
-        stats: Stats { instructions, regions: regions.len(), wasm_bytes: wasm.len() },
+        stats: Stats {
+            instructions,
+            regions: regions.len(),
+            wasm_bytes: wasm.len(),
+            guest_bytes: elf.image.len() + images.interp.map(|i| i.image.len()).unwrap_or(0),
+        },
+        interp_base,
         code_lo,
         code_hi,
         unsupported,
@@ -763,26 +772,35 @@ impl StackBuilder {
     }
 }
 
+/// A NUL-terminated copy of a string argument, which is what the stack holds.
+fn cstr(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + 1);
+    out.extend_from_slice(bytes);
+    out.push(0);
+    out
+}
+
 pub fn build_initial_stack(
     elf: &Elf,
     interp_base: u64,
-    argv: &[String],
-    envp: &[String],
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
     stack_top: u64,
 ) -> (Vec<u8>, u64) {
     let mut sb = StackBuilder { cur: stack_top, chunks: Vec::new() };
 
-    let argv: Vec<String> =
-        if argv.is_empty() { vec!["guest".to_string()] } else { argv.to_vec() };
+    // The strings are bytes, not text: `execve` passes whatever the program gave it.
+    let default: Vec<Vec<u8>> = vec![b"guest".to_vec()];
+    let argv = if argv.is_empty() { &default } else { argv };
 
-    let execfn_addr = sb.bytes(format!("{}\0", argv[0]).as_bytes());
+    let execfn_addr = sb.bytes(&cstr(&argv[0]));
     let mut env_addrs = Vec::new();
     for e in envp {
-        env_addrs.push(sb.bytes(format!("{e}\0").as_bytes()));
+        env_addrs.push(sb.bytes(&cstr(e)));
     }
     let mut argv_addrs = Vec::new();
-    for a in &argv {
-        argv_addrs.push(sb.bytes(format!("{a}\0").as_bytes()));
+    for a in argv {
+        argv_addrs.push(sb.bytes(&cstr(a)));
     }
     let platform_addr = sb.bytes(b"aarch64\0");
     // Fixed AT_RANDOM: runs reproduce, at the cost of every run being identical.
@@ -1291,11 +1309,14 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
         f.ls(X0 + i);
     }
 
+    // A region handed back a next pc of zero: the guest stopped, either because a syscall wants the
+    // host or because it jumped to an address no block starts at. Status 1 says so; 2 is a pc that
+    // needs translating.
     f.lg(NEXT);
     f.op(I32_EQZ);
     f.op(IF);
     f.body.push(0x40);
-    f.i32c(0);
+    f.i32c(1);
     f.ls(STATUS);
     f.br(2);
     f.end();
@@ -3516,6 +3537,8 @@ impl<'a> RegionEmitter<'a> {
                 self.f.lg(L_TI);
                 self.open_if();
                 self.begin_return();
+                // A region that returns a zero next pc is what stops the run loop, and the host
+                // resumes this process with x0 holding the syscall's answer.
                 self.f.i32c(0);
                 self.end_return();
                 self.close_if();

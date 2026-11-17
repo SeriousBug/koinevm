@@ -10,6 +10,20 @@ import { spawn } from "node:child_process";
 const SHADOW_PC = 0x108;
 const TABLE_SLOT = 8;
 
+/// The pages translated for one image generation, as modules: the same image at the same base
+/// always translates to the same bytes, and a fork or a second run must not pay for it again.
+const pageModules = new Map();
+
+/// What a fork shares with its parent: the region slots of the dispatch table, which are baked
+/// into the guest's memory and therefore into the copy the child starts from, and the page module
+/// each one came from. An exec starts a new lineage, because its dispatch table starts over.
+export class Lineage {
+  constructor(initialSlots) {
+    this.slots = initialSlots;
+    this.slotOf = new Map();
+  }
+}
+
 /// The translator, kept alive: a page costs one request, and the process is not restarted for it.
 export class Translator {
   constructor(bin) {
@@ -42,12 +56,21 @@ export class Translator {
     });
   }
 
-  configure({ bounds, trace, memPages }) {
-    return this.ask(`cfg bounds=${bounds ? "check" : "trust"} trace=${trace ? 1 : 0} mem-pages=${memPages}`);
+  configure({ bounds, trace, memPages, rootfs }) {
+    const root = rootfs ? rootfs : "-";
+    return this.ask(`cfg bounds=${bounds ? "check" : "trust"} trace=${trace ? 1 : 0} mem-pages=${memPages} rootfs=${root}`);
   }
 
   page(image, base, at) {
     return this.ask(`page ${image} ${base.toString(16)} ${at.toString(16)}`);
+  }
+
+  /// A whole image, which is what `execve` needs: the program, its loader, and the stack built for
+  /// the arguments it was given.
+  image(path, argv, envp) {
+    const hex = (bytes) => (bytes.length ? Buffer.from(bytes).toString("hex") : "-");
+    const args = [...argv.map(hex), String(envp.length), ...envp.map(hex)].join(" ");
+    return this.ask(`image ${path} ${argv.length} ${args}`);
   }
 
   stop() {
@@ -65,9 +88,29 @@ export class Mach {
     this.translator = translator;
     this.imports = imports;
     this.table = instance.exports.tbl;
-    this.slots = this.table.length;
-    this.pages = new Map();
+    this.lineage = new Lineage(this.table.length);
+    this.pageInstances = new Map();
     this.view = new DataView(memory.buffer);
+  }
+
+  /// The table a fork's child needs: the same slots holding regions that write to its own memory.
+  adopt(lineage, parent) {
+    this.lineage = lineage;
+    this.growTo(lineage.slots);
+    for (const [key, page] of parent.pageInstances) {
+      this.instantiate(key, page.source, lineage.slotOf.get(key));
+    }
+  }
+
+  instantiate(key, source, base) {
+    const inst = new WebAssembly.Instance(source.module, {
+      env: { ...this.imports, mem: this.memory },
+    });
+    for (let i = 0; i < source.regions.length; i++) {
+      this.table.set(base + i, inst.exports[`r${i}`]);
+    }
+    this.pageInstances.set(key, { source, instance: inst });
+    return inst;
   }
 
   /// What the dispatch table says about a pc, for checking an insert against the answer.
@@ -130,16 +173,20 @@ export class Mach {
     if (!image) throw new Error(`nothing to translate 0x${pc.toString(16)} from`);
 
     const key = `${image.host}:${image.base}:${pc}`;
-    let page = this.pages.get(key);
+    let page = pageModules.get(key);
     if (!page) {
       const answer = await this.translator.page(image.host, image.base, pc);
       if (!answer.ok) throw new Error(`translating 0x${pc.toString(16)}: ${answer.error}`);
-      page = answer;
-      this.pages.set(key, page);
+      page = {
+        module: new WebAssembly.Module(Buffer.from(answer.wasm, "hex")),
+        regions: answer.regions,
+        unsupported: answer.unsupported,
+      };
+      pageModules.set(key, page);
       if (process.env.ARMJIT_TRACE_PAGES) {
         const where = `${image.host.split("/").pop()}+0x${(pc - image.base).toString(16)}`;
         console.error(
-          `page ${where}: ${page.regions.length} regions, ${page.wasm.length / 2} bytes wasm` +
+          `page ${where}: ${page.regions.length} regions, ${answer.wasm.length / 2} bytes wasm` +
             (page.unsupported.length ? `, ${page.unsupported.length} gaps` : ""),
         );
         for (const [at, why] of page.unsupported) console.error(`  gap at 0x${at.toString(16)}: ${why}`);
@@ -152,62 +199,35 @@ export class Mach {
       }
     }
 
-    if (!page.instance) {
-      const mod = new WebAssembly.Module(Buffer.from(page.wasm, "hex"));
-      page.instance = new WebAssembly.Instance(mod, {
-        env: { ...this.imports, mem: this.memory },
-      });
+    // The slot a page's regions take is a property of the lineage, not of this run: the fork's
+    // memory holds dispatch words that name them.
+    let base = this.lineage.slotOf.get(key);
+    if (base === undefined) {
+      base = this.lineage.slots;
       // The dispatch entry packs the region slot and the block index into 16 bits each, so a run
       // that translates enough pages to need more than 65535 slots corrupts every later entry.
-      if (this.slots + page.regions.length > 0xffff) {
+      if (base + page.regions.length > 0xffff) {
         throw new Error(
-          `region slots exhausted: ${this.slots} in use, ${page.regions.length} more for 0x${pc.toString(16)}`,
+          `region slots exhausted: ${base} in use, ${page.regions.length} more for 0x${pc.toString(16)}`,
         );
       }
-      this.growTo(this.slots + page.regions.length);
-      page.base = this.slots;
-      for (let i = 0; i < page.regions.length; i++) {
-        this.table.set(this.slots + i, page.instance.exports[`r${i}`]);
-      }
-      this.slots += page.regions.length;
+      this.lineage.slots += page.regions.length;
+      this.lineage.slotOf.set(key, base);
+    }
+    if (!this.pageInstances.has(key)) {
+      this.growTo(this.lineage.slots);
+      this.instantiate(key, page, base);
     }
 
     for (let i = 0; i < page.regions.length; i++) {
       const region = page.regions[i];
       for (let b = 0; b < region.blocks.length; b++) {
-        this.dispatch(region.blocks[b], page.base + i, b);
+        this.dispatch(region.blocks[b], base + i, b);
       }
     }
     if (!this.hasDispatch(pc)) {
       throw new Error(`translated 0x${pc.toString(16)} but no block starts there`);
     }
     return this.instance.exports.run(0, 0n, 1);
-  }
-
-  /// Run until the guest exits, or a jump lands where nothing has been translated yet.
-  async run() {
-    const after = process.env.ARMJIT_WATCHDOG ? Number(process.env.ARMJIT_WATCHDOG) * 1000 : 0;
-    const startedAt = Date.now();
-    let status = this.instance.exports.run(this.meta.entry, BigInt(this.meta.sp), 0);
-    while (status === 2) {
-      // A run that never ends is only observable from here: the guest's wasm call does not return
-      // while it spins, so the loop that translates pages is the one place time can be checked.
-      if (after && Date.now() - startedAt > after) return 4;
-      const pc = this.view.getUint32(SHADOW_PC, true) >>> 0;
-      if (process.env.ARMJIT_TRACE_PAGES) {
-      console.error(`images: ${JSON.stringify(this.kernel.space.images.map((m) => [m.lo.toString(16), m.hi.toString(16), m.base.toString(16), m.host]))}`);
-    }
-    if (!this.kernel.space.imageOf(pc)) {
-        console.error(`armjit: guest jumped to untranslated address 0x${pc.toString(16)}`);
-        return 1;
-      }
-      if (process.env.ARMJIT_TRACE_PAGES) console.error(`miss at 0x${pc.toString(16)}`);
-      status = await this.translateAndResume(pc);
-    }
-    if (status !== 0) {
-      console.error(`armjit: stopped with status ${status}`);
-      return 1;
-    }
-    return 0;
   }
 }

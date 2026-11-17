@@ -11,20 +11,34 @@ import { Files, AT_FDCWD, ENOENT } from "./files.mjs";
 export const ENOSYS = 38;
 export const EBADF = 9;
 export const ENOTTY = 25;
+export const ECHILD = 10;
+export const ENOEXEC = 8;
 
 const MAP_ANONYMOUS = 0x20;
+const CLONE_VM = 0x100;
+const WNOHANG = 1;
 
 export class Kernel {
   constructor(memory, meta, options = {}) {
     this.memory = memory;
     this.meta = meta;
+    this.pid = options.pid ?? 1;
+    this.ppid = options.ppid ?? 0;
     this.space = new AddressSpace(memory, meta);
-    this.files = new Files(options.rootfs);
+    this.files = options.files ?? new Files(options.rootfs);
     this.exited = null;
     this.missing = new Set();
     this.table = new Map();
     this.random = 0;
+    // What a syscall that cannot finish inside the guest's wasm call leaves for the host: the run
+    // returns, this is served, and the process is resumed with x0 as the answer.
+    this.pending = null;
     this.register();
+  }
+
+  /// A syscall the host has to perform, which means giving up the wasm call until it can.
+  ask(request) {
+    return { host: request };
   }
 
   addr(x) {
@@ -59,6 +73,16 @@ export class Kernel {
 
   u32(x) {
     return new DataView(this.memory.buffer).getUint32(this.addr(x), true);
+  }
+
+  /// The bytes of a string the guest passes, without a character set in the way: `execve` hands
+  /// over whatever it was given.
+  strBytes(x) {
+    const a = this.addr(x);
+    const view = new Uint8Array(this.memory.buffer);
+    let end = a;
+    while (end < view.length && view[end] !== 0) end++;
+    return view.subarray(a, end);
   }
 
   u64(x) {
@@ -158,6 +182,94 @@ export class Kernel {
 
     this.registerFiles();
     this.registerStartup();
+    this.registerProcess();
+  }
+
+  // ---- processes
+
+  /// The kernel state a fork copies. The descriptor entries are shared by reference, because a
+  /// fork shares its open file descriptions, so a read in one moves the position in the other; the
+  /// tables that hold them are not shared, so closing in one leaves the other open.
+  forkState() {
+    return {
+      brk: this.space.brk,
+      free: this.space.free.map((s) => ({ ...s })),
+      images: this.space.images.map((i) => ({ ...i })),
+      fds: new Map(this.files.map),
+      nextFd: this.files.next,
+      cwd: this.files.cwd,
+      random: this.random,
+    };
+  }
+
+  adopt(state) {
+    this.space.brk = state.brk;
+    this.space.free = state.free;
+    this.space.images = state.images;
+    this.files.map = state.fds;
+    this.files.next = state.nextFd;
+    this.files.cwd = state.cwd;
+    this.random = state.random;
+  }
+
+  registerProcess() {
+    this.on(220, (k, flags, stack, ptid, ctid, tls) => {
+      const f = Number(flags);
+      // A thread shares its memory, which one linear memory per process cannot express, and a new
+      // stack is what makes it a thread.
+      if (f & CLONE_VM || k.addr(stack) !== 0) return k.fail(ENOSYS);
+      return k.ask({
+        kind: "fork",
+        flags: f,
+        ptid: k.addr(ptid),
+        ctid: k.addr(ctid),
+        tls: Number(tls),
+      });
+    });
+
+    // clone3, which is the same request as a struct: glibc's fork still uses clone, but
+    // `posix_spawn` asks this one first.
+    this.on(435, (k, args) => {
+      const at = args;
+      if (k.addr(at) === 0) return k.fail(EINVAL);
+      const flags = Number(k.u64(at));
+      const stack = Number(k.u64(at + 40n));
+      if (flags & CLONE_VM || stack !== 0) return k.fail(ENOSYS);
+      return k.ask({
+        kind: "fork",
+        flags,
+        ptid: k.addr(k.u64(at + 24n)),
+        ctid: k.addr(k.u64(at + 16n)),
+        tls: Number(k.u64(at + 56n)),
+      });
+    });
+
+    this.on(221, (k, path, argv, envp) =>
+      k.ask({
+        kind: "exec",
+        path: Buffer.from(k.strBytes(path)),
+        argv: stringVector(k, argv),
+        envp: stringVector(k, envp),
+      }),
+    );
+
+    this.on(260, (k, pid, wstatus, options, rusage) =>
+      k.ask({
+        kind: "wait",
+        pid: Number(BigInt.asIntN(32, BigInt.asUintN(64, pid))),
+        wstatus: k.addr(wstatus),
+        options: Number(options),
+        rusage: k.addr(rusage),
+      }),
+    );
+
+    this.on(172, (k) => [BigInt(k.pid), 0]); // getpid
+    this.on(173, (k) => [BigInt(k.ppid), 0]); // getppid
+    this.on(178, (k) => [BigInt(k.pid), 0]); // gettid
+    this.on(96, (k, uaddr) => {
+      k.tidAddress = k.addr(uaddr);
+      return [BigInt(k.pid), 0]; // set_tid_address
+    });
   }
 
   // ---- files
@@ -425,3 +537,15 @@ export class Kernel {
 const isCwd = (x) => Number(BigInt.asIntN(64, x)) === AT_FDCWD;
 
 export { EFAULT, ENOMEM, EINVAL };
+
+/// A guest `char *const argv[]`: every string up to the null terminator.
+function stringVector(k, vec) {
+  if (k.addr(vec) === 0) return [];
+  const out = [];
+  for (let i = 0; i < 4096; i++) {
+    const p = k.u64(vec + BigInt(i * 8));
+    if (p === 0n) break;
+    out.push(Buffer.from(k.strBytes(p)));
+  }
+  return out;
+}

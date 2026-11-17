@@ -30,6 +30,7 @@ const O_EXCL = 0x80;
 const O_TRUNC = 0x200;
 const O_APPEND = 0x400;
 const O_DIRECTORY = 0x4000;
+const O_CLOEXEC = 0x80000;
 
 export class Files {
   constructor(rootfs) {
@@ -63,6 +64,13 @@ export class Files {
     return this.map.get(fd);
   }
 
+  /// What survives an exec: the descriptors whose entry was not opened close-on-exec.
+  keepAcrossExec() {
+    for (const [fd, entry] of this.map) {
+      if (fd > 2 && entry.cloexec) this.map.delete(fd);
+    }
+  }
+
   open(guestPath, flags, mode) {
     const host = this.resolve(guestPath);
     if (host < 0) return host;
@@ -75,6 +83,7 @@ export class Files {
         append: (flags & O_APPEND) !== 0,
         readable: access !== O_WRONLY,
         writable: access !== 0,
+        cloexec: (flags & O_CLOEXEC) !== 0,
       };
       if ((flags & O_CREAT) && !fs.existsSync(host)) {
         fs.mkdirSync(path.dirname(host), { recursive: true });

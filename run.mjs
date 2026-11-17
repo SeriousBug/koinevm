@@ -6,8 +6,8 @@
 // initial stack, and report how the run ended.
 
 import fs from "node:fs";
-import { Kernel } from "./host/syscall.mjs";
-import { Mach, Translator } from "./host/pages.mjs";
+import { Translator } from "./host/pages.mjs";
+import { Session } from "./host/session.mjs";
 
 const wasmPath = process.argv[2];
 if (!wasmPath) {
@@ -20,6 +20,14 @@ const bytes = fs.readFileSync(wasmPath);
 
 let memory = null;
 let kernel = null;
+
+// Every report below reads the process the guest is in when it happens, so the hooks that make a
+// process hand over the globals first.
+function enter(proc) {
+  memory = proc.memory;
+  kernel = proc.kernel;
+  ranges = kernel.space.images;
+}
 
 // The guest's state as the translator left it in the shadow: a run that stopped without a syscall
 // says what it was doing here, and nothing else does.
@@ -255,30 +263,60 @@ function trace2(pc, sp) {
   console.log(`0x${(pc >>> 0).toString(16)} nzcv=0x${nzcv.toString(16)} sp=0x${BigInt.asUintN(64, sp).toString(16)} ${regs.join(" ")}`);
 }
 
-function syscall(nr, a0, a1, a2, a3, a4, a5) {
-  if (process.env.ARMJIT_TRACE_WRITES && Number(nr) === 64) {
-    const bytes = kernel.read(a1, Number(a2));
-    const hex = bytes ? Buffer.from(bytes).toString("hex") : "?";
-    const text = bytes ? JSON.stringify(Buffer.from(bytes).toString("latin1")) : "";
-    console.error(`write fd=${a0} n=${a2} ${hex} ${text}`);
-  }
-  if (process.env.ARMJIT_TRACE_SYSCALLS) {
-    const view = new DataView(memory.buffer);
-    const pc = view.getInt32(0xf8 + 16, true) >>> 0;
-    const args = [a0, a1, a2, a3, a4, a5].map((v) => `0x${BigInt(v).toString(16)}`).join(" ");
-    console.error(`syscall ${nr} from 0x${pc.toString(16)}: ${args}`);
-  }
-  return kernel.call(nr, a0, a1, a2, a3, a4, a5);
+// The three calls the guest makes into the host, bound to one process: a fork has its own memory
+// and its own kernel, and the same module bytes instantiated a second time.
+function makeImports(proc) {
+  return {
+    syscall: (nr, a0, a1, a2, a3, a4, a5) => {
+      enter(proc);
+      if (process.env.ARMJIT_TRACE_WRITES && Number(nr) === 64) {
+        const bytes = kernel.read(a1, Number(a2));
+        const hex = bytes ? Buffer.from(bytes).toString("hex") : "?";
+        const text = bytes ? JSON.stringify(Buffer.from(bytes).toString("latin1")) : "";
+        console.error(`write fd=${a0} n=${a2} ${hex} ${text}`);
+      }
+      if (process.env.ARMJIT_TRACE_SYSCALLS) {
+        const view = new DataView(memory.buffer);
+        const pc = view.getUint32(0xf8 + 16, true) >>> 0;
+        const args = [a0, a1, a2, a3, a4, a5].map((v) => `0x${BigInt(v).toString(16)}`).join(" ");
+        console.error(`syscall ${nr} from 0x${pc.toString(16)}: ${args}`);
+      }
+      const answer = kernel.call(nr, a0, a1, a2, a3, a4, a5);
+      if (Array.isArray(answer)) return [answer[0], answer[1]];
+      // The host has to act, which it cannot do from inside this call: the run returns and the
+      // scheduler resumes it with x0 holding the answer.
+      kernel.pending = answer;
+      return [0n, 1];
+    },
+    trap: (kind, addr, at) => {
+      enter(proc);
+      trap(kind, addr, at);
+    },
+    trace2: (pc, sp) => {
+      enter(proc);
+      trace2(pc, sp);
+    },
+  };
 }
 
 const module = new WebAssembly.Module(bytes);
-const instance = new WebAssembly.Instance(module, { env: { syscall, trap, trace2 } });
-memory = instance.exports.mem;
-kernel = new Kernel(memory, meta, { rootfs: process.env.ARMJIT_ROOTFS });
-// The images the translator placed, before any mapping happened, so a jump into one that the scan
-// did not predict can be translated on demand like a library page.
-for (const image of meta.images ?? []) kernel.space.images.push(image);
 
+const rootfs = process.env.ARMJIT_ROOTFS;
+const translator = new Translator(process.env.ARMJIT_TRANSLATOR || "./target/release/armjit");
+const configured = await translator.configure({
+  bounds: meta.bounds === 1,
+  trace: meta.trace === 1,
+  memPages: meta.mem_pages,
+  rootfs,
+});
+if (!configured.ok) {
+  console.error(`armjit: translator did not start: ${configured.error}`);
+  process.exit(1);
+}
+
+const session = new Session({ translator, rootfs, makeImports });
+const root = session.spawn({ module, meta });
+enter(root);
 if (process.env.ARMJIT_DUMP_STACK) {
   const view = new DataView(memory.buffer);
   const at = Number(BigInt(meta.sp));
@@ -289,21 +327,8 @@ if (process.env.ARMJIT_DUMP_STACK) {
   }
 }
 
-const translator = new Translator(process.env.ARMJIT_TRANSLATOR || "./target/release/armjit");
-const configured = await translator.configure({
-  bounds: meta.bounds === 1,
-  trace: meta.trace === 1,
-  memPages: meta.mem_pages,
-});
-if (!configured.ok) {
-  console.error(`armjit: translator did not start: ${configured.error}`);
-  process.exit(1);
-}
-
-const mach = new Mach({ instance, memory, meta, kernel, translator, imports: { syscall, trap, trace2 } });
-ranges = mach.kernel.space.images;
 const started = process.hrtime.bigint();
-const code = await mach.run();
+const code = await session.run();
 const elapsed = process.hrtime.bigint();
 translator.stop();
 if (code === 4) {
@@ -316,4 +341,4 @@ if (process.env.ARMJIT_TIME) {
   console.error(`guest run ${Number(elapsed - started) / 1e6} ms`);
 }
 
-process.exit(code === 0 ? (kernel.exited ?? 0) : code);
+process.exit(code);
