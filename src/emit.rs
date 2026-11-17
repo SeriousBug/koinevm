@@ -2762,71 +2762,64 @@ impl<'a> RegionEmitter<'a> {
                 if n != sf as u32 || immr >= w || imms >= w {
                     return Err(format!("invalid bitfield at 0x{addr:x}"));
                 }
-                let (len, middle) = if imms >= immr {
-                    (imms - immr + 1, false)
-                } else {
-                    (imms + 1 + w - immr, true)
-                };
+                // A bitfield move names a field of the source and where it lands. The plain form
+                // extracts it from `immr` down to the bottom; the wrapping form, which is what a
+                // compiler emits for a shifted field (ubfiz/sbfiz/bfi), takes the low `imms + 1`
+                // bits and puts them at the top of the register.
+                let (len, pos) = if imms >= immr { (imms - immr + 1, 0) } else { (imms + 1, w - immr) };
                 let mask: u64 = if len >= 64 { u64::MAX } else { (1u64 << len) - 1 };
-                // field into T0
                 if rn == 31 {
                     self.f.i64c(0);
                 } else {
                     self.f.lg(rn);
                 }
                 self.mask_w(sf);
-                if immr != 0 {
+                if pos == 0 && immr != 0 {
                     self.f.i64c(immr as i64);
                     self.f.op(I64_SHR_U);
-                }
-                if middle {
-                    if rn == 31 {
-                        self.f.i64c(0);
-                    } else {
-                        self.f.lg(rn);
-                    }
-                    self.mask_w(sf);
-                    self.f.i64c((w - immr) as i64);
-                    self.f.op(I64_SHL);
-                    self.mask_w(sf);
-                    self.f.op(I64_OR);
                 }
                 self.f.i64c(mask as i64);
                 self.f.op(I64_AND);
                 self.f.ls(L_T0);
+                if opc == 0 && len < w {
+                    let sh = w - len;
+                    self.f.lg(L_T0);
+                    self.f.i64c(sh as i64);
+                    self.f.op(I64_SHL);
+                    self.f.i64c(sh as i64);
+                    self.f.op(I64_SHR_S);
+                    self.f.ls(L_T0);
+                }
                 match opc {
-                    0 => {
-                        if len < w {
-                            let sh = w - len;
-                            self.f.lg(L_T0);
-                            self.f.i64c(sh as i64);
+                    0 | 2 => {
+                        if rd == 31 {
+                            return Ok(());
+                        }
+                        self.f.lg(L_T0);
+                        if pos != 0 {
+                            self.f.i64c(pos as i64);
                             self.f.op(I64_SHL);
-                            self.f.i64c(sh as i64);
-                            self.f.op(I64_SHR_S);
-                            self.f.ls(L_T0);
                         }
-                        if rd != 31 {
-                            self.f.lg(L_T0);
-                            self.mask_w(sf);
-                            self.f.ls(rd);
-                        }
-                    }
-                    2 => {
-                        if rd != 31 {
-                            self.f.lg(L_T0);
-                            self.f.ls(rd);
-                        }
+                        self.mask_w(sf);
+                        self.f.ls(rd);
                     }
                     1 => {
-                        if rd != 31 {
-                            self.f.lg(rd);
-                            self.f.i64c(!mask as i64);
-                            self.f.op(I64_AND);
-                            self.f.lg(L_T0);
-                            self.f.op(I64_OR);
-                            self.mask_w(sf);
-                            self.f.ls(rd);
+                        if rd == 31 {
+                            return Ok(());
                         }
+                        // bfi/bfxil: the field replaces the same bits of the destination.
+                        let at = if len >= 64 { u64::MAX } else { mask << pos };
+                        self.f.lg(rd);
+                        self.f.i64c(!at as i64);
+                        self.f.op(I64_AND);
+                        self.f.lg(L_T0);
+                        if pos != 0 {
+                            self.f.i64c(pos as i64);
+                            self.f.op(I64_SHL);
+                        }
+                        self.f.op(I64_OR);
+                        self.mask_w(sf);
+                        self.f.ls(rd);
                     }
                     _ => return Err(format!("unallocated bitfield at 0x{addr:x}")),
                 }

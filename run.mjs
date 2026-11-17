@@ -149,6 +149,30 @@ function cstr(at) {
 }
 
 const ARM_RING = Number(process.env.ARMJIT_LAST || 24);
+// Where the time went in the last `n` instructions, which is how a loop this large shows itself.
+function hot(n) {
+  const counts = new Map();
+  for (const pc of recent.slice(-n)) counts.set(pc, (counts.get(pc) ?? 0) + 1);
+  return [...counts]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([pc, c]) => `${where(pc)} x${c}`)
+    .join(", ");
+}
+
+// The memory named by ARMJIT_WATCH_DUMP, for a report of any kind.
+function memory_dump() {
+  const view = new DataView(memory.buffer);
+  const bytes = new Uint8Array(memory.buffer);
+  let out = "";
+  for (const [at, len] of watchRanges) {
+    const from = at < 0 ? Number(view.getBigUint64(0xf8, true)) + -at : at;
+    const slice = bytes.subarray(from, from + len);
+    out += `\n  mem 0x${from.toString(16)}: ${Buffer.from(slice).toString("hex")} ${JSON.stringify(Buffer.from(slice).toString("latin1"))}`;
+  }
+  return out;
+}
+
 function report(pc) {
   const view = new DataView(memory.buffer);
   const bytes = new Uint8Array(memory.buffer);
@@ -173,10 +197,46 @@ function report(pc) {
   console.error(`  ring ${ring(40).map(where).join(" -> ")}`);
   console.error(`  last ${recent.slice(-ARM_RING).map(where).join(" -> ")}`);
 }
+// ARMJIT_HEARTBEAT=SECONDS reports where the guest is every so often, and ARMJIT_SPIN=N where one
+// instruction has run N times in the last few thousand. Both exist because the wasm call does not
+// return while a guest spins, so this hook is the only place the host sees it at all.
+const spin = process.env.ARMJIT_SPIN ? Number(process.env.ARMJIT_SPIN) : 0;
+const heartbeat = process.env.ARMJIT_HEARTBEAT ? Number(process.env.ARMJIT_HEARTBEAT) * 1000 : 0;
+const startedAt = Date.now();
+let beat = startedAt;
+let ticks = 0;
+const spins = new Map();
 function trace2(pc, sp) {
-  recent.push(pc >>> 0);
+  const at = pc >>> 0;
+  recent.push(at);
   if (recent.length > 1 << 20) recent.shift();
-  watch(pc >>> 0);
+  if (spin) {
+    spins.set(at, (spins.get(at) ?? 0) + 1);
+    if (recent.length > 4096) {
+      const old = recent[recent.length - 4097];
+      spins.set(old, spins.get(old) - 1);
+    }
+    const n = spins.get(at);
+    if (n > spin) {
+      throw new Error(
+        `spin: ${where(at)} ran ${n} times in ${recent.length} instructions\n` +
+          state() +
+          "\n" + backtrace() +
+          memory_dump() +
+          `\n  trail ${recent.slice(-32).map(where).join(" -> ")}`,
+      );
+    }
+  }
+  if (heartbeat && (++ticks & 0xfff) === 0 && Date.now() - beat > heartbeat) {
+    beat = Date.now();
+    console.error(
+      `heartbeat ${((beat - startedAt) / 1000).toFixed(0)}s at ${where(at)}` +
+        `\n  trail ${recent.slice(-16).map(where).join(" -> ")}` +
+        "\n" + backtrace() +
+        "\n  hot " + hot(4096),
+    );
+  }
+  watch(at);
   if (!process.env.ARMJIT_TRACE_PRINT) return;
   const view = new DataView(memory.buffer);
   const regs = traceRegs.map((r) => `x${r}=0x${view.getBigUint64(r * 8, true).toString(16)}`);
