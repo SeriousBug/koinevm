@@ -706,10 +706,32 @@ fn decode_simd_multi(w: u32) -> Insn {
     let post_index = (w >> 23) & 1 != 0;
 
     if (w >> 24) & 0x3f == 0b001101 {
-        // One lane of one to four registers: 001101 in bits 29:24 is what separates this group from
-        // the whole-register one at 001100. The opcode's bit 1 and bit 21 together count the
-        // registers, and the fields the index comes from shift by the element width.
+        // One lane of one to four registers, or the same element replicated into every lane. 001101
+        // in bits 29:24 is what separates this group from the whole-register one at 001100. The
+        // opcode's top two bits are 11 for the replicating forms, so they are the ones at 1100.
         let opcode = (w >> 12) & 0xf;
+        if opcode >> 2 == 3 {
+            let count = 1 + (opcode & 3);
+            let size = (w >> 10) & 3;
+            if count != 1 {
+                return Insn::Undefined;
+            }
+            return Insn::VecLd1r {
+                q,
+                size,
+                post: if post_index {
+                    Some(if rm == 31 {
+                        PostIndex::Imm(1 << size)
+                    } else {
+                        PostIndex::Reg(rm)
+                    })
+                } else {
+                    None
+                },
+                rn,
+                rt,
+            };
+        }
         if opcode >> 2 > 2 {
             return Insn::Undefined;
         }
@@ -737,34 +759,6 @@ fn decode_simd_multi(w: u32) -> Insn {
             },
             rn,
             rt,
-        };
-    }
-
-    if (w >> 24) & 0x3f == 0b001101 {
-        // Replicate one element: `ld1r`, `ld2r`, `ld3r`, `ld4r`. Only ld1r is translated.
-        return match opcode {
-            0b1100 | 0b1101 | 0b1110 | 0b1111 => {
-                let count = 1 + (opcode & 3);
-                if count != 1 {
-                    return Insn::Undefined;
-                }
-                Insn::VecLd1r {
-                    q,
-                    size,
-                    post: if post_index {
-                        Some(if rm == 31 {
-                            PostIndex::Imm(if q { 16 } else { 8 })
-                        } else {
-                            PostIndex::Reg(rm)
-                        })
-                    } else {
-                        None
-                    },
-                    rn,
-                    rt,
-                }
-            }
-            _ => Insn::Undefined,
         };
     }
 

@@ -1,0 +1,82 @@
+d 0x0p+0 0.000000 0.000 0.000000e+00 0
+  sqrt 0 floor 0.0 ceil 0.0 trunc 0.0 round 0.0 abs 0x0p+0
+  cmp 1 1 0 1
+  cast 0 0 0.000000
+  max 1.5000 min 0.0000 fma-ish 0.250000000
+d -0x0p+0 -0.000000 -0.000 -0.000000e+00 -0
+  sqrt -0 floor -0.0 ceil -0.0 trunc -0.0 round -0.0 abs 0x0p+0
+  cmp 1 1 0 1
+  cast 0 0 0.000000
+  max 1.5000 min -0.0000 fma-ish 0.250000000
+d 0x1p+0 1.000000 1.000 1.000000e+00 1
+  sqrt 1 floor 1.0 ceil 1.0 trunc 1.0 round 1.0 abs 0x1p+0
+  cmp 0 1 1 1
+  cast 1 4 2.000000
+  max 1.5000 min 1.0000 fma-ish 1.750000000
+d -0x1p+0 -1.000000 -1.000 -1.000000e+00 -1
+  sqrt 1 floor -1.0 ceil -1.0 trunc -1.0 round -1.0 abs 0x1p+0
+  cmp 1 1 0 0
+  cast -1 -4 -2.000000
+  max 1.5000 min -1.0000 fma-ish 0.750000000
+d 0x1p-1 0.500000 0.500 5.000000e-01 0.5
+  sqrt 0.70710678118654757 floor 0.0 ceil 1.0 trunc 0.0 round 1.0 abs 0x1p-1
+  cmp 1 1 0 1
+  cast 0 2 1.000000
+  max 1.5000 min 0.5000 fma-ish 0.750000000
+d -0x1.4p+1 -2.500000 -2.500 -2.500000e+00 -2.5
+  sqrt 1.5811388300841898 floor -3.0 ceil -2.0 trunc -2.0 round -3.0 abs 0x1.4p+1
+  cmp 1 1 0 0
+  cast -2 -10 -5.000000
+  max 1.5000 min -2.5000 fma-ish 5.250000000
+d 0x1.5555555555555p-2 0.333333 0.333 3.333333e-01 0.333333
+  sqrt 0.57735026918962573 floor 0.0 ceil 1.0 trunc 0.0 round 0.0 abs 0x1.5555555555555p-2
+  cmp 1 1 0 1
+  cast 0 1 0.000000
+  max 1.5000 min 0.3333 fma-ish 0.527777778
+d 0x1.d6f34548p+26 123456789.125000 123456789.125 1.234568e+08 1.23457e+08
+  sqrt 11111.111066180556 floor 123456789.0 ceil 123456790.0 trunc 123456789.0 round 123456789.0 abs 0x1.d6f34548p+26
+  cmp 0 0 0 1
+  cast 123456789 493827156 246913578.000000
+  max 123456789.1250 min 1.5000 fma-ish 15241578842783112.000000000
+d 0x1.56e1fc2f8f359p-997 0.000000 0.000 1.000000e-300 1e-300
+  sqrt 1e-150 floor 0.0 ceil 1.0 trunc 0.0 round 0.0 abs 0x1.56e1fc2f8f359p-997
+  cmp 1 1 0 1
+  cast 0 0 0.000000
+  max 1.5000 min 0.0000 fma-ish 0.250000000
+d 0x1.dp+2 7.250000 7.250 7.250000e+00 7.25
+  sqrt 2.6925824035672519 floor 7.0 ceil 8.0 trunc 7.0 round 7.0 abs 0x1.dp+2
+  cmp 0 0 0 1
+  cast 7 29 14.000000
+  max 7.2500 min 1.5000 fma-ish 56.437500000
+d 0x1.fffffffffffffp+51 4503599627370495.500000 4503599627370495.500 4.503600e+15 4.5036e+15
+  sqrt 67108863.999999993 floor 4503599627370495.0 ceil 4503599627370496.0 trunc 4503599627370495.0 round 4503599627370496.0 abs 0x1.fffffffffffffp+51
+  cmp 0 0 0 1
+  cast 4503599627370495 2147483647 2147483647.000000
+  max 4503599627370495.5000 min 1.5000 fma-ish 20282409603651668172147437600768.000000000
+f 0x0p+0 0.0000 0.000000e+00 | 0.00000 0.00000 | 1 1
+  to double 0  back to float 0x0p+0
+f -0x0p+0 -0.0000 -0.000000e+00 | -0.00000 0.00000 | 1 1
+  to double -0  back to float -0x0p+0
+f 0x1p+0 1.0000 1.000000e+00 | 1.00000 1.00000 | 0 0
+  to double 1  back to float 0x1p+0
+f -0x1p+0 -1.0000 -1.000000e+00 | 1.00000 1.00000 | 1 0
+  to double -1  back to float -0x1p+0
+f 0x1p-1 0.5000 5.000000e-01 | 0.70711 0.25000 | 1 0
+  to double 0.5  back to float 0x1p-1
+f -0x1.4p+1 -2.5000 -2.500000e+00 | 1.58114 6.25000 | 1 0
+  to double -2.5  back to float -0x1.4p+1
+f 0x1.555556p-2 0.3333 3.333333e-01 | 0.57735 0.11111 | 1 0
+  to double 0.3333333432674408  back to float 0x1.555556p-2
+f 0x1.fffffep+23 16777215.0000 1.677722e+07 | 4095.99976 281474943156224.00000 | 0 0
+  to double 16777215  back to float 0x1.fffffep+23
+f 0x1.921fb6p+1 3.1416 3.141593e+00 | 1.77245 9.86961 | 0 0
+  to double 3.1415927410125732  back to float 0x1.921fb6p+1
+strtod 0 -> 0x0p+0 (consumed 1)
+strtod -0 -> -0x0p+0 (consumed 2)
+strtod 1.5 -> 0x1.8p+0 (consumed 3)
+strtod -2.5e10 -> -0x1.74876e8p+34 (consumed 7)
+strtod 3.0e-40 -> 0x1.a22393b33036bp-132 (consumed 7)
+strtod 1e400 -> inf (consumed 5)
+strtod 0.1 -> 0x1.999999999999ap-4 (consumed 3)
+strtod   7.25 -> 0x1.dp+2 (consumed 6)
+snprintf 0.14285714285714285|1.235e+03|x

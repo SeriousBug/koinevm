@@ -3282,7 +3282,9 @@ impl<'a> RegionEmitter<'a> {
                     }
                     self.f.op(if sub { I64_SUB } else { I64_ADD });
                     self.mask_w(sf);
-                    self.set_sp(rd, sf);
+                    // The result is already a zero-extended 64-bit value, so storing it needs no
+                    // widening: set_sp would ask for an i32 that the mask has already cleared.
+                    self.f.ls(if rd == 31 { 31 } else { rd });
                 }
             }
             Insn::AddSubCarry { sf, sub, setflags, rm, rn, rd } => {

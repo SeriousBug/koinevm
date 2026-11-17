@@ -4,11 +4,13 @@
 // syscall that ends the process answers `stop = 1`; one this kernel does not implement answers
 // -ENOSYS rather than trapping, so a run gets as far as it can and says what it was missing.
 
+import fs from "node:fs";
 import { AddressSpace, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
-import { Files, AT_FDCWD } from "./files.mjs";
+import { Files, AT_FDCWD, ENOENT } from "./files.mjs";
 
 export const ENOSYS = 38;
 export const EBADF = 9;
+export const ENOTTY = 25;
 
 const MAP_ANONYMOUS = 0x20;
 
@@ -26,7 +28,7 @@ export class Kernel {
   }
 
   addr(x) {
-    return Number(BigInt.asUintN(64, x));
+    return Number(BigInt.asUintN(64, typeof x === "bigint" ? x : BigInt(x)));
   }
 
   inBounds(a, len) {
@@ -261,6 +263,38 @@ export class Kernel {
       return [typeof st === "number" ? BigInt(st) : 0n, 0];
     });
 
+    this.on(61, (k, fd, buf, len) => {
+      const got = k.files.getdents(Number(fd), Number(len));
+      if (typeof got === "number") return [BigInt(got), 0];
+      if (!k.put(buf, got)) return k.fail(EFAULT);
+      return [BigInt(got.length), 0];
+    });
+
+    this.on(43, (k, path, buf) => {
+      const host = k.files.resolve(k.str(path));
+      if (typeof host === "number") return [BigInt(host), 0];
+      let st;
+      try {
+        st = fs.statfsSync(host);
+      } catch {
+        return [BigInt(-ENOENT), 0];
+      }
+      const put = (off, v) => k.put64(buf + BigInt(off), BigInt(v));
+      put(0, st.type);
+      put(8, st.bsize);
+      put(16, st.blocks);
+      put(24, st.bfree);
+      put(32, st.bavail);
+      put(40, st.files);
+      put(48, st.ffree);
+      put(56, 0);
+      put(64, st.namelen);
+      put(72, st.frsize ?? st.bsize);
+      put(80, 0);
+      for (let i = 0; i < 4; i++) put(88 + i * 8, 0);
+      return [0n, 0];
+    });
+
     this.on(17, (k, buf, size) => {
       const cwd = Buffer.from(k.files.cwd + "\0");
       if (cwd.length > Number(size)) return k.fail(EINVAL);
@@ -269,14 +303,11 @@ export class Kernel {
     });
 
     this.on(29, (k, fd, request, arg) => {
-      // A terminal that is not a terminal: answer the sizes the common requests ask for.
+      // There is no console, so the streams are pipes and `isatty` has to say so: a program that
+      // believes it has a terminal formats for one, and its output stops matching a real run.
       const req = Number(request);
-      if (req === 0x5401 || req === 0x5402) return [0n, 0]; // TCGETS/TCSETS
-      if (req === 0x5413) {
-        if (!k.put32(arg + 4, 24) || !k.put32(arg + 8, 80)) return k.fail(EFAULT);
-        k.put32(arg, 0);
-        return [0n, 0]; // TIOCGWINSZ
-      }
+      if (req === 0x5401) return k.fail(ENOTTY); // TCGETS
+      if (req === 0x5413) return k.fail(ENOTTY); // TIOCGWINSZ
       return [0n, 0];
     });
   }

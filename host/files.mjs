@@ -20,6 +20,8 @@ export const ENAMETOOLONG = 36;
 
 export const AT_FDCWD = -100;
 
+const DT = { file: 8, dir: 4, link: 10, fifo: 1, sock: 12, chr: 2, blk: 6 };
+
 const O_ACCMODE = 3;
 const O_WRONLY = 1;
 const O_RDWR = 2;
@@ -129,8 +131,74 @@ export class Files {
     return this.bytes(entry, off, len);
   }
 
-  write(fd, data) {
+  /// The entries of a directory descriptor, read once: a program reads them until it has seen every
+  /// name, and the inode and type a listing shows come from the host's own metadata.
+  dirEntries(entry) {
+    if (entry.entries) return entry.entries;
+    const out = [];
+    const add = (name, host) => {
+      let st = null;
+      try {
+        st = fs.lstatSync(host, { bigint: true });
+      } catch {}
+      const mode = st ? Number(st.mode) : 0;
+      const type =
+        mode === 0
+          ? 0
+          : (mode & 0o170000) === 0o040000
+            ? DT.dir
+            : (mode & 0o170000) === 0o100000
+              ? DT.file
+              : (mode & 0o170000) === 0o120000
+                ? DT.link
+                : (mode & 0o170000) === 0o010000
+                  ? DT.fifo
+                  : (mode & 0o170000) === 0o140000
+                    ? DT.sock
+                    : (mode & 0o170000) === 0o020000
+                      ? DT.chr
+                      : (mode & 0o170000) === 0o060000
+                        ? DT.blk
+                        : 0;
+      out.push({ name, ino: st ? st.ino : 1n, type });
+    };
+    add(".", entry.host);
+    add("..", path.join(entry.host, ".."));
+    for (const d of fs.readdirSync(entry.host, { withFileTypes: true })) {
+      add(d.name, path.join(entry.host, d.name));
+    }
+    entry.entries = out;
+    return out;
+  }
+
+  /// getdents64: as many `linux_dirent64` records as fit in `len`, or an empty answer at the end.
+  getdents(fd, len) {
     const entry = this.map.get(fd);
+    if (!entry) return -EBADF;
+    if (entry.kind !== "dir") return -ENOTDIR;
+    const all = this.dirEntries(entry);
+    const chunks = [];
+    let used = 0;
+    while (entry.pos < all.length) {
+      const e = all[entry.pos];
+      const name = Buffer.from(e.name, "utf8");
+      const reclen = (19 + name.length + 1 + 7) & ~7;
+      if (used + reclen > len) break;
+      if (used === 0 && reclen > len) return -EINVAL;
+      const rec = Buffer.alloc(reclen);
+      rec.writeBigUInt64LE(e.ino, 0);
+      rec.writeBigInt64LE(BigInt(entry.pos + 1), 8);
+      rec.writeUInt16LE(reclen, 16);
+      rec.writeUInt8(e.type, 18);
+      name.copy(rec, 19);
+      chunks.push(rec);
+      used += reclen;
+      entry.pos++;
+    }
+    return Buffer.concat(chunks);
+  }
+
+  write(fd, data) {    const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     if (entry.kind === "stdout" || entry.kind === "stderr") {
       (fd === 1 ? process.stdout : process.stderr).write(data);
