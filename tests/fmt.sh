@@ -8,7 +8,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-GUESTS=${GUESTS:-"fmt procs"}
+GUESTS=${GUESTS:-"fmt procs str vops argv"}
 MODES=${MODES:-"check trust"}
 rootfs=rootfs/debian
 
@@ -20,7 +20,8 @@ for g in $GUESTS; do
     for mode in $MODES; do
         wasm="$work/$g.$mode.wasm"
         if ! ./target/release/armjit translate "tests/guest/${g}_dyn.elf" -o "$wasm" \
-                --rootfs=$rootfs --bounds="$mode" --trace > "$work/translate.log" 2>&1; then
+                --rootfs=$rootfs --bounds="$mode" --trace \
+                --argv=./tests/guest/${g}_dyn.elf > "$work/translate.log" 2>&1; then
             echo "FAIL $g bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
         fi
         ARMJIT_ROOTFS=$rootfs node run.mjs "$wasm" > "$work/out" 2> "$work/err"

@@ -3849,9 +3849,30 @@ impl<'a> RegionEmitter<'a> {
                 }
             }
             Insn::VecModImm { q, op, cmode, imm8, rd } => {
-                let bytes = modified_immediate(q, op, cmode, imm8);
-                self.f.v128c(bytes);
-                self.setv(rd);
+                // An odd cmode below the masking-shift forms is the same lane layout as the even one
+                // under it, but the immediate is combined with the destination: `orr` keeps the bits
+                // it names and `bic` clears them, where `movi` writes the immediate on its own.
+                if cmode & 1 != 0 && (cmode >> 1) < 0b110 {
+                    let mask = modified_immediate(q, false, cmode & !1, imm8);
+                    self.getv(rd);
+                    self.f.v128c(mask);
+                    self.f.simd(if op { simd::V128_ANDNOT } else { simd::V128_OR });
+                    self.setv(rd);
+                } else if cmode == 0b1111 && op {
+                    // `fmov v.4s, #imm`: the eight-bit FP immediate, once per lane.
+                    let mut bytes = [0u8; 16];
+                    let lane = vfp_expand_imm(imm8, 32) as u32;
+                    let lanes = if q { 4 } else { 2 };
+                    for i in 0..lanes {
+                        bytes[i * 4..i * 4 + 4].copy_from_slice(&lane.to_le_bytes());
+                    }
+                    self.f.v128c(bytes);
+                    self.setv(rd);
+                } else {
+                    let bytes = modified_immediate(q, op, cmode, imm8);
+                    self.f.v128c(bytes);
+                    self.setv(rd);
+                }
             }
             Insn::VecThreeSame { q, u, size, op, rn, rm, rd } => {
                 let _ = q;

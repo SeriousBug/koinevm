@@ -1,0 +1,5 @@
+argc 1
+argv[0] <./tests/guest/argv_dyn.elf>
+environ set
+invocation <./tests/guest/argv_dyn.elf> short <argv_dyn.elf>
+argv[0] len 26

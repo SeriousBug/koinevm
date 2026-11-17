@@ -1,0 +1,324 @@
+bits 0 0 3
+bits 0 1 48
+bits 0 2 768
+bits 0 3 12288
+bits 0 4 196608
+bits 0 5 3145728
+bits 0 6 50331648
+bits 0 7 805306368
+bits 0 8 12884901888
+bits 0 9 206158430208
+bits 0 10 3298534883328
+bits 0 11 52776558133248
+bits 0 12 844424930131968
+bits 0 13 13510798882111488
+bits 0 14 216172782113783808
+bits 0 15 3458764513820540928
+bits 0 16 0
+bits 0 17 0
+bits 0 18 0
+bits 0 19 0
+bits 0 20 0
+bits 0 21 0
+bits 0 22 0
+bits 0 23 0
+bits 0 24 0
+bits 0 25 0
+bits 0 26 0
+bits 0 27 0
+bits 0 28 0
+bits 0 29 0
+bits 0 30 0
+bits 0 31 0
+bits 1 0 3
+bits 1 1 48
+bits 1 2 768
+bits 1 3 12288
+bits 1 4 196608
+bits 1 5 3145728
+bits 1 6 50331648
+bits 1 7 805306368
+bits 1 8 12884901888
+bits 1 9 206158430208
+bits 1 10 3298534883328
+bits 1 11 52776558133248
+bits 1 12 844424930131968
+bits 1 13 13510798882111488
+bits 1 14 216172782113783808
+bits 1 15 0
+bits 1 16 0
+bits 1 17 0
+bits 1 18 0
+bits 1 19 0
+bits 1 20 0
+bits 1 21 0
+bits 1 22 0
+bits 1 23 0
+bits 1 24 0
+bits 1 25 0
+bits 1 26 0
+bits 1 27 0
+bits 1 28 0
+bits 1 29 0
+bits 1 30 0
+bits 1 31 0
+bits 2 0 3
+bits 2 1 48
+bits 2 2 768
+bits 2 3 12288
+bits 2 4 196608
+bits 2 5 3145728
+bits 2 6 50331648
+bits 2 7 805306368
+bits 2 8 12884901888
+bits 2 9 206158430208
+bits 2 10 3298534883328
+bits 2 11 52776558133248
+bits 2 12 844424930131968
+bits 2 13 13510798882111488
+bits 2 14 0
+bits 2 15 0
+bits 2 16 0
+bits 2 17 0
+bits 2 18 0
+bits 2 19 0
+bits 2 20 0
+bits 2 21 0
+bits 2 22 0
+bits 2 23 0
+bits 2 24 0
+bits 2 25 0
+bits 2 26 0
+bits 2 27 0
+bits 2 28 0
+bits 2 29 0
+bits 2 30 0
+bits 2 31 0
+bits 3 0 3
+bits 3 1 48
+bits 3 2 768
+bits 3 3 12288
+bits 3 4 196608
+bits 3 5 3145728
+bits 3 6 50331648
+bits 3 7 805306368
+bits 3 8 12884901888
+bits 3 9 206158430208
+bits 3 10 3298534883328
+bits 3 11 52776558133248
+bits 3 12 844424930131968
+bits 3 13 0
+bits 3 14 0
+bits 3 15 0
+bits 3 16 0
+bits 3 17 0
+bits 3 18 0
+bits 3 19 0
+bits 3 20 0
+bits 3 21 0
+bits 3 22 0
+bits 3 23 0
+bits 3 24 0
+bits 3 25 0
+bits 3 26 0
+bits 3 27 0
+bits 3 28 0
+bits 3 29 0
+bits 3 30 0
+bits 3 31 0
+cmp 0 0 0 0
+cmp 0 1 1 1
+cmp 0 2 2 2
+cmp 0 3 3 3
+cmp 0 4 4 4
+cmp 0 5 5 5
+cmp 0 6 6 6
+cmp 0 7 7 7
+cmp 0 8 8 8
+cmp 0 9 9 9
+cmp 0 10 10 10
+cmp 0 11 11 11
+cmp 0 12 12 12
+cmp 0 13 13 13
+cmp 0 14 14 14
+cmp 0 15 15 15
+cmp 0 16 16 16
+cmp 0 17 17 17
+cmp 0 18 18 18
+cmp 0 19 19 19
+cmp 0 20 20 20
+cmp 0 21 21 21
+cmp 0 22 22 22
+cmp 0 23 23 23
+cmp 0 24 24 24
+cmp 0 25 25 25
+cmp 0 26 26 26
+cmp 0 27 27 27
+cmp 0 28 28 28
+cmp 0 29 29 29
+cmp 0 30 30 30
+cmp 0 31 31 31
+cmp 0 32 32 32
+cmp 0 33 33 33
+cmp 0 34 34 34
+cmp 0 35 35 35
+cmp 0 36 36 36
+cmp 0 37 37 37
+cmp 0 38 38 38
+cmp 0 39 39 39
+cmp 0 40 40 40
+cmp 0 41 41 41
+cmp 0 42 42 42
+cmp 0 43 43 43
+cmp 0 44 44 44
+cmp 0 45 45 45
+cmp 0 46 46 46
+cmp 0 47 47 47
+cmp 1 0 0 0
+cmp 1 1 1 1
+cmp 1 2 2 2
+cmp 1 3 3 3
+cmp 1 4 4 4
+cmp 1 5 5 5
+cmp 1 6 6 6
+cmp 1 7 7 7
+cmp 1 8 8 8
+cmp 1 9 9 9
+cmp 1 10 10 10
+cmp 1 11 11 11
+cmp 1 12 12 12
+cmp 1 13 13 13
+cmp 1 14 14 14
+cmp 1 15 15 15
+cmp 1 16 16 16
+cmp 1 17 17 17
+cmp 1 18 18 18
+cmp 1 19 19 19
+cmp 1 20 20 20
+cmp 1 21 21 21
+cmp 1 22 22 22
+cmp 1 23 23 23
+cmp 1 24 24 24
+cmp 1 25 25 25
+cmp 1 26 26 26
+cmp 1 27 27 27
+cmp 1 28 28 28
+cmp 1 29 29 29
+cmp 1 30 30 30
+cmp 1 31 31 31
+cmp 1 32 32 32
+cmp 1 33 33 33
+cmp 1 34 34 34
+cmp 1 35 35 35
+cmp 1 36 36 36
+cmp 1 37 37 37
+cmp 1 38 38 38
+cmp 1 39 39 39
+cmp 1 40 40 40
+cmp 1 41 41 41
+cmp 1 42 42 42
+cmp 1 43 43 43
+cmp 1 44 44 44
+cmp 1 45 45 45
+cmp 1 46 46 46
+cmp 1 47 47 47
+cmp 2 0 0 0
+cmp 2 1 1 1
+cmp 2 2 2 2
+cmp 2 3 3 3
+cmp 2 4 4 4
+cmp 2 5 5 5
+cmp 2 6 6 6
+cmp 2 7 7 7
+cmp 2 8 8 8
+cmp 2 9 9 9
+cmp 2 10 10 10
+cmp 2 11 11 11
+cmp 2 12 12 12
+cmp 2 13 13 13
+cmp 2 14 14 14
+cmp 2 15 15 15
+cmp 2 16 16 16
+cmp 2 17 17 17
+cmp 2 18 18 18
+cmp 2 19 19 19
+cmp 2 20 20 20
+cmp 2 21 21 21
+cmp 2 22 22 22
+cmp 2 23 23 23
+cmp 2 24 24 24
+cmp 2 25 25 25
+cmp 2 26 26 26
+cmp 2 27 27 27
+cmp 2 28 28 28
+cmp 2 29 29 29
+cmp 2 30 30 30
+cmp 2 31 31 31
+cmp 2 32 32 32
+cmp 2 33 33 33
+cmp 2 34 34 34
+cmp 2 35 35 35
+cmp 2 36 36 36
+cmp 2 37 37 37
+cmp 2 38 38 38
+cmp 2 39 39 39
+cmp 2 40 40 40
+cmp 2 41 41 41
+cmp 2 42 42 42
+cmp 2 43 43 43
+cmp 2 44 44 44
+cmp 2 45 45 45
+cmp 2 46 46 46
+cmp 2 47 47 47
+cmp 3 0 0 0
+cmp 3 1 1 1
+cmp 3 2 2 2
+cmp 3 3 3 3
+cmp 3 4 4 4
+cmp 3 5 5 5
+cmp 3 6 6 6
+cmp 3 7 7 7
+cmp 3 8 8 8
+cmp 3 9 9 9
+cmp 3 10 10 10
+cmp 3 11 11 11
+cmp 3 12 12 12
+cmp 3 13 13 13
+cmp 3 14 14 14
+cmp 3 15 15 15
+cmp 3 16 16 16
+cmp 3 17 17 17
+cmp 3 18 18 18
+cmp 3 19 19 19
+cmp 3 20 20 20
+cmp 3 21 21 21
+cmp 3 22 22 22
+cmp 3 23 23 23
+cmp 3 24 24 24
+cmp 3 25 25 25
+cmp 3 26 26 26
+cmp 3 27 27 27
+cmp 3 28 28 28
+cmp 3 29 29 29
+cmp 3 30 30 30
+cmp 3 31 31 31
+cmp 3 32 32 32
+cmp 3 33 33 33
+cmp 3 34 34 34
+cmp 3 35 35 35
+cmp 3 36 36 36
+cmp 3 37 37 37
+cmp 3 38 38 38
+cmp 3 39 39 39
+cmp 3 40 40 40
+cmp 3 41 41 41
+cmp 3 42 42 42
+cmp 3 43 43 43
+cmp 3 44 44 44
+cmp 3 45 45 45
+cmp 3 46 46 46
+cmp 3 47 47 47
+bsl 00 14 28 36 50 54 6c 76 a0 b4 a8 9e d8 dc ec f6
+bit 00 14 28 3e 50 58 7c 62 a0 a4 b0 9e f8 d8 c4 d2
+bif ff ed db c7 b7 b1 8f ab 6f 6d 63 77 1f 41 57 4b
+vops: done
