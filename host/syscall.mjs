@@ -329,6 +329,9 @@ export class Kernel {
       if (process.env.ARMJIT_TRACE_SYSCALLS)
         console.error(`  read fd=${Number(fd)} at 0x${BigInt.asUintN(64, buf).toString(16)} n=${n}`);
       const got = k.files.read(Number(fd), n);
+      if (process.env.ARMJIT_TRACE_SYSCALLS) {
+        console.error(`  read fd=${Number(fd)} n=${n} -> ${typeof got === "number" ? got : got.length}`);
+      }
       // A pipe with writers and nothing in it yet: the host waits and answers this again.
       if (got === WOULD_BLOCK) return k.ask({ kind: "read", fd: Number(fd), buf: k.addr(buf), len: n });
       if (typeof got === "number") return [BigInt(got), 0];

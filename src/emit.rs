@@ -4836,6 +4836,23 @@ impl<'a> RegionEmitter<'a> {
                 }
                 self.fp_put(rd, double);
             }
+            Insn::FpFromInt { double, unsigned, rn, rd } => {
+                // The register holds an integer in its low lane, which becomes a float. The
+                // conversion is exact up to the mantissa, which is what the instruction does.
+                self.fp_base();
+                self.getv(rn);
+                if double {
+                    self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
+                    self.f.op(if unsigned { F64_CONVERT_I64_U } else { F64_CONVERT_I64_S });
+                } else if unsigned {
+                    self.f.simd_lane(simd::I32X4_EXTRACT_LANE, 0);
+                    self.f.op(F32_CONVERT_I32_U);
+                } else {
+                    self.f.simd_lane(simd::I32X4_EXTRACT_LANE, 0);
+                    self.f.op(F32_CONVERT_I32_S);
+                }
+                self.fp_put(rd, double);
+            }
             Insn::FpImm { size, imm8, rd } => {
                 if size > 1 {
                     return self.refuse(format!("half precision floating point at 0x{addr:x}"));

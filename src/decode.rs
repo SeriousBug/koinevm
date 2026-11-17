@@ -149,6 +149,9 @@ pub enum Insn {
     FpCondSelect { size: u32, cond: u32, rn: u32, rm: u32, rd: u32 },
     /// Scalar FP with an immediate: `fmov s0, #1.0`.
     FpImm { size: u32, imm8: u32, rd: u32 },
+    /// `scvtf d0, d0`: the integer in a scalar FP register, converted to a floating point value of
+    /// the same width.
+    FpFromInt { double: bool, unsigned: bool, rn: u32, rd: u32 },
     /// Ordered and exclusive loads and stores. One thread, so an exclusive always succeeds.
     Atomic { is_load: bool, exclusive: bool, size: u32, rn: u32, rt: u32, rs: u32 },
     /// Compare and swap (`cas`/`casa`/`casl`): the loaded value goes back into Rs either way.
@@ -931,6 +934,17 @@ fn decode_scalar_fp(w: u32) -> Insn {
                 rd,
             };
         }
+    }
+
+    // An integer in a scalar FP register converted to floating point. Bits 15:10 are 110110, where
+    // `fcsel` puts a condition in 15:12 and 11 in 11:10, so the whole field is what tells them apart.
+    if (w >> 21) & 1 == 1 && (w >> 10) & 0x3f == 0b110110 {
+        return Insn::FpFromInt {
+            double: (w >> 22) & 1 == 1,
+            unsigned: (w >> 29) & 1 == 1,
+            rn,
+            rd,
+        };
     }
 
     // The fused multiply-add group: bits 28:24 are 11111 and the rounding-mode field holds the two

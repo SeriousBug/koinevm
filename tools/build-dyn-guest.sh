@@ -11,12 +11,21 @@ cd "$(dirname "$0")/.."
 GUESTS=${GUESTS:-"fmt"}
 
 for g in $GUESTS; do
+    # A C++ fixture needs the other compiler and library, and its own source suffix.
+    src="tests/guest/$g.c"
+    cc="gcc"
+    pkgs="gcc libc6-dev"
+    if [ -f "tests/guest/$g.cc" ]; then
+        src="tests/guest/$g.cc"
+        cc="g++"
+        pkgs="g++ libstdc++-12-dev"
+    fi
     echo "== guest: $g, dynamically linked against bookworm's glibc =="
     docker run --rm -v "$PWD":/w -w /w debian:bookworm sh -c "
         apt-get update -qq >/dev/null &&
-        apt-get install -y -qq gcc libc6-dev >/dev/null &&
-        gcc -O2 -fno-builtin -D_FORTIFY_SOURCE=2 -fno-stack-protector \
-            -o tests/guest/${g}_dyn.elf tests/guest/$g.c &&
+        apt-get install -y -qq $pkgs >/dev/null &&
+        $cc -O2 -fno-builtin -D_FORTIFY_SOURCE=2 -fno-stack-protector \
+            -o tests/guest/${g}_dyn.elf $src &&
         ./tests/guest/${g}_dyn.elf > tests/guest/$g.expected
     "
     echo "oracle output:"

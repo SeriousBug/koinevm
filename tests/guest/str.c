@@ -5,7 +5,10 @@
 // length. Each answer is printed as an offset so a failure names the case.
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <ctype.h>
+#include <locale.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void show(const char *what, long got, long want) {
@@ -63,6 +66,44 @@ int main(void) {
     show("memcmp", memcmp("abcdef", "abcdxf", 6) < 0, 1);
     show("strncmp", strncmp("abcd", "abce", 4) < 0, 1);
     show("strcmp", strcmp("", "a") < 0, 1);
+    // The span and set searches, which the loaders' parsers use to split lines.
+    for (int i = 0; i < 40; i++) {
+        char hay[64];
+        memset(hay, 'a', sizeof hay);
+        hay[63] = 0;
+        hay[i] = ' ';
+        show("strcspn", (long)strcspn(hay, " \t"), i);
+        show("strspn", (long)strspn(hay, "ab"), 63);
+        show("strpbrk", strpbrk(hay, " \t") ? (long)(strpbrk(hay, " \t") - hay) : -1, i);
+        show("memrchr", (long)((char *)memrchr(hay, 'a', 40) - hay), 39);
+    }
+    show("strcspn_none", (long)strcspn("abcdef", "xyz"), 6);
+    show("strcspn_first", (long)strcspn("xabc", "abc"), 0);
+    show("strspn_all", (long)strspn("aaabbb", "ab"), 6);
+    show("strspn_none", (long)strspn("xyz", "ab"), 0);
+    show("strpbrk_none", strpbrk("abcdef", "xyz") == NULL ? -1 : 1, -1);
+    show("strsep", (long)({ char b[] = "one two"; char *p = b; char *w = strsep(&p, " "); w - b; }), 0);
+    show("strtok", (long)({ char b[] = "a,b"; strtok(b, ",")[0]; }), (long)'a');
+    // The character classification tables, which every parser walks: a wrong class is a parser
+    // that never advances.
+    int space = 0, alpha = 0, digit = 0, eof = 0;
+    for (int c = -1; c < 256; c++) {
+        if (isspace(c)) space |= 1;
+        if (isalpha(c)) alpha = alpha * 31 + c;
+        if (isdigit(c) || isblank(c) || isprint(c)) digit += c;
+        if (c == -1 && isspace(c)) eof = 1;
+    }
+    printf("ctype %d %d %d %d\n", space, alpha, digit, eof);
+    int up = 0;
+    for (int c = 0; c < 256; c++) up = up * 3 + tolower(c) + toupper(c);
+    printf("case %d\n", up);
+    // strtol, which is where a number in a config file becomes a value.
+    char *end = NULL;
+    const char *nums[] = {"0", "12", " 42", "-7", "0x1f", "abc", "99zz"};
+    for (unsigned i = 0; i < sizeof nums / sizeof *nums; i++) {
+        long v = strtol(nums[i], &end, 0);
+        printf("strtol %ld %ld\n", v, (long)(end - nums[i]));
+    }
     printf("str: done\n");
     return 0;
 }
