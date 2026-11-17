@@ -105,11 +105,16 @@ Two things follow.
 - **A shell prompt.** Debian's own `ld-linux-aarch64.so.1` is translated with dash and runs from
   `_dl_start` through the tunable scan, `/etc/ld.so.preload`, the library search path, the mapping of
   `libc.so.6` (its segments at the addresses the loader chose, its relocations applied, its `relro`
-  protected) and into glibc's start-up: `set_tid_address`, `set_robust_list`, `rseq`, dash's `_init`,
-  then `main`. Along the way the guest reaches 52 pages of libc, each translated when it was first
-  jumped to. What stops it now is dash's own error path: dash reports an error and its `outfmt` never
-  reaches the `write` syscall, re-entering the error reporter until the guest stack runs out, with
-  `stderr` itself unreachable from the trace so far.
+  protected) and into glibc's start-up, then `main`, then dash's own command loop. It now behaves like
+  dash: `-c true` exits 0, `-c 'echo hi'` prints `hi`, `-c 'nosuchcommand'` prints
+  `dash: 1: nosuchcommand: not found` and exits 127, `-c ':;exit 7'` exits 7, all matching the same
+  binary on a real kernel.
+- **Variable expansion.** `echo $?` prints the parse tree's own text, `!?=`, instead of `0`, and
+  every parameter and variable does the same: `!` + name + `=`. The marker byte dash's parser puts
+  in front of an expansion (`CTLVAR`, `0x82`) is missing from the tree text that the expander reads:
+  the four bytes `82 21 3f 3d` sit at `0x4327c8` in guest memory, and the four that get copied to the
+  buffer the expander walks start at `0x4327c9`. The copy is a four-byte `mempcpy` in
+  `makestrspace`/`stnputs`, so the source pointer dash computed is one byte past the text.
 - **Scalar floating point arithmetic.** The vector register file is translated and compared against
   the oracle case by case, as are the moves and conversions between the general and FP registers.
   `fadd`, `fmul`, `fdiv`, `fsqrt`, `fcmp`, `fcsel`, `fneg`/`fabs`/`fmax`/`fmin` and `fcvt` between

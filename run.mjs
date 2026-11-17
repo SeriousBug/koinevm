@@ -245,6 +245,12 @@ function trace2(pc, sp) {
 }
 
 function syscall(nr, a0, a1, a2, a3, a4, a5) {
+  if (process.env.ARMJIT_TRACE_WRITES && Number(nr) === 64) {
+    const bytes = kernel.read(a1, Number(a2));
+    const hex = bytes ? Buffer.from(bytes).toString("hex") : "?";
+    const text = bytes ? JSON.stringify(Buffer.from(bytes).toString("latin1")) : "";
+    console.error(`write fd=${a0} n=${a2} ${hex} ${text}`);
+  }
   if (process.env.ARMJIT_TRACE_SYSCALLS) {
     const view = new DataView(memory.buffer);
     const pc = view.getInt32(0xf8 + 16, true) >>> 0;
