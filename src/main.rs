@@ -437,13 +437,14 @@ fn run(args: &[String]) -> Result<(), String> {
             let path = args.get(1).ok_or(usage())?;
             let image = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
             let elf = elf::Elf::parse(image)?;
-            let (lo, hi) = elf.code_range().ok_or("no executable segment")?;
-            let mut a = lo;
-            while a + 4 <= hi {
-                let Some(w) = elf.vaddr_bytes(a, 4) else { break };
-                let raw = u32::from_le_bytes(w.try_into().unwrap());
-                println!("0x{a:x}  {raw:08x}  {:?}", decode::decode(raw));
-                a += 4;
+            for (lo, hi) in elf.instruction_ranges() {
+                let mut a = lo;
+                while a + 4 <= hi {
+                    let Some(w) = elf.vaddr_bytes(a, 4) else { break };
+                    let raw = u32::from_le_bytes(w.try_into().unwrap());
+                    println!("0x{a:x}  {raw:08x}  {:?}", decode::decode(raw));
+                    a += 4;
+                }
             }
             Ok(())
         }

@@ -7,6 +7,7 @@ pub const EM_AARCH64: u16 = 183;
 pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
 pub const PF_R: u32 = 4;
+pub const SHF_EXECINSTR: u64 = 0x4;
 
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -50,6 +51,11 @@ pub struct Elf {
     /// through, including the ones nothing branches to.
     pub eh_frame_hdr: Option<u64>,
     pub symbols: Vec<Symbol>,
+    /// The ranges `SHF_EXECINSTR` sections cover, sorted. A loadable executable segment also holds
+    /// `.rodata` and unwind tables, so the segment's span is not code; decoding it as code invents
+    /// instructions, and a data address that happens to look like a function entry puts garbage in
+    /// the dispatch table. Empty when the image has no section table.
+    pub code_ranges: Vec<(u64, u64)>,
     pub image: Vec<u8>,
     /// What was added to every address when the image was moved to its load address, so a value
     /// read out of a data segment can be turned into the address it will point at.
@@ -138,6 +144,7 @@ impl Elf {
         }
 
         let mut symbols = Vec::new();
+        let mut code_ranges: Vec<(u64, u64)> = Vec::new();
         if shoff != 0 {
             let shentsize = u16at(&image, 58)? as usize;
             let shnum = u16at(&image, 60)? as usize;
@@ -145,6 +152,16 @@ impl Elf {
             for i in 0..shnum {
                 let o = shoff as usize + i * shentsize;
                 let sh_type = u32at(&image, o + 4)?;
+                if sh_type == 1 && u64at(&image, o + 8)? & SHF_EXECINSTR != 0 {
+                    let addr = u64at(&image, o + 16)?;
+                    let size = u64at(&image, o + 32)?;
+                    let mapped = segments
+                        .iter()
+                        .any(|s| s.flags & PF_X != 0 && addr >= s.vaddr && addr + size <= s.end());
+                    if size != 0 && mapped {
+                        code_ranges.push((addr, addr + size));
+                    }
+                }
                 if sh_type == 2 {
                     symtab = Some((u64at(&image, o + 24)?, u64at(&image, o + 32)?, u32at(&image, o + 40)?));
                 }
@@ -179,6 +196,7 @@ impl Elf {
             segments,
             symbols,
             image,
+            code_ranges,
             bias: 0,
             eh_frame_hdr,
         })
@@ -210,6 +228,9 @@ impl Elf {
                 if s.shndx != 0 {
                     s.value = s.value.wrapping_add(bias);
                 }
+            }
+            for r in &mut self.code_ranges {
+                *r = (r.0.wrapping_add(bias), r.1.wrapping_add(bias));
             }
         }
         Ok(self)
@@ -256,6 +277,21 @@ impl Elf {
             }
         }
         if lo == u64::MAX { None } else { Some((lo, hi)) }
+    }
+
+    /// Where this image's instructions are, section by section. Falls back to the executable
+    /// segments when there is no section table, which is the best an image without one allows.
+    pub fn instruction_ranges(&self) -> Vec<(u64, u64)> {
+        if !self.code_ranges.is_empty() {
+            let mut r = self.code_ranges.clone();
+            r.sort_unstable();
+            return r;
+        }
+        self.segments
+            .iter()
+            .filter(|s| s.flags & PF_X != 0)
+            .map(|s| (s.vaddr, s.vaddr + s.filesz))
+            .collect()
     }
 
     pub fn image_end(&self) -> u64 {

@@ -341,16 +341,18 @@ pub struct Site {
 }
 
 pub fn sites<'a>(images: &[&'a Elf]) -> Site {
-    // Decode every image's executable range once. Literal pools and padding decode to Undefined,
-    // which is only an error if a translated block actually reaches it.
+    // Decode every image's instructions once, section by section: an executable segment also holds
+    // read-only data, and a word of that is not an instruction. Literal pools and padding inside a
+    // code section decode to Undefined, which is only an error if a translated block reaches it.
     let mut insns: BTreeMap<u64, Insn> = BTreeMap::new();
     for image in images {
-        let Some((lo, hi)) = image.code_range() else { continue };
-        let mut a = lo;
-        while a + 4 <= hi {
-            let Some(w) = image.vaddr_bytes(a, 4) else { break };
-            insns.insert(a, decode(u32::from_le_bytes(w.try_into().unwrap())));
-            a += 4;
+        for (lo, hi) in image.instruction_ranges() {
+            let mut a = lo;
+            while a + 4 <= hi {
+                let Some(w) = image.vaddr_bytes(a, 4) else { break };
+                insns.insert(a, decode(u32::from_le_bytes(w.try_into().unwrap())));
+                a += 4;
+            }
         }
     }
 
