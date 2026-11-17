@@ -524,11 +524,13 @@ export class Files {
   }
 
   chmod(name, dirfd, mode, follow) {
-    if (name === null) return -EINVAL;
     const host = this.resolveAt(name, dirfd);
     if (host < 0) return host;
     try {
-      (follow ? fs.chmodSync : fs.lchmodSync)(host, mode & 0o7777);
+      // Linux has no way to set a symbolic link's own mode, so the form that refuses to follow one
+      // changes the file behind it and does nothing at all to the link.
+      if (!follow && fs.lstatSync(host).isSymbolicLink()) return 0;
+      fs.chmodSync(host, mode & 0o7777);
       return 0;
     } catch (e) {
       return fromErrno(e, -EPERM);

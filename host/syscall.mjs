@@ -141,7 +141,13 @@ export class Kernel {
       }
       return this.fail(ENOSYS);
     }
-    return fn(this, a0, a1, a2, a3, a4, a5);
+    const answer = fn(this, a0, a1, a2, a3, a4, a5);
+    if (!Array.isArray(answer)) return answer;
+    // A read or a write would drown the trace, and its answer is the count it already reported.
+    if (process.env.ARMJIT_TRACE_SYSCALLS && Number(nr) !== 63 && Number(nr) !== 64) {
+      console.error(`  -> ${BigInt.asIntN(64, answer[0])}`);
+    }
+    return answer;
   }
 
   register() {
