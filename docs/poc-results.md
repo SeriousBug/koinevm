@@ -119,8 +119,15 @@ Two things follow.
   arithmetic, quotes, `if`/`while`/`for`/`case`, functions and `printf` all behave: 33 `-c` scripts
   print what the same binary prints on a real kernel and exit the same way. What is left is what
   needs a second process: a pipe, a subshell, or any external command other than a builtin.
-- **Scalar floating point arithmetic.** The vector register file is translated and compared against
-  the oracle case by case, as are the moves and conversions between the general and FP registers.
+- **Scalar floating point.** Every shape is translated and compared against the oracle: `fadd`,
+  `fsub`, `fmul`, `fdiv`, `fnmul`, `fmax`/`fmin` and their number forms (with the NaN each of them
+  hands back, bit for bit), `fabs`, `fneg`, `fsqrt`, `fmov` with a register and with the eight-bit
+  immediate, `fcvt` both ways, every `frint*`, `fcmp`/`fcmpe` including the zero form and the
+  unordered result, `fcsel` over all sixteen conditions, `fcvtzs`/`fcvtzu` with a fraction-bit count,
+  and the fused multiply-add group. `tests/guest/fp.c` is 5403 values over the two zeros, the
+  infinities, a quiet and a signalling NaN, a denormal and values that only differ in the last bit.
+  One known inexactness: wasm has no fused multiply-add, so `fmadd` and its siblings round twice and
+  can differ from the instruction in the last bit.
   `fadd`, `fmul`, `fdiv`, `fsqrt`, `fcmp`, `fcsel`, `fneg`/`fabs`/`fmax`/`fmin` and `fcvt` between
   precisions are refused at the instruction that reaches them, and glibc's own pages already report
   them: `scalar floating point arithmetic is not translated yet` at `0x4004cec8`.

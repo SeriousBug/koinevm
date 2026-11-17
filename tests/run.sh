@@ -6,7 +6,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-GUESTS=${GUESTS:-"hello call flags simd bits stack"}
+GUESTS=${GUESTS:-"hello call flags simd bits stack fp"}
 OPTS=${OPTS:-"-O0 -O1 -O2 -O3 -Os"}
 MODES=${MODES:-"check trust"}
 

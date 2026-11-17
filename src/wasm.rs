@@ -2,6 +2,8 @@
 
 pub const I32: u8 = 0x7f;
 pub const I64: u8 = 0x7e;
+pub const F32: u8 = 0x7d;
+pub const F64: u8 = 0x7c;
 pub const V128: u8 = 0x7b;
 
 pub fn uleb(out: &mut Vec<u8>, mut v: u64) {
@@ -68,6 +70,8 @@ pub mod op {
     pub const I64_STORE32: u8 = 0x3e;
     pub const I32_CONST: u8 = 0x41;
     pub const I64_CONST: u8 = 0x42;
+    pub const F32_CONST: u8 = 0x43;
+    pub const F64_CONST: u8 = 0x44;
 
     pub const I32_EQZ: u8 = 0x45;
     pub const I32_EQ: u8 = 0x46;
@@ -92,6 +96,48 @@ pub mod op {
     pub const I64_LE_U: u8 = 0x58;
     pub const I64_GE_S: u8 = 0x59;
     pub const I64_GE_U: u8 = 0x5a;
+
+    pub const F32_EQ: u8 = 0x5b;
+    pub const F32_NE: u8 = 0x5c;
+    pub const F32_LT: u8 = 0x5d;
+    pub const F32_GT: u8 = 0x5e;
+    pub const F32_LE: u8 = 0x5f;
+    pub const F32_GE: u8 = 0x60;
+    pub const F64_EQ: u8 = 0x61;
+    pub const F64_NE: u8 = 0x62;
+    pub const F64_LT: u8 = 0x63;
+    pub const F64_GT: u8 = 0x64;
+    pub const F64_LE: u8 = 0x65;
+    pub const F64_GE: u8 = 0x66;
+
+    pub const F32_ABS: u8 = 0x8b;
+    pub const F32_NEG: u8 = 0x8c;
+    pub const F32_CEIL: u8 = 0x8d;
+    pub const F32_FLOOR: u8 = 0x8e;
+    pub const F32_TRUNC: u8 = 0x8f;
+    pub const F32_NEAREST: u8 = 0x90;
+    pub const F32_SQRT: u8 = 0x91;
+    pub const F32_ADD: u8 = 0x92;
+    pub const F32_SUB: u8 = 0x93;
+    pub const F32_MUL: u8 = 0x94;
+    pub const F32_DIV: u8 = 0x95;
+    pub const F32_MIN: u8 = 0x96;
+    pub const F32_MAX: u8 = 0x97;
+    pub const F32_COPYSIGN: u8 = 0x98;
+    pub const F64_ABS: u8 = 0x99;
+    pub const F64_NEG: u8 = 0x9a;
+    pub const F64_CEIL: u8 = 0x9b;
+    pub const F64_FLOOR: u8 = 0x9c;
+    pub const F64_TRUNC: u8 = 0x9d;
+    pub const F64_NEAREST: u8 = 0x9e;
+    pub const F64_SQRT: u8 = 0x9f;
+    pub const F64_ADD: u8 = 0xa0;
+    pub const F64_SUB: u8 = 0xa1;
+    pub const F64_MUL: u8 = 0xa2;
+    pub const F64_DIV: u8 = 0xa3;
+    pub const F64_MIN: u8 = 0xa4;
+    pub const F64_MAX: u8 = 0xa5;
+    pub const F64_COPYSIGN: u8 = 0xa6;
 
     pub const I32_CLZ: u8 = 0x67;
     pub const I32_CTZ: u8 = 0x68;
@@ -398,6 +444,20 @@ impl Func {
         sleb(&mut self.body, v);
         self
     }
+    /// The bit pattern of the float. Unlike an integer, a float immediate travels as its IEEE bytes
+    /// in little-endian order at a fixed width, not as a variable-length integer.
+    pub fn f32c(&mut self, bits: u32) -> &mut Self {
+        self.body.push(op::F32_CONST);
+        self.body.extend_from_slice(&bits.to_le_bytes());
+        self
+    }
+
+    pub fn f64c(&mut self, bits: u64) -> &mut Self {
+        self.body.push(op::F64_CONST);
+        self.body.extend_from_slice(&bits.to_le_bytes());
+        self
+    }
+
     pub fn lg(&mut self, i: u32) -> &mut Self {
         self.idx(op::LOCAL_GET, i)
     }

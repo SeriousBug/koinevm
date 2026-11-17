@@ -105,6 +105,9 @@ pub enum Insn {
     VecLd1 { is_load: bool, count: u32, q: bool, post: Option<PostIndex>, rn: u32, rt: u32 },
     /// `ld1r`: load one element and replicate it across the register.
     VecLd1r { q: bool, size: u32, post: Option<PostIndex>, rn: u32, rt: u32 },
+    /// One lane of one to four registers: `ld1 {v0.b}[3], [x1]` and the stores and multi-structure
+    /// forms of the same shape. `size` is the element width in bytes as a shift.
+    VecLane { is_load: bool, nregs: u32, size: u32, index: u32, post: Option<PostIndex>, rn: u32, rt: u32 },
     /// Three-register, same-width integer or FP operation: `add v.4s`, `cmeq`, `umaxp`, ...
     VecThreeSame { q: bool, u: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
     /// Two-register, same-width operation: `not`, `abs`, `cmeq ... #0`, `rev64`, `cnt`, ...
@@ -128,10 +131,17 @@ pub enum Insn {
     /// Scalar FP between the vector file and the general registers: `fmov`, `fcvtzs`, ...
     FpToGpr { sf: bool, signed: bool, size: u32, rmode: u32, opcode: u32, rn: u32, rd: u32 },
     GprToFp { sf: bool, signed: bool, size: u32, rmode: u32, opcode: u32, rn: u32, rd: u32 },
+    /// `fcvtzs`/`fcvtzu` with a fraction-bit count: the fixed-point conversion a scaled cast uses.
+    FpToGprFixed { sf: bool, unsigned: bool, size: u32, fbits: u32, rn: u32, rd: u32 },
     /// Scalar FP arithmetic on one register: `fmov`, `fabs`, `fneg`, `fsqrt`, `fcvt`, ...
     FpOneSource { size: u32, opcode: u32, rn: u32, rd: u32 },
-    /// Scalar FP arithmetic on two registers: `fadd`, `fdiv`, `fmax`, `fcmp`, ...
+    /// Scalar FP arithmetic on two registers: `fadd`, `fdiv`, `fmax`, ...
     FpTwoSource { size: u32, opcode: u32, rn: u32, rm: u32, rd: u32 },
+    /// `fcmp`/`fcmpe`: a comparison that writes NZCV instead of a register. `zero` compares the
+    /// register against `+0.0` in the form that names no second register.
+    FpCompare { size: u32, signaling: bool, zero: bool, rn: u32, rm: u32 },
+    /// The fused multiply-add group: `fmadd`, `fmsub`, `fnmadd`, `fnmsub`.
+    FpFused { size: u32, negate_product: bool, subtract: bool, rn: u32, rm: u32, ra: u32, rd: u32 },
     /// `fcsel`: a conditional select between two FP registers.
     FpCondSelect { size: u32, cond: u32, rn: u32, rm: u32, rd: u32 },
     /// Scalar FP with an immediate: `fmov s0, #1.0`.
@@ -696,6 +706,41 @@ fn decode_simd_multi(w: u32) -> Insn {
     let post_index = (w >> 23) & 1 != 0;
 
     if (w >> 24) & 0x3f == 0b001101 {
+        // One lane of one to four registers: 001101 in bits 29:24 is what separates this group from
+        // the whole-register one at 001100. The opcode's bit 1 and bit 21 together count the
+        // registers, and the fields the index comes from shift by the element width.
+        let opcode = (w >> 12) & 0xf;
+        if opcode >> 2 > 2 {
+            return Insn::Undefined;
+        }
+        let nregs = 1 + 2 * ((opcode >> 1) & 1) + ((w >> 21) & 1);
+        let size = match (opcode >> 2, (w >> 10) & 3) {
+            (0, _) => 0,
+            (1, _) => 1,
+            (2, 0) => 2,
+            (2, 1) => 3,
+            _ => return Insn::Undefined,
+        };
+        let index = (((q as u32) << 3) | (((w >> 12) & 1) << 2) | ((w >> 10) & 3)) >> size;
+        let rm_imm = (w >> 16) & 0x1f;
+        return Insn::VecLane {
+            is_load,
+            nregs,
+            size,
+            index,
+            post: if rm_imm == 0 {
+                None
+            } else if rm_imm == 0x1f {
+                Some(PostIndex::Imm((1 << size) * nregs as i64))
+            } else {
+                Some(PostIndex::Reg(rm))
+            },
+            rn,
+            rt,
+        };
+    }
+
+    if (w >> 24) & 0x3f == 0b001101 {
         // Replicate one element: `ld1r`, `ld2r`, `ld3r`, `ld4r`. Only ld1r is translated.
         return match opcode {
             0b1100 | 0b1101 | 0b1110 | 0b1111 => {
@@ -830,16 +875,66 @@ fn decode_scalar_fp(w: u32) -> Insn {
         };
     }
 
-    // FP immediate: `fmov s0, #const`.
-    if (w >> 21) & 0xf == 0b1001 && (w >> 5) & 0xf == 0b1000 {
-        let imm8 = (((w >> 16) & 0x7f) << 1 | ((w >> 5) & 1)) as u32;
-        return Insn::FpImm { size, imm8, rd };
+    // The fused multiply-add group: bits 28:24 are 11111 and the rounding-mode field holds the two
+    // negate bits. Bit 21 is the first and bit 15 the second.
+    if (w >> 24) & 0x1f == 0b11111 {
+        if size > 1 {
+            return Insn::Undefined;
+        }
+        return Insn::FpFused {
+            size,
+            negate_product: (w >> 21) & 1 != 0,
+            subtract: (w >> 15) & 1 != 0,
+            rn,
+            rm,
+            ra: (w >> 10) & 31,
+            rd,
+        };
     }
 
-    if (w >> 24) & 0x1f == 0b01111 {
-        // Two source: `fadd`, `fmul`, `fdiv`, `fmax`, `fcmp` share this space with one opcode bit
-        // selecting the comparison forms.
-        return Insn::FpTwoSource { size, opcode, rn, rm, rd };
+    // The conversions with a fraction-bit count: bit 21 is clear, the rounding mode bits say
+    // truncate, and the count is stored as 64 minus the fraction bits.
+    if (w >> 21) & 1 == 0 && (w >> 19) & 3 == 3 && (w >> 16) & 7 <= 1 {
+        return Insn::FpToGprFixed {
+            sf,
+            unsigned: (w >> 16) & 1 == 1,
+            size,
+            fbits: 64 - ((w >> 10) & 0x3f),
+            rn,
+            rd,
+        };
+    }
+
+    // FP immediate: `fmov s0, #const`. The immediate is bits 20:13 and bits 12:10 are the marker.
+    if (w >> 21) & 1 == 1 && (w >> 10) & 7 == 0b100 && (w >> 5) & 0x1f == 0 {
+        return Insn::FpImm { size, imm8: (w >> 13) & 0xff, rd };
+    }
+
+    // Everything else in the FP data-processing space, whose marker is 0011110 in bits 30:24 (bit
+    // 30 is what separates it from the scalar pairwise group at 1011110), told apart by bits 11:10.
+    if (w >> 24) & 0x7f == 0b0011110 && (w >> 21) & 1 == 1 {
+        return match (w >> 10) & 3 {
+            // fcmp/fcmpe write NZCV: bits 15:10 are 001000, bit 4 signals and bit 3 asks for the
+            // form that compares against zero, whose second register is the marker 01000.
+            0b00 if (w >> 10) & 0x1f == 0b01000 => {
+                let zero = (w >> 3) & 1 != 0;
+                if zero && (w >> 16) & 0x1f != 0 {
+                    return Insn::Undefined;
+                }
+                Insn::FpCompare { size, signaling: (w >> 4) & 1 != 0, zero, rn, rm }
+            }
+            // One source shares bits 11:10 with the comparisons; its marker is 10000 at 14:10,
+            // because bit 15 is the low bit of the opcode.
+            0b00 if (w >> 10) & 0x1f == 0b10000 => {
+                Insn::FpOneSource { size, opcode: (w >> 15) & 0x3f, rn, rd }
+            }
+            // fcsel: `cond` sits where the two-source opcode would be.
+            0b11 => {
+                Insn::FpCondSelect { size, cond: (w >> 12) & 0xf, rn, rm, rd }
+            }
+            0b10 => Insn::FpTwoSource { size, opcode: (w >> 12) & 0xf, rn, rm, rd },
+            _ => Insn::Undefined,
+        };
     }
 
     // The scalar forms of the across-lane reductions live in this space: `addp d2, v0.2d` and
@@ -848,5 +943,6 @@ fn decode_scalar_fp(w: u32) -> Insn {
         return Insn::VecAcross { q: true, u: (w >> 29) & 1 != 0, size, op: (w >> 12) & 0x1f, rn, rd };
     }
 
-    Insn::FpOneSource { size, opcode, rn, rd }
+    // One source: bits 20:15 name the operation and bits 15:10 are the marker `10000`.
+    Insn::FpOneSource { size, opcode: (w >> 15) & 0x3f, rn, rd }
 }

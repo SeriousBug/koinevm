@@ -40,6 +40,10 @@ pub const L_V0: u32 = L_TI + 1;
 pub const L_V1: u32 = L_V0 + 1;
 pub const L_V2: u32 = L_V1 + 1;
 pub const L_V3: u32 = L_V2 + 1;
+/// Two scalars wide enough that an f32 can go through them exactly, for the sequences that need a
+/// temporary in the middle of a floating point operation.
+pub const L_F0: u32 = L_V3 + 1;
+pub const L_F1: u32 = L_F0 + 1;
 /// Where the trace writes the vector file, one 16-byte value per register.
 pub const SHADOW_V0: u64 = 0x600;
 
@@ -195,6 +199,17 @@ fn narrows_to_low_half(i: &Insn) -> bool {
 /// the control flow graph finds them, which is not the order the code runs in.
 fn falls_through(i: &Insn) -> bool {
     matches!(i, Insn::BCond { .. } | Insn::Cbz { .. } | Insn::Tbz { .. })
+}
+
+/// The eight-bit floating point immediate, expanded to the width of the register it lands in:
+/// one sign bit, the exponent that says how large, and the four-bit fraction that says how much.
+fn vfp_expand_imm(imm8: u32, n: u32) -> u64 {
+    let bit = |i: u32| ((imm8 >> i) & 1) as u64;
+    let (exp_bits, frac_bits) = if n == 64 { (11, 52) } else { (8, 23) };
+    let repeat = exp_bits - 3;
+    let exp = ((1 - bit(6)) << (exp_bits - 1)) | (bit(6) * ((1 << repeat) - 1) << 2) | (bit(5) << 1) | bit(4);
+    let frac = (bit(3) << 3 | bit(2) << 2 | bit(1) << 1 | bit(0)) << (frac_bits - 4);
+    (bit(7) << (n - 1)) | (exp << frac_bits) | frac
 }
 
 fn page_align(x: u64) -> u64 {
@@ -1667,7 +1682,7 @@ impl<'a> RegionEmitter<'a> {
         unsupported: &'a mut Vec<(u64, String)>,
     ) -> Self {
         let mut f = Func::new(ids.ty_region);
-        f.locals = vec![I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128];
+        f.locals = vec![I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128, F64, F64];
         RegionEmitter { f, region, layout, ids, unsupported, open: 0, cur_pc: 0, narrow: false }
     }
 
@@ -2215,6 +2230,188 @@ impl<'a> RegionEmitter<'a> {
             self.f.simd(simd::V128_AND);
         }
         self.f.ls(NVEC0 + r);
+    }
+
+    /// The scalar in lane 0 of an FP register, as the wasm value of its own width.
+    fn fp_get(&mut self, r: u32, double: bool) {
+        self.getv(r);
+        self.f.simd_lane(if double { simd::F64X2_EXTRACT_LANE } else { simd::F32X4_EXTRACT_LANE }, 0);
+    }
+
+    /// A cleared register for a scalar result to land in lane 0 of: a scalar write zeroes the rest
+    /// of the register, so the whole 128 bits are built rather than patched into what was there.
+    fn fp_base(&mut self) {
+        self.f.v128c([0; 16]);
+    }
+
+    /// Store the scalar on the stack into lane 0 of `r`, leaving the rest zero.
+    fn fp_put(&mut self, r: u32, double: bool) {
+        self.f.simd_lane(if double { simd::F64X2_REPLACE_LANE } else { simd::F32X4_REPLACE_LANE }, 0);
+        self.setv(r);
+    }
+
+    fn fp_const(&mut self, bits: u64, double: bool) {
+        if double {
+            self.f.f64c(bits);
+        } else {
+            self.f.f32c(bits as u32);
+        }
+    }
+
+    /// The second operand of a comparison, which is `+0.0` in the form that names no register.
+    fn fp_other(&mut self, r: u32, zero: bool, double: bool) {
+        if zero {
+            self.fp_const(0, double);
+        } else {
+            self.fp_get(r, double);
+        }
+    }
+
+    /// Push whether the scalar in `r` is a NaN, which is the only thing that tells wasm's min and
+    /// max apart from AArch64's.
+    fn fp_is_nan(&mut self, r: u32, double: bool) {
+        self.fp_get(r, double);
+        self.fp_get(r, double);
+        self.f.op(if double { F64_NE } else { F32_NE });
+    }
+
+    /// The bit pattern of a scalar, for the NaN questions that only bits can answer.
+    fn fp_bits(&mut self, r: u32, double: bool) {
+        self.fp_get(r, double);
+        self.f.op(if double { I64_REINTERPRET_F64 } else { I32_REINTERPRET_F32 });
+    }
+
+    /// The quiet form of a NaN: the bit that says it will not signal again.
+    fn fp_quiet(&mut self, r: u32, double: bool) {
+        let quiet = if double { 0x0008_0000_0000_0000u64 } else { 0x0040_0000 };
+        self.fp_bits(r, double);
+        if double {
+            self.f.i64c(quiet as i64);
+            self.f.op(I64_OR);
+            self.f.op(F64_REINTERPRET_I64);
+        } else {
+            self.f.i32c(quiet as i32);
+            self.f.op(I32_OR);
+            self.f.op(F32_REINTERPRET_I32);
+        }
+    }
+
+    /// Whether the scalar in `r` is a NaN that would signal.
+    fn fp_is_snan(&mut self, r: u32, double: bool) {
+        let quiet = if double { 0x0008_0000_0000_0000u64 } else { 0x0040_0000 };
+        self.fp_is_nan(r, double);
+        self.fp_bits(r, double);
+        if double {
+            self.f.i64c(quiet as i64);
+            self.f.op(I64_AND);
+            self.f.op(I64_EQZ);
+        } else {
+            self.f.i32c(quiet as i32);
+            self.f.op(I32_AND);
+            self.f.op(I32_EQZ);
+        }
+        self.f.op(I32_AND);
+    }
+
+    /// The NaN a binary operation hands back when it has one: the first signalling operand, made
+    /// quiet, else the first quiet one. Both widths, so both tests, and the order matters.
+    fn fp_process_nans(&mut self, rn: u32, rm: u32, double: bool) {
+        let scalar = if double { F64 } else { F32 };
+        self.fp_is_snan(rn, double);
+        self.f.op(IF);
+        self.f.body.push(scalar);
+        self.fp_quiet(rn, double);
+        self.f.op(ELSE);
+        self.fp_is_snan(rm, double);
+        self.f.op(IF);
+        self.f.body.push(scalar);
+        self.fp_quiet(rm, double);
+        self.f.op(ELSE);
+        self.fp_is_nan(rn, double);
+        self.f.op(IF);
+        self.f.body.push(scalar);
+        self.fp_get(rn, double);
+        self.f.op(ELSE);
+        self.fp_get(rm, double);
+        self.f.end();
+        self.f.end();
+        self.f.end();
+    }
+
+    /// `fmax`/`fmin` and their number forms. A signalling NaN wins over everything, quieted; a
+    /// quiet one wins over the number in the ordinary form and loses to it in the number form.
+    /// wasm's min and max do neither, and their NaN is whatever the engine picks.
+    fn fp_minmax(&mut self, rn: u32, rm: u32, double: bool, max: bool, number: bool) {
+        let scalar = if double { F64 } else { F32 };
+        let op = match (max, double) {
+            (true, true) => F64_MAX,
+            (true, false) => F32_MAX,
+            (false, true) => F64_MIN,
+            (false, false) => F32_MIN,
+        };
+        self.fp_is_nan(rn, double);
+        self.fp_is_nan(rm, double);
+        self.f.op(I32_OR);
+        self.f.op(I32_EQZ);
+        self.f.op(IF);
+        self.f.body.push(scalar);
+        self.fp_get(rn, double);
+        self.fp_get(rm, double);
+        self.f.op(op);
+        self.f.op(ELSE);
+        self.fp_is_snan(rn, double);
+        self.f.op(IF);
+        self.f.body.push(scalar);
+        self.fp_quiet(rn, double);
+        self.f.op(ELSE);
+        self.fp_is_snan(rm, double);
+        self.f.op(IF);
+        self.f.body.push(scalar);
+        self.fp_quiet(rm, double);
+        self.f.op(ELSE);
+        self.fp_is_nan(rn, double);
+        self.f.op(IF);
+        self.f.body.push(scalar);
+        self.fp_get(if number { rm } else { rn }, double);
+        self.f.op(ELSE);
+        self.fp_get(if number { rn } else { rm }, double);
+        self.f.end();
+        self.f.end();
+        self.f.end();
+        self.f.end();
+    }
+
+    /// `frinta`: round to nearest with ties away from zero, which wasm does not have. Rounding
+    /// through a double is exact for a single, and the result of rounding is always representable.
+    fn fp_round_away(&mut self, r: u32, double: bool) {
+        self.fp_get(r, double);
+        if !double {
+            self.f.op(F64_PROMOTE_F32);
+        }
+        self.f.ls(L_F0);
+        self.f.lg(L_F0);
+        self.f.op(F64_TRUNC);
+        self.f.ls(L_F1);
+        self.f.lg(L_F0);
+        self.f.lg(L_F1);
+        self.f.op(F64_SUB);
+        self.f.op(F64_ABS);
+        self.f.f64c(0.5f64.to_bits());
+        self.f.op(F64_GE);
+        self.f.op(IF);
+        self.f.body.push(F64);
+        self.f.lg(L_F1);
+        // copysign takes its magnitude first and its sign second, so the one goes on first.
+        self.f.f64c(1.0f64.to_bits());
+        self.f.lg(L_F0);
+        self.f.op(F64_COPYSIGN);
+        self.f.op(F64_ADD);
+        self.f.op(ELSE);
+        self.f.lg(L_F1);
+        self.f.end();
+        if !double {
+            self.f.op(F32_DEMOTE_F64);
+        }
     }
 
     /// A vector register read into a scratch local, so a second read can follow.
@@ -3327,10 +3524,14 @@ impl<'a> RegionEmitter<'a> {
             Insn::CacheOp => {}
             Insn::MsrSys { reg, rn } => match reg {
                 SysReg::Nzcv => {
+                    // The architectural register holds N,Z,C,V in bits 31:28; the emitter packs the
+                    // same four flags into bits 3:0, so the two differ by a shift and nothing else.
                     if rn == 31 {
                         self.f.i64c(0);
                     } else {
                         self.f.lg(rn);
+                        self.f.i64c(28);
+                        self.f.op(I64_SHR_U);
                     }
                     self.f.ls(32);
                 }
@@ -3361,6 +3562,8 @@ impl<'a> RegionEmitter<'a> {
                 match reg {
                     SysReg::Nzcv => {
                         self.f.lg(32);
+                        self.f.i64c(28);
+                        self.f.op(I64_SHL);
                     }
                     SysReg::Fpcr | SysReg::Fpsr => {
                         let at = if reg == SysReg::Fpcr { SHADOW_FPCR } else { SHADOW_FPSR };
@@ -3489,6 +3692,80 @@ impl<'a> RegionEmitter<'a> {
                         self.vload(step, L_T1, r);
                     } else {
                         self.vstore(step, L_T1, r);
+                    }
+                }
+                if let Some(index) = post {
+                    match index {
+                        PostIndex::Imm(imm) => self.writeback(rn, L_T2, imm),
+                        PostIndex::Reg(r) => {
+                            self.f.lg(L_T2);
+                            self.get(r, true);
+                            self.f.op(I64_ADD);
+                            self.f.ls(rn);
+                        }
+                    }
+                }
+            }
+            Insn::VecLane { is_load, nregs, size, index, post, rn, rt } => {
+                let ebytes = 1u32 << size;
+                let index = index as u8;
+                self.addr_base_off(rn, 0);
+                self.f.lg(L_T1);
+                self.f.ls(L_T2);
+                for i in 0..nregs {
+                    if i > 0 {
+                        self.f.lg(L_T1);
+                        self.f.i64c(ebytes as i64);
+                        self.f.op(I64_ADD);
+                        self.f.ls(L_T1);
+                    }
+                    let r = (rt + i) % 32;
+                    self.check_byte(L_T1, ebytes as u64);
+                    if is_load {
+                        self.getv(r);
+                        self.f.lg(L_T1);
+                        self.f.wrap_i64();
+                        match size {
+                            0 => {
+                                self.f.mem(I32_LOAD8_U, 0, 0);
+                                self.f.simd_lane(simd::I8X16_REPLACE_LANE, index);
+                            }
+                            1 => {
+                                self.f.mem(I32_LOAD16_U, 1, 0);
+                                self.f.simd_lane(simd::I16X8_REPLACE_LANE, index);
+                            }
+                            2 => {
+                                self.f.mem(I32_LOAD, 2, 0);
+                                self.f.simd_lane(simd::I32X4_REPLACE_LANE, index);
+                            }
+                            _ => {
+                                self.f.mem(I64_LOAD, 3, 0);
+                                self.f.simd_lane(simd::I64X2_REPLACE_LANE, index);
+                            }
+                        }
+                        self.setv(r);
+                    } else {
+                        self.f.lg(L_T1);
+                        self.f.wrap_i64();
+                        self.getv(r);
+                        match size {
+                            0 => {
+                                self.f.simd_lane(simd::I8X16_EXTRACT_LANE_U, index);
+                                self.f.mem(I32_STORE8, 0, 0);
+                            }
+                            1 => {
+                                self.f.simd_lane(simd::I16X8_EXTRACT_LANE_U, index);
+                                self.f.mem(I32_STORE16, 1, 0);
+                            }
+                            2 => {
+                                self.f.simd_lane(simd::I32X4_EXTRACT_LANE, index);
+                                self.f.mem(I32_STORE, 2, 0);
+                            }
+                            _ => {
+                                self.f.simd_lane(simd::I64X2_EXTRACT_LANE, index);
+                                self.f.mem(I64_STORE, 3, 0);
+                            }
+                        }
                     }
                 }
                 if let Some(index) = post {
@@ -4199,6 +4476,42 @@ impl<'a> RegionEmitter<'a> {
                 }
                 self.set(rd, true);
             }
+            Insn::FpToGprFixed { sf, unsigned, size, fbits, rn, rd } => {
+                let double = size == 1;
+                if size > 1 || fbits == 0 || fbits > if double { 64 } else { 32 } {
+                    return self.refuse(format!("fixed-point conversion at 0x{addr:x}"));
+                }
+                self.getv(rn);
+                self.f.simd_lane(if double { simd::F64X2_EXTRACT_LANE } else { simd::F32X4_EXTRACT_LANE }, 0);
+                // Scaling by a power of two is exact, and an overflow to infinity still saturates
+                // to the end of the integer range, which is what the instruction does.
+                let scale: u64 = if double {
+                    ((1023 + fbits) as u64) << 52
+                } else {
+                    (((127 + fbits) as u32) << 23) as u64
+                };
+                self.fp_const(scale, double);
+                self.f.op(if double { F64_MUL } else { F32_MUL });
+                self.f.sat(if double {
+                    if sf {
+                        if unsigned { sat::I64_TRUNC_SAT_F64_U } else { sat::I64_TRUNC_SAT_F64_S }
+                    } else if unsigned {
+                        sat::I32_TRUNC_SAT_F64_U
+                    } else {
+                        sat::I32_TRUNC_SAT_F64_S
+                    }
+                } else if sf {
+                    if unsigned { sat::I64_TRUNC_SAT_F32_U } else { sat::I64_TRUNC_SAT_F32_S }
+                } else if unsigned {
+                    sat::I32_TRUNC_SAT_F32_U
+                } else {
+                    sat::I32_TRUNC_SAT_F32_S
+                });
+                if !sf {
+                    self.f.op(I64_EXTEND_I32_U);
+                }
+                self.set(rd, true);
+            }
             Insn::GprToFp { sf, signed, size, opcode, rn, rd, .. } => {
                 let double = size == 1;
                 self.f.v128c([0; 16]);
@@ -4238,11 +4551,170 @@ impl<'a> RegionEmitter<'a> {
                 }
                 self.setv(rd);
             }
-            Insn::FpOneSource { .. }
-            | Insn::FpTwoSource { .. }
-            | Insn::FpCondSelect { .. }
-            | Insn::FpImm { .. } => {
-                return self.refuse(format!("scalar floating point arithmetic is not translated yet (0x{addr:x})"));
+            Insn::FpTwoSource { size, opcode, rn, rm, rd } => {
+                if size > 1 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
+                }
+                let double = size == 1;
+                self.fp_base();
+                if (4..=7).contains(&opcode) {
+                    self.fp_minmax(rn, rm, double, opcode & 1 == 0, opcode >= 6);
+                } else {
+                    self.fp_get(rn, double);
+                    self.fp_get(rm, double);
+                    let op = match opcode {
+                        0 | 8 => if double { F64_MUL } else { F32_MUL },
+                        1 => if double { F64_DIV } else { F32_DIV },
+                        2 => if double { F64_ADD } else { F32_ADD },
+                        3 => if double { F64_SUB } else { F32_SUB },
+                        _ => return self.refuse(format!("floating point opcode {opcode} at 0x{addr:x}")),
+                    };
+                    self.f.op(op);
+                    if opcode == 8 {
+                        // fnmul: the product, then the sign flipped.
+                        self.f.op(if double { F64_NEG } else { F32_NEG });
+                    }
+                }
+                self.fp_put(rd, double);
+            }
+            Insn::FpFused { size, negate_product, subtract, rn, rm, ra, rd } => {
+                if size > 1 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
+                }
+                let double = size == 1;
+                // There is no fused multiply-add in wasm, so this rounds twice and can differ from
+                // the instruction in the last bit. docs/poc-results.md records that.
+                self.fp_base();
+                self.fp_get(rn, double);
+                self.fp_get(rm, double);
+                self.f.op(if double { F64_MUL } else { F32_MUL });
+                if negate_product {
+                    self.f.op(if double { F64_NEG } else { F32_NEG });
+                }
+                self.fp_get(ra, double);
+                if negate_product != subtract {
+                    self.f.op(if double { F64_SUB } else { F32_SUB });
+                } else {
+                    self.f.op(if double { F64_ADD } else { F32_ADD });
+                }
+                self.fp_put(rd, double);
+            }
+            Insn::FpCompare { size, zero, rn, rm, .. } => {
+                if size > 1 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
+                }
+                let double = size == 1;
+                // An unordered comparison is the one outcome no ordinary comparison reports, and
+                // it has its own NZCV: C and V set, which is what everything downstream tests.
+                self.fp_is_nan(rn, double);
+                if zero {
+                    self.f.i32c(0);
+                } else {
+                    self.fp_is_nan(rm, double);
+                }
+                self.f.op(I32_OR);
+                self.f.op(IF);
+                self.f.body.push(I32);
+                self.f.i32c(3);
+                self.f.op(ELSE);
+                self.fp_get(rn, double);
+                self.fp_other(rm, zero, double);
+                self.f.op(if double { F64_GT } else { F32_GT });
+                self.f.op(IF);
+                self.f.body.push(I32);
+                self.f.i32c(2);
+                self.f.op(ELSE);
+                self.fp_get(rn, double);
+                self.fp_other(rm, zero, double);
+                self.f.op(if double { F64_EQ } else { F32_EQ });
+                self.f.op(IF);
+                self.f.body.push(I32);
+                self.f.i32c(6);
+                self.f.op(ELSE);
+                self.f.i32c(8);
+                self.f.end();
+                self.f.end();
+                self.f.end();
+                self.f.op(I64_EXTEND_I32_U);
+                self.f.ls(32);
+            }
+            Insn::FpCondSelect { size, cond, rn, rm, rd } => {
+                if size > 1 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
+                }
+                let double = size == 1;
+                self.push_cond(cond);
+                self.f.op(IF);
+                self.f.body.push(V128);
+                self.fp_base();
+                self.fp_get(rn, double);
+                self.f.simd_lane(if double { simd::F64X2_REPLACE_LANE } else { simd::F32X4_REPLACE_LANE }, 0);
+                self.f.op(ELSE);
+                self.fp_base();
+                self.fp_get(rm, double);
+                self.f.simd_lane(if double { simd::F64X2_REPLACE_LANE } else { simd::F32X4_REPLACE_LANE }, 0);
+                self.f.end();
+                self.setv(rd);
+            }
+            Insn::FpOneSource { size, opcode, rn, rd } => {
+                if size > 1 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
+                }
+                let double = size == 1;
+                // fcvt changes the width of the register it writes, so it does not share the tail.
+                match (opcode, double) {
+                    (0b000101, false) => {
+                        self.fp_base();
+                        self.fp_get(rn, false);
+                        self.f.op(F64_PROMOTE_F32);
+                        self.fp_put(rd, true);
+                        return Ok(());
+                    }
+                    (0b000100, true) => {
+                        self.fp_base();
+                        self.fp_get(rn, true);
+                        self.f.op(F32_DEMOTE_F64);
+                        self.fp_put(rd, false);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if opcode == 12 {
+                    self.fp_base();
+                    self.fp_round_away(rn, double);
+                    self.fp_put(rd, double);
+                    return Ok(());
+                }
+                self.fp_base();
+                self.fp_get(rn, double);
+                let op = match opcode {
+                    0b000000 => None, // fmov: the bits move unchanged
+                    0b000001 => Some(if double { F64_ABS } else { F32_ABS }),
+                    0b000010 => Some(if double { F64_NEG } else { F32_NEG }),
+                    0b000011 => Some(if double { F64_SQRT } else { F32_SQRT }),
+                    0b001000 => Some(if double { F64_NEAREST } else { F32_NEAREST }),
+                    0b001001 => Some(if double { F64_CEIL } else { F32_CEIL }),
+                    0b001010 => Some(if double { F64_FLOOR } else { F32_FLOOR }),
+                    0b001011 => Some(if double { F64_TRUNC } else { F32_TRUNC }),
+                    // frintx and frinti round in the mode the FPCR holds; the default is the same
+                    // nearest-even that frintn asks for, and nothing here changes the mode.
+                    0b001110 | 0b001111 => Some(if double { F64_NEAREST } else { F32_NEAREST }),
+                    _ => return self.refuse(format!("floating point opcode {opcode} at 0x{addr:x}")),
+                };
+                if let Some(op) = op {
+                    self.f.op(op);
+                }
+                self.fp_put(rd, double);
+            }
+            Insn::FpImm { size, imm8, rd } => {
+                if size > 1 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
+                }
+                let double = size == 1;
+                let bits = vfp_expand_imm(imm8, if double { 64 } else { 32 });
+                self.fp_base();
+                self.fp_const(bits, double);
+                self.fp_put(rd, double);
             }
             Insn::MrsTpidr { rd } => {
                 if rd != 31 {
