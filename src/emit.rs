@@ -52,6 +52,9 @@ pub const SHADOW_SP: u64 = SHADOW + 31 * 8;
 pub const SHADOW_NZCV: u64 = SHADOW_SP + 8;
 pub const SHADOW_PC: u64 = SHADOW_NZCV + 8;
 pub const SHADOW_TP: u64 = SHADOW_PC + 8;
+/// Where the guest continues after a syscall the host had to answer: the instruction after the
+/// `svc`, which the run's own exit path cannot report because it names the block it was in.
+pub const SHADOW_RESUME: u64 = 0x118;
 /// Trace mode ring buffer of dispatched guest pcs: a count at RING_IDX and 256 slots at RING.
 pub const RING_IDX: u64 = 0x1fc;
 pub const RING: u64 = 0x200;
@@ -165,7 +168,10 @@ pub struct MapInfo {
 fn is_terminator(i: &Insn) -> bool {
     matches!(
         i,
-        Insn::B { .. }
+        // A syscall ends the block so that the instruction after it is a block start, which is what
+        // makes the address a run resumes at dispatchable.
+        Insn::Svc
+            | Insn::B { .. }
             | Insn::Bl { .. }
             | Insn::BCond { .. }
             | Insn::Cbz { .. }
@@ -201,7 +207,7 @@ fn narrows_to_low_half(i: &Insn) -> bool {
 /// next instruction is not the region's next block: a page region reaches its blocks in the order
 /// the control flow graph finds them, which is not the order the code runs in.
 fn falls_through(i: &Insn) -> bool {
-    matches!(i, Insn::BCond { .. } | Insn::Cbz { .. } | Insn::Tbz { .. })
+    matches!(i, Insn::BCond { .. } | Insn::Cbz { .. } | Insn::Tbz { .. } | Insn::Svc)
 }
 
 /// The eight-bit floating point immediate, expanded to the width of the register it lands in:
@@ -1957,6 +1963,34 @@ impl<'a> RegionEmitter<'a> {
                 self.f.ls(30);
                 self.emit_return_reg(rn);
             }
+            Insn::Svc => {
+                // The host side reports which instruction called it, which is how a failing
+                // syscall is traced back to the guest code that asked for it.
+                self.f.i32c(SHADOW_PC as i32);
+                self.f.i32c(addr as i32);
+                self.f.mem(I32_STORE, 2, 0);
+                self.f.i32c(SHADOW_RESUME as i32);
+                self.f.i32c((addr + 4) as i32);
+                self.f.mem(I32_STORE, 2, 0);
+                self.f.lg(8);
+                for i in 0..6u32 {
+                    self.f.lg(i);
+                }
+                self.f.call(self.ids.syscall);
+                self.f.ls(L_TI);
+                self.f.ls(L_T0);
+                self.f.lg(L_TI);
+                self.open_if();
+                self.begin_return();
+                // A region that returns a zero next pc is what stops the run loop, and the host
+                // resumes this process with x0 holding the syscall's answer.
+                self.f.i32c(0);
+                self.end_return();
+                self.close_if();
+                if self.f.body.last() == Some(&UNREACHABLE) {}
+                self.f.lg(L_T0);
+                self.f.ls(0);
+            }
             _ => return Err(format!("not a terminator at 0x{addr:x}")),
         }
         Ok(())
@@ -2888,6 +2922,8 @@ impl<'a> RegionEmitter<'a> {
         self.emit_trace(addr);
         match insn {
             Insn::Hint => {}
+            // The terminator table handles a syscall: it ends the block it is in.
+            Insn::Svc => return Err(format!("syscall at 0x{addr:x} is not a block end")),
             Insn::Undefined => return self.refuse(format!("undecoded instruction at 0x{addr:x}")),
             Insn::Adr { rd, imm } => {
                 if rd != 31 {
@@ -3520,31 +3556,6 @@ impl<'a> RegionEmitter<'a> {
                 self.f.i64c(target as i64);
                 self.f.ls(L_T1);
                 self.emit_load(L_T1, if sf { 3 } else { 2 }, 1, rt);
-            }
-            Insn::Svc => {
-                // The host side reports which instruction called it, which is how a failing
-                // syscall is traced back to the guest code that asked for it.
-                self.f.i32c(SHADOW_PC as i32);
-                self.f.i32c(self.cur_pc as i32);
-                self.f.mem(I32_STORE, 2, 0);
-                self.f.lg(8);
-                for i in 0..6u32 {
-                    self.f.lg(i);
-                }
-                self.f.call(self.ids.syscall);
-                self.f.ls(L_TI);
-                self.f.ls(L_T0);
-                self.f.lg(L_TI);
-                self.open_if();
-                self.begin_return();
-                // A region that returns a zero next pc is what stops the run loop, and the host
-                // resumes this process with x0 holding the syscall's answer.
-                self.f.i32c(0);
-                self.end_return();
-                self.close_if();
-                if self.f.body.last() == Some(&UNREACHABLE) {}
-                self.f.lg(L_T0);
-                self.f.ls(0);
             }
             Insn::CacheOp => {}
             Insn::MsrSys { reg, rn } => match reg {

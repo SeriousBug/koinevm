@@ -37,7 +37,7 @@ function state() {
   for (let i = 0; i < 31; i++) regs.push(view.getBigInt64(i * 8, true));
   return (
     `  pc=${where(view.getInt32(0x108, true) >>> 0)} sp=0x${view.getBigUint64(0xf8, true).toString(16)} ` +
-    `nzcv=0x${view.getBigUint64(0x100, true).toString(16)}\n` +
+    `nzcv=0x${view.getBigUint64(0x100, true).toString(16)} tp=0x${view.getBigUint64(0x110, true).toString(16)}\n` +
     `  ${regs.map((v, i) => `x${i}=0x${v.toString(16)}`).join(" ")}`
   );
 }
@@ -57,7 +57,9 @@ function trap(kind, addr, at) {
   throw new Error(
     `guest pc trail: ${ring(24).map(where).join(" -> ")}\n` +
       `guest trap ${Number(kind)} at address 0x${Number(addr).toString(16)} from 0x${(at >>> 0).toString(16)}\n` +
-      state(),
+      state() +
+      "\n" + backtrace() +
+      memory_dump(),
   );
 }
 
@@ -279,13 +281,13 @@ function makeImports(proc) {
         const view = new DataView(memory.buffer);
         const pc = view.getUint32(0xf8 + 16, true) >>> 0;
         const args = [a0, a1, a2, a3, a4, a5].map((v) => `0x${BigInt(v).toString(16)}`).join(" ");
-        console.error(`syscall ${nr} from 0x${pc.toString(16)}: ${args}`);
+        console.error(`syscall ${nr} from ${where(pc)}: ${args}`);
       }
       const answer = kernel.call(nr, a0, a1, a2, a3, a4, a5);
       if (Array.isArray(answer)) return [answer[0], answer[1]];
       // The host has to act, which it cannot do from inside this call: the run returns and the
       // scheduler resumes it with x0 holding the answer.
-      kernel.pending = answer;
+      kernel.pending = answer.host;
       return [0n, 1];
     },
     trap: (kind, addr, at) => {

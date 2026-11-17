@@ -17,10 +17,21 @@ export const ENOTDIR = 20;
 export const ESPIPE = 29;
 export const ELOOP = 40;
 export const ENAMETOOLONG = 36;
+export const ENOSPC = 28;
 
 export const AT_FDCWD = -100;
 
 const DT = { file: 8, dir: 4, link: 10, fifo: 1, sock: 12, chr: 2, blk: 6 };
+
+/// The character devices a program expects to find: a rootfs unpacked by `apt` has an empty /dev,
+/// so the kernel provides them by name rather than by node.
+const DEVICES = new Map([
+  ["/dev/null", { kind: "null", mode: 0o020666, rdev: 0x0103 }],
+  ["/dev/zero", { kind: "zero", mode: 0o020666, rdev: 0x0105 }],
+  ["/dev/full", { kind: "full", mode: 0o020666, rdev: 0x0107 }],
+  ["/dev/random", { kind: "random", mode: 0o020666, rdev: 0x0108 }],
+  ["/dev/urandom", { kind: "random", mode: 0o020666, rdev: 0x0109 }],
+]);
 
 const O_ACCMODE = 3;
 const O_WRONLY = 1;
@@ -37,17 +48,23 @@ export class Files {
     this.rootfs = rootfs ? path.resolve(rootfs) : null;
     this.map = new Map();
     this.next = 3;
+    this.seed = 1;
     this.cwd = "/";
     this.map.set(0, { kind: "stdin" });
     this.map.set(1, { kind: "stdout" });
     this.map.set(2, { kind: "stderr" });
   }
 
+  /// The path the guest named, as its own absolute path.
+  guestPath(name) {
+    const absolute = name.startsWith("/") ? name : path.posix.join(this.cwd, name);
+    return path.posix.normalize(absolute);
+  }
+
   /// Guest path to host path, refusing anything that leaves the rootfs.
   resolve(guestPath) {
     if (!this.rootfs) return -ENOENT;
-    const absolute = guestPath.startsWith("/") ? guestPath : path.posix.join(this.cwd, guestPath);
-    const clean = path.posix.normalize(absolute);
+    const clean = this.guestPath(guestPath);
     if (clean.includes("\0")) return -ENOENT;
     const host = path.join(this.rootfs, clean);
     if (host !== this.rootfs && !host.startsWith(this.rootfs + path.sep)) return -EACCES;
@@ -64,6 +81,36 @@ export class Files {
     return this.map.get(fd);
   }
 
+  /// Bytes from a generator that starts from a fixed point, so a run reproduces.
+  randomBytes(len) {
+    const out = Buffer.alloc(len);
+    for (let i = 0; i < len; i++) {
+      this.seed = (this.seed * 6364136223846793005 + 1442695040888963407) % 2 ** 32;
+      out[i] = this.seed & 0xff;
+    }
+    return out;
+  }
+
+  /// fcntl's F_DUPFD: another descriptor on the same open file description.
+  dup(fd, from, cloexec) {
+    const entry = this.map.get(fd);
+    if (!entry) return -EBADF;
+    let n = Math.max(from, 0);
+    while (this.map.has(n)) n++;
+    this.map.set(n, { ...entry, cloexec });
+    return n;
+  }
+
+  /// dup3: make `newfd` another descriptor on the same open file description, closing it first.
+  dup3(oldfd, newfd, cloexec) {
+    const entry = this.map.get(oldfd);
+    if (!entry) return -EBADF;
+    if (oldfd === newfd) return -EINVAL;
+    this.map.set(newfd, { ...entry, cloexec });
+    if (newfd >= this.next) this.next = newfd + 1;
+    return newfd;
+  }
+
   /// What survives an exec: the descriptors whose entry was not opened close-on-exec.
   keepAcrossExec() {
     for (const [fd, entry] of this.map) {
@@ -72,17 +119,23 @@ export class Files {
   }
 
   open(guestPath, flags, mode) {
+    const device = DEVICES.get(this.guestPath(guestPath));
+    if (device) return this.add({ ...device, desc: { pos: 0 }, cloexec: (flags & O_CLOEXEC) !== 0 });
     const host = this.resolve(guestPath);
     if (host < 0) return host;
     const access = flags & O_ACCMODE;
     try {
+      // The entry is one descriptor; `desc` is the open file description behind it, which a
+      // duplicate shares, so a read through either one moves the position for both.
       const entry = {
         kind: "file",
         host,
-        pos: 0,
-        append: (flags & O_APPEND) !== 0,
-        readable: access !== O_WRONLY,
-        writable: access !== 0,
+        desc: {
+          pos: 0,
+          append: (flags & O_APPEND) !== 0,
+          readable: access !== O_WRONLY,
+          writable: access !== 0,
+        },
         cloexec: (flags & O_CLOEXEC) !== 0,
       };
       if ((flags & O_CREAT) && !fs.existsSync(host)) {
@@ -92,12 +145,12 @@ export class Files {
       const st = fs.statSync(host);
       if ((flags & O_DIRECTORY) && !st.isDirectory()) return -ENOTDIR;
       if (st.isDirectory()) {
-        if (entry.writable) return -EISDIR;
+        if (entry.desc.writable) return -EISDIR;
         entry.kind = "dir";
         entry.size = st.size;
         return this.add(entry);
       }
-      if ((flags & O_TRUNC) && entry.writable) fs.writeFileSync(host, Buffer.alloc(0));
+      if ((flags & O_TRUNC) && entry.desc.writable) fs.writeFileSync(host, Buffer.alloc(0));
       entry.size = st.size;
       return this.add(entry);
     } catch (e) {
@@ -128,8 +181,11 @@ export class Files {
     if (!entry) return -EBADF;
     if (entry.kind === "dir") return -EISDIR;
     if (entry.kind === "stdin") return Buffer.alloc(0); // stdin is empty: no console yet
-    const out = this.bytes(entry, entry.pos, len);
-    entry.pos += out.length;
+    if (entry.kind === "null") return Buffer.alloc(0);
+    if (entry.kind === "zero" || entry.kind === "full") return Buffer.alloc(len);
+    if (entry.kind === "random") return this.randomBytes(len);
+    const out = this.bytes(entry, entry.desc.pos, len);
+    entry.desc.pos += out.length;
     return out;
   }
 
@@ -186,23 +242,24 @@ export class Files {
     if (!entry) return -EBADF;
     if (entry.kind !== "dir") return -ENOTDIR;
     const all = this.dirEntries(entry);
+    entry.index ??= 0;
     const chunks = [];
     let used = 0;
-    while (entry.pos < all.length) {
-      const e = all[entry.pos];
+    while (entry.index < all.length) {
+      const e = all[entry.index];
       const name = Buffer.from(e.name, "utf8");
       const reclen = (19 + name.length + 1 + 7) & ~7;
       if (used + reclen > len) break;
       if (used === 0 && reclen > len) return -EINVAL;
       const rec = Buffer.alloc(reclen);
       rec.writeBigUInt64LE(e.ino, 0);
-      rec.writeBigInt64LE(BigInt(entry.pos + 1), 8);
+      rec.writeBigInt64LE(BigInt(entry.index + 1), 8);
       rec.writeUInt16LE(reclen, 16);
       rec.writeUInt8(e.type, 18);
       name.copy(rec, 19);
       chunks.push(rec);
       used += reclen;
-      entry.pos++;
+      entry.index++;
     }
     return Buffer.concat(chunks);
   }
@@ -213,16 +270,19 @@ export class Files {
       (fd === 1 ? process.stdout : process.stderr).write(data);
       return data.length;
     }
-    if (!entry.writable) return -EBADF;
-    const at = entry.append ? Number(fs.statSync(entry.host).size) : entry.pos;
+    if (entry.kind === "null") return data.length;
+    if (entry.kind === "zero") return data.length;
+    if (entry.kind === "full") return -ENOSPC;
+    if (!entry.desc.writable) return -EBADF;
+    const at = entry.desc.append ? Number(fs.statSync(entry.host).size) : entry.desc.pos;
     const handle = fs.openSync(entry.host, "r+");
     try {
       fs.writeSync(handle, data, 0, data.length, at);
     } finally {
       fs.closeSync(handle);
     }
-    entry.pos = at + data.length;
-    entry.size = Math.max(entry.size ?? 0, entry.pos);
+    entry.desc.pos = at + data.length;
+    entry.size = Math.max(entry.size ?? 0, entry.desc.pos);
     return data.length;
   }
 
@@ -230,11 +290,11 @@ export class Files {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     if (entry.kind !== "file") return -ESPIPE;
-    const base = whence === 0 ? 0 : whence === 1 ? entry.pos : whence === 2 ? entry.size ?? 0 : -1;
+    const base = whence === 0 ? 0 : whence === 1 ? entry.desc.pos : whence === 2 ? entry.size ?? 0 : -1;
     if (base < 0) return -EINVAL;
-    entry.pos = base + off;
-    if (entry.pos < 0) return -EINVAL;
-    return entry.pos;
+    entry.desc.pos = base + off;
+    if (entry.desc.pos < 0) return -EINVAL;
+    return entry.desc.pos;
   }
 
   /// The bytes a file-backed mapping gets, clipped to the mapping.
@@ -269,7 +329,10 @@ export class Files {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     if (entry.kind === "stdin" || entry.kind === "stdout" || entry.kind === "stderr") {
-      return { mode: 0o020666n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n };
+      return { mode: 0o020666n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n };
+    }
+    if (entry.rdev) {
+      return { mode: BigInt(entry.mode), nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: BigInt(entry.rdev) };
     }
     try {
       return fs.statSync(entry.host, { bigint: true });

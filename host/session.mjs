@@ -17,7 +17,9 @@ import { Mach } from "./pages.mjs";
 
 const SHADOW = 0x0;
 const SHADOW_PC = 0x108;
+const SHADOW_RESUME = 0x118;
 
+const CLONE_VFORK = 0x4000;
 const CLONE_PARENT_SETTID = 0x00100000;
 const CLONE_CHILD_SETTID = 0x01000000;
 const WNOHANG = 1;
@@ -93,6 +95,20 @@ export class Session {
 
   /// One entry into the guest, run until it exits, asks the host, or jumps somewhere untranslated.
   async step(proc) {
+    if (process.env.ARMJIT_TRACE_STEPS) {
+      const v = new DataView(proc.memory.buffer);
+      console.error(
+        `step: ${proc.pid} entry=${proc.entry} pc=0x${v.getUint32(SHADOW_PC, true).toString(16)}` +
+          ` resume=0x${v.getUint32(SHADOW_RESUME, true).toString(16)} x0=0x${v.getBigUint64(0, true).toString(16)}`,
+      );
+    }
+    // A syscall that was waiting is answered here, not by running the guest's code again: the
+    // function it was in pushed a frame before the svc, and a second entry would push another.
+    if (proc.pending) {
+      const request = proc.pending;
+      proc.pending = null;
+      return this.answer(proc, request);
+    }
     let status;
     if (proc.entry) {
       proc.entry = false;
@@ -124,6 +140,10 @@ export class Session {
       console.error(`armjit: pid ${proc.pid} returned from a syscall with no request`);
       return 1;
     }
+    return this.answer(proc, request);
+  }
+
+  answer(proc, request) {
     switch (request.kind) {
       case "fork":
         return this.fork(proc, request);
@@ -137,12 +157,18 @@ export class Session {
     }
   }
 
-  /// x0 is the syscall's answer and the guest continues after the `svc`, whose address the shadow
-  /// holds because the yield returned before the emitter stored x0.
+  /// x0 is the syscall's answer and the guest continues after the `svc`. The address to continue at
+  /// is the one the syscall stored, not the block the run went out through, and it is a block start
+  /// because a syscall ends the block it is in.
   resume(proc, value) {
     const view = new DataView(proc.memory.buffer);
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(
+        `resume: ${proc.pid} x0=${value} at 0x${view.getUint32(SHADOW_RESUME, true).toString(16)}`,
+      );
+    }
     view.setBigInt64(SHADOW, BigInt.asIntN(64, BigInt(value)), true);
-    view.setUint32(SHADOW_PC, view.getUint32(SHADOW_PC, true) + 4, true);
+    view.setUint32(SHADOW_PC, view.getUint32(SHADOW_RESUME, true), true);
     proc.state = "runnable";
     return 0;
   }
@@ -166,9 +192,8 @@ export class Session {
     // The child's fork returns zero, from the instruction after the svc.
     const from = new DataView(parent.memory.buffer);
     const view = new DataView(child.memory.buffer);
-    const after = from.getUint32(SHADOW_PC, true) + 4;
     view.setBigInt64(SHADOW, 0n, true);
-    view.setUint32(SHADOW_PC, after, true);
+    view.setUint32(SHADOW_PC, view.getUint32(SHADOW_RESUME, true), true);
     if (request.flags & CLONE_CHILD_SETTID && request.ctid) {
       view.setUint32(request.ctid, child.pid, true);
     }
@@ -177,9 +202,16 @@ export class Session {
     }
     this.processes.push(child);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
-      console.error(`fork: ${parent.pid} -> ${child.pid}`);
+      console.error(
+        `fork: ${parent.pid} -> ${child.pid} at 0x${from.getUint32(SHADOW_RESUME, true).toString(16)}` +
+          ` sp=0x${from.getBigUint64(0xf8, true).toString(16)}`,
+      );
     }
-    return this.resume(parent, child.pid);
+    const verdict = this.resume(parent, child.pid);
+    // vfork suspends the parent until the child execs or exits, and the child runs on the stack the
+    // parent is using, so it must not get a turn while it is still inside the fork.
+    if (request.flags & CLONE_VFORK && !process.env.ARMJIT_NO_WAIT_VFORK) this.block(parent, child.pid);
+    return verdict;
   }
 
   /// The whole of the parent's memory that exists: the engine area, which holds the page and
@@ -196,8 +228,11 @@ export class Session {
       }
       const lo = i;
       while (i < ptes.length && ptes[i] !== 0) i++;
-      const at = lo << 12;
-      const len = (i - lo) << 12;
+      // Not a shift: a page index times 4096 passes what a 32-bit shift can hold.
+      const at = lo * 4096;
+      // The page table covers 4 GiB and the memory is a few pages short of it.
+      if (at >= dst.length) break;
+      const len = Math.min((i - lo) * 4096, dst.length - at);
       dst.set(src.subarray(at, at + len), at);
     }
   }
@@ -218,7 +253,7 @@ export class Session {
       console.error(`armjit: cannot run ${path}: ${answer.error}`);
       return this.resume(proc, -ENOEXEC);
     }
-    const meta = JSON.parse(answer.meta);
+    const meta = answer.meta;
     // What survives an exec: the descriptor table (less close-on-exec entries) and the cwd. The
     // address space, the page tables and every translation in them do not.
     const files = proc.kernel.files;
@@ -231,6 +266,7 @@ export class Session {
     if (process.env.ARMJIT_TRACE_PROCESSES) {
       console.error(`exec: ${proc.pid} ${path} at 0x${meta.entry.toString(16)}`);
     }
+    this.wake(proc);
     return 0;
   }
 
@@ -245,12 +281,25 @@ export class Session {
       return this.resume(proc, done.pid);
     }
     if (request.options & WNOHANG) return this.resume(proc, 0);
-    proc.state = "blocked";
-    proc.blockedOn = request.pid;
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
-      console.error(`wait: ${proc.pid} blocks on ${request.pid}`);
-    }
+    this.block(proc, request.pid);
+    proc.pending = request;
     return 0;
+  }
+
+  block(proc, on) {
+    proc.state = "blocked";
+    proc.blockedOn = on;
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(`wait: ${proc.pid} blocks on ${on <= 0 ? "any child" : on}`);
+    }
+  }
+
+  /// A parent waiting for this process, whether for its exit or for the exec that ends a vfork.
+  wake(proc) {
+    for (const q of this.processes) {
+      if (q.state !== "blocked" || proc.ppid !== q.pid) continue;
+      if (q.blockedOn <= 0 || q.blockedOn === proc.pid) q.state = "runnable";
+    }
   }
 
   /// The wait status a real kernel would give, and the rusage a program that asks for one reads.
@@ -259,6 +308,12 @@ export class Session {
     if (request.wstatus) view.setInt32(request.wstatus, (child.code & 0xff) << 8, true);
     if (request.rusage) new Uint8Array(parent.memory.buffer).fill(0, request.rusage, request.rusage + 144);
     child.reaped = true;
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(
+        `reap: ${child.pid} code ${child.code}, status word at 0x${request.wstatus.toString(16)}` +
+          ` = ${request.wstatus ? view.getInt32(request.wstatus, true) : "none"}`,
+      );
+    }
   }
 
   exit(proc, code) {
@@ -266,11 +321,7 @@ export class Session {
     proc.code = code & 0xff;
     if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exit: ${proc.pid} status ${proc.code}`);
     // A parent that was waiting for this one has something to see now.
-    for (const q of this.processes) {
-      if (q.state === "blocked" && proc.ppid === q.pid && (q.blockedOn <= 0 || q.blockedOn === proc.pid)) {
-        q.state = "runnable";
-      }
-    }
+    this.wake(proc);
     return 0;
   }
 

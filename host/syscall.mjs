@@ -16,6 +16,8 @@ export const ENOEXEC = 8;
 
 const MAP_ANONYMOUS = 0x20;
 const CLONE_VM = 0x100;
+const CLONE_VFORK = 0x4000;
+const CLONE_THREAD = 0x10000;
 const WNOHANG = 1;
 
 export class Kernel {
@@ -215,9 +217,12 @@ export class Kernel {
   registerProcess() {
     this.on(220, (k, flags, stack, ptid, ctid, tls) => {
       const f = Number(flags);
-      // A thread shares its memory, which one linear memory per process cannot express, and a new
-      // stack is what makes it a thread.
-      if (f & CLONE_VM || k.addr(stack) !== 0) return k.fail(ENOSYS);
+      // A thread shares its memory with its creator, which one linear memory per process cannot
+      // express. vfork also asks for shared memory, but on the one stack it already has, and it
+      // promises not to touch anything but that stack before it execs, so a copy is enough.
+      if (f & CLONE_THREAD) return k.fail(ENOSYS);
+      if (process.env.ARMJIT_NO_VFORK && f & CLONE_VM) return k.fail(ENOSYS);
+      if (k.addr(stack) !== 0 && k.addr(stack) !== Number(k.u64(0xf8n))) return k.fail(ENOSYS);
       return k.ask({
         kind: "fork",
         flags: f,
@@ -233,8 +238,9 @@ export class Kernel {
       const at = args;
       if (k.addr(at) === 0) return k.fail(EINVAL);
       const flags = Number(k.u64(at));
-      const stack = Number(k.u64(at + 40n));
-      if (flags & CLONE_VM || stack !== 0) return k.fail(ENOSYS);
+      const stack = k.addr(k.u64(at + 40n));
+      if (flags & CLONE_THREAD) return k.fail(ENOSYS);
+      if (stack !== 0 && stack !== Number(k.u64(0xf8n))) return k.fail(ENOSYS);
       return k.ask({
         kind: "fork",
         flags,
@@ -282,6 +288,33 @@ export class Kernel {
     });
 
     this.on(57, (k, fd) => [BigInt(k.files.close(Number(fd))), 0]);
+
+    this.on(23, (k, fd) => [BigInt(k.files.dup(Number(fd), 0, false)), 0]); // dup
+
+    this.on(24, (k, oldfd, newfd, flags) => [
+      BigInt(k.files.dup3(Number(oldfd), Number(newfd), (Number(flags) & 0x80000) !== 0)),
+      0,
+    ]);
+
+    this.on(25, (k, fd, cmd, arg) => {
+      const entry = k.files.get(Number(fd));
+      if (!entry) return k.fail(EBADF);
+      switch (Number(cmd)) {
+        case 0: // F_DUPFD
+          return [BigInt(k.files.dup(Number(fd), Number(arg), false)), 0];
+        case 1030: // F_DUPFD_CLOEXEC
+          return [BigInt(k.files.dup(Number(fd), Number(arg), true)), 0];
+        case 1: // F_GETFD
+          return [BigInt(entry.cloexec ? 1 : 0), 0];
+        case 2: // F_SETFD
+          entry.cloexec = (Number(arg) & 1) !== 0;
+          return [0n, 0];
+        case 3: // F_GETFL
+          return [BigInt(entry.desc?.append ? 0x400 : 0), 0];
+        default:
+          return [0n, 0];
+      }
+    });
 
     this.on(63, (k, fd, buf, count) => {
       const n = Math.min(Number(count), 0x7ffff000);

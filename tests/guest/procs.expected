@@ -1,0 +1,9 @@
+in child, pid>0? 1, ppid>0? 1
+child 1 exited 1, status 1792, exit code 7
+hello from exec
+echo reaped, exited 1, code 0
+reaped 2, codes sum 3
+hello from vfork
+vfork child reaped, code 0
+failed exec code 126
+procs: done

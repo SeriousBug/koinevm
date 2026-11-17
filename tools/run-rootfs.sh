@@ -16,13 +16,13 @@ shift
 argv=$prog
 for a in "$@"; do argv="$argv,$a"; done
 
-key=$(printf '%s_' "$prog" "$@" | tr -c 'A-Za-z0-9_.-' '_')
+key=$(printf '%s_' "$prog" "$@" | tr -c 'A-Za-z0-9_.-' '_')${ARMJIT_TRACE:+_trace}
 wasm="target/tmp/rootfs_$key.wasm"
 mkdir -p target/tmp
 
 if [[ ! -f $wasm || -n ${ARMJIT_RETRANSLATE:-} ]]; then
     if ! ./target/release/armjit translate "$rootfs$prog" -o "$wasm" --rootfs="$rootfs" \
-            --argv="$argv" > "target/tmp/rootfs_$key.log" 2>&1; then
+            --argv="$argv" ${ARMJIT_TRACE:+--trace} > "target/tmp/rootfs_$key.log" 2>&1; then
         echo "translate failed:" >&2
         tail -20 "target/tmp/rootfs_$key.log" >&2
         exit 2

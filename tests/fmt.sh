@@ -8,7 +8,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-GUESTS=${GUESTS:-"fmt"}
+GUESTS=${GUESTS:-"fmt procs"}
 MODES=${MODES:-"check trust"}
 rootfs=rootfs/debian
 
