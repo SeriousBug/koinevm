@@ -9,6 +9,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 rootfs=${ARMJIT_ROOTFS:-rootfs/debian}
+# The runtime needs the same rootfs the translation saw, and it reads it from the environment.
+export ARMJIT_ROOTFS=$rootfs
 # The environment a Debian program expects to find. A process started by a shell inherits one, and
 # a package manager checks for `PATH` before it does anything.
 env=${ARMJIT_ENV:-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,HOME=/root}
