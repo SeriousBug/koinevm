@@ -115,6 +115,9 @@ pub struct Config {
     pub mem_pages: u32,
     /// Write the register shadow on every dispatch, so a trap can report guest state.
     pub trace: bool,
+    /// Report only the backward branches, which is enough to find a loop that never ends without
+    /// the cost of tracing every instruction.
+    pub trace_loops: bool,
     /// Translate what decodes and trap at what does not, instead of refusing the whole image. This
     /// is how `scan` measures the gap, and how a run gets far enough to say what it is missing.
     pub allow_undefined: bool,
@@ -465,7 +468,7 @@ fn prelude(m: &mut Module, cfg: &Config) -> Prelude {
 
     m.imports.push(Import { module: "env".into(), name: "syscall".into(), ty: ty_syscall });
     m.imports.push(Import { module: "env".into(), name: "trap".into(), ty: ty_trap });
-    let trace_idx = if cfg.trace {
+    let trace_idx = if cfg.trace || cfg.trace_loops {
         let ty = m.ty(vec![I32, I64], vec![]);
         m.imports.push(Import { module: "env".into(), name: "trace2".into(), ty });
         Some(m.n_imports() - 1)
@@ -498,7 +501,12 @@ pub fn translate(
     envp: &[Vec<u8>],
 ) -> Result<Output, String> {
     let elf = images.main;
-    let (code_lo, code_hi) = elf.code_range().ok_or("no executable segment")?;
+    let ranges = elf.instruction_ranges();
+    if ranges.is_empty() {
+        return Err("no executable segment".into());
+    }
+    let code_lo = ranges.iter().map(|r| r.0).min().unwrap();
+    let code_hi = ranges.iter().map(|r| r.1).max().unwrap();
     let mem_size = cfg.mem_pages as u64 * 65536;
     let entry = images.interp.map(|i| i.entry).unwrap_or(elf.entry);
 
@@ -579,6 +587,7 @@ pub fn translate(
         stack_floor,
         bounds_check: cfg.bounds_check,
         trace: cfg.trace,
+        trace_loops: cfg.trace_loops,
         allow_undefined: cfg.allow_undefined,
         mem_size,
     };
@@ -662,6 +671,7 @@ struct Layout {
     stack_floor: u64,
     bounds_check: bool,
     trace: bool,
+    trace_loops: bool,
     allow_undefined: bool,
     mem_size: u64,
 }
@@ -1918,7 +1928,11 @@ impl<'a> RegionEmitter<'a> {
 
     fn emit_term(&mut self, addr: u64, insn: Insn) -> Result<(), String> {
         match insn {
-            Insn::B { offset } => self.emit_jump((addr as i64 + offset) as u64),
+            Insn::B { offset } => {
+                let t = (addr as i64 + offset) as u64;
+                self.trace_backedge(addr, t);
+                self.emit_jump(t)
+            }
             Insn::Bl { offset } => {
                 let t = (addr as i64 + offset) as u64;
                 self.f.i64c((addr + 4) as i64);
@@ -1927,6 +1941,7 @@ impl<'a> RegionEmitter<'a> {
             }
             Insn::BCond { cond, offset } => {
                 let t = (addr as i64 + offset) as u64;
+                self.trace_backedge(addr, t);
                 self.push_cond(cond);
                 self.open_if();
                 self.emit_jump(t);
@@ -1934,6 +1949,7 @@ impl<'a> RegionEmitter<'a> {
             }
             Insn::Cbz { sf, nonzero, rt, offset } => {
                 let t = (addr as i64 + offset) as u64;
+                self.trace_backedge(addr, t);
                 self.get(rt, sf);
                 self.f.op(if sf { I64_EQZ } else { I32_EQZ });
                 if nonzero {
@@ -1945,6 +1961,7 @@ impl<'a> RegionEmitter<'a> {
             }
             Insn::Tbz { nonzero, bit, rt, offset } => {
                 let t = (addr as i64 + offset) as u64;
+                self.trace_backedge(addr, t);
                 self.f.lg(rt);
                 self.f.i64c(bit as i64);
                 self.f.op(I64_SHR_U);
@@ -2894,6 +2911,13 @@ impl<'a> RegionEmitter<'a> {
     }
 
     // ---- instructions
+
+    /// A branch that jumps back is a loop, and a run that never returns is inside one.
+    fn trace_backedge(&mut self, addr: u64, target: u64) {
+        if self.layout.trace_loops && target <= addr {
+            self.emit_trace(addr);
+        }
+    }
 
     /// The register shadow and the call into the host, before the instruction at `addr` runs.
     fn emit_trace(&mut self, addr: u64) {
@@ -4995,6 +5019,7 @@ pub fn translate_page(
         stack_floor: 0,
         bounds_check: cfg.bounds_check,
         trace: cfg.trace,
+        trace_loops: cfg.trace_loops,
         allow_undefined: cfg.allow_undefined,
         mem_size: cfg.mem_pages as u64 * 65536,
     };

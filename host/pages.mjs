@@ -56,9 +56,12 @@ export class Translator {
     });
   }
 
-  configure({ bounds, trace, memPages, rootfs }) {
+  configure({ bounds, trace, traceLoops, memPages, rootfs }) {
     const root = rootfs ? rootfs : "-";
-    return this.ask(`cfg bounds=${bounds ? "check" : "trust"} trace=${trace ? 1 : 0} mem-pages=${memPages} rootfs=${root}`);
+    return this.ask(
+      `cfg bounds=${bounds ? "check" : "trust"} trace=${trace ? 1 : 0} trace-loops=${traceLoops ? 1 : 0}` +
+        ` mem-pages=${memPages} rootfs=${root}`,
+    );
   }
 
   page(image, base, at) {

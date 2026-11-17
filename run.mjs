@@ -323,6 +323,7 @@ const translator = new Translator(process.env.ARMJIT_TRANSLATOR || "./target/rel
 const configured = await translator.configure({
   bounds: meta.bounds === 1,
   trace: meta.trace === 1,
+  traceLoops: meta.trace_loops === 1,
   memPages: meta.mem_pages,
   rootfs,
 });

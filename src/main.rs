@@ -111,7 +111,7 @@ fn place(
             "{{\"entry\":{},\"sp\":{},\"mem_pages\":{},\"code_lo\":{},\"code_hi\":{},",
             "\"pte_base\":{},\"table_base\":{},\"table_mask\":{},",
             "\"heap_base\":{},\"heap_limit\":{},\"mmap_base\":{},",
-            "\"stack_floor\":{},\"bounds\":{},\"trace\":{},\"images\":[{}]}}\n"
+            "\"stack_floor\":{},\"bounds\":{},\"trace\":{},\"trace_loops\":{},\"images\":[{}]}}\n"
         ),
         res.entry,
         res.sp,
@@ -127,6 +127,7 @@ fn place(
         res.map.stack_floor,
         if cfg.bounds_check { 1 } else { 0 },
         if cfg.trace { 1 } else { 0 },
+        if cfg.trace_loops { 1 } else { 0 },
         images.join(",")
     );
     Ok(Placed { interp_entry: interp.as_ref().map(|i| i.entry), output: res, meta })
@@ -165,6 +166,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut bounds_check = true;
             let mut allow_undefined = false;
             let mut trace = false;
+            let mut trace_loops = false;
             let mut mem_pages = emit::DEFAULT_MEM_PAGES;
             let mut argv: Vec<Vec<u8>> = Vec::new();
             let mut envp: Vec<Vec<u8>> = Vec::new();
@@ -182,6 +184,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     i += 1;
                 } else if a == "--trace" {
                     trace = true;
+                    i += 1;
+                } else if a == "--trace-loops" {
+                    trace_loops = true;
                     i += 1;
                 } else if a == "--allow-undefined" {
                     allow_undefined = true;
@@ -214,7 +219,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
             }
             let out_path = out.ok_or("missing -o <out.wasm>")?;
-            let cfg = emit::Config { bounds_check, trace, mem_pages, allow_undefined };
+            let cfg = emit::Config { bounds_check, trace, trace_loops, mem_pages, allow_undefined };
             let started = std::time::Instant::now();
             let placed = place(path, &cfg, &argv, &envp, &rootfs, interp_path.as_deref(), interp_base)?;
             let elapsed = started.elapsed();
@@ -251,6 +256,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut cfg = emit::Config {
                 bounds_check: true,
                 trace: false,
+                trace_loops: false,
                 mem_pages: emit::DEFAULT_MEM_PAGES,
                 allow_undefined: true,
             };
@@ -275,6 +281,8 @@ fn run(args: &[String]) -> Result<(), String> {
                                 cfg.bounds_check = v == "check";
                             } else if let Some(v) = a.strip_prefix("trace=") {
                                 cfg.trace = v == "1";
+                            } else if let Some(v) = a.strip_prefix("trace-loops=") {
+                                cfg.trace_loops = v == "1";
                             } else if let Some(v) = a.strip_prefix("mem-pages=") {
                                 cfg.mem_pages = v.parse().map_err(|_| format!("bad page count {v}"))?;
                             } else if let Some(v) = a.strip_prefix("rootfs=") {
@@ -394,6 +402,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let cfg = emit::Config {
                 bounds_check: true,
                 trace: false,
+                trace_loops: false,
                 mem_pages: emit::DEFAULT_MEM_PAGES,
                 allow_undefined: true,
             };
