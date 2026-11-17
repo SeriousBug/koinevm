@@ -577,6 +577,12 @@ fn decode_loadstore(w: u32, sf: bool, rd: u32, rn: u32) -> Insn {
             } else {
                 return Insn::Undefined;
             };
+            // A prefetch is a hint: it has no architectural effect, and there is nothing for the
+            // translation to do with it. Compilers emit it in front of the copy loops a hash
+            // library walks, so leaving it undecoded stops real code.
+            if size == 3 && opc == 2 {
+                return Insn::Hint;
+            }
             // opc/size combinations that are prefetch or unallocated
             if (size == 3 && opc != 0 && opc != 1) || (size == 2 && opc == 3) || (size == 0 && opc == 3 && false) {
                 return Insn::Undefined;
@@ -612,8 +618,12 @@ fn decode_loadstore(w: u32, sf: bool, rd: u32, rn: u32) -> Insn {
         0b011 => {
             let v = (w >> 26) & 1;
             let opc = (w >> 30) & 3;
-            if v != 0 || opc > 1 {
+            // opc 2 is `prfm` of a literal address, the hint form again.
+            if v != 0 || opc > 2 {
                 return Insn::Undefined;
+            }
+            if opc == 2 {
+                return Insn::Hint;
             }
             let imm19 = (w >> 5) & 0x7ffff;
             Insn::Literal { sf: opc == 1, offset: sx(imm19, 19) << 2, rt: rd }

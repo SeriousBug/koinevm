@@ -194,12 +194,13 @@ fn narrows_to_low_half(i: &Insn) -> bool {
         | Insn::VecThreeSame { q, .. }
         | Insn::VecTwoMisc { q, .. }
         | Insn::VecAcross { q, .. }
-        | Insn::VecThreeDiff { q, .. }
         | Insn::VecModImm { q, .. }
         | Insn::VecPermute { q, .. }
         | Insn::VecExt { q, .. }
         | Insn::VecTbl { q, .. } => !q,
-        // sshll and ushll widen into the whole destination even with the q bit clear.
+        // The long multiplies write the whole destination even with the q bit clear, and so do
+        // sshll and ushll: q picks which half of the sources widen, not how much is written.
+        Insn::VecThreeDiff { q, op, .. } => !q && op & 0b10011 != 0b10000,
         Insn::VecShiftImm { q, op, .. } => !q && op != 0b10100,
         _ => false,
     }
@@ -4199,6 +4200,43 @@ impl<'a> RegionEmitter<'a> {
                 }
             }
             Insn::VecThreeDiff { q, u, size, op, rn, rm, rd } => {
+                // smlal/umlal and smlsl/umlsl, and the `2` forms: half-width lanes multiply into
+                // full-width ones and accumulate. The q bit takes the high half of each source, the
+                // way the `2` suffix says, and opcode bit 2 subtracts instead of adding. The
+                // destination is the whole register in every one of them, whatever q says.
+                if op & 0b10011 == 0b10000 {
+                    let high = q;
+                    let sub = op & 0b00100 != 0;
+                    let (mul, acc) = match (size, high, u) {
+                        (1, false, false) => (simd::I32X4_EXTMUL_LOW_I16X8_S, simd::I32X4_ADD),
+                        (1, true, false) => (simd::I32X4_EXTMUL_HIGH_I16X8_S, simd::I32X4_ADD),
+                        (1, false, true) => (simd::I32X4_EXTMUL_LOW_I16X8_U, simd::I32X4_ADD),
+                        (1, true, true) => (simd::I32X4_EXTMUL_HIGH_I16X8_U, simd::I32X4_ADD),
+                        (2, false, false) => (simd::I64X2_EXTMUL_LOW_I32X4_S, simd::I64X2_ADD),
+                        (2, true, false) => (simd::I64X2_EXTMUL_HIGH_I32X4_S, simd::I64X2_ADD),
+                        (2, false, true) => (simd::I64X2_EXTMUL_LOW_I32X4_U, simd::I64X2_ADD),
+                        (2, true, true) => (simd::I64X2_EXTMUL_HIGH_I32X4_U, simd::I64X2_ADD),
+                        _ => {
+                            return self.refuse(format!(
+                                "long multiply of size {size} at 0x{addr:x}"
+                            ))
+                        }
+                    };
+                    let acc = match (sub, size) {
+                        (false, _) => acc,
+                        (true, 1) => simd::I32X4_SUB,
+                        (true, _) => simd::I64X2_SUB,
+                    };
+                    self.getv(rn);
+                    self.getv(rm);
+                    self.f.simd(mul);
+                    self.f.ls(L_V0);
+                    self.getv(rd);
+                    self.f.lg(L_V0);
+                    self.f.simd(acc);
+                    self.setv(rd);
+                    return Ok(());
+                }
                 match (u, op) {
                     (false, 0b01000) | (true, 0b01000) => {
                         // addhn / raddhn: add, take the high half of each lane.

@@ -139,6 +139,49 @@ __asm__(
     "  ret\n"
     ".size vselect, .-vselect\n");
 
+// The long multiplies a hash round is built from: half-width lanes multiply into full-width ones
+// and accumulate, over both halves of the sources and both signs.
+void vlong(const unsigned char *a, const unsigned char *b, const unsigned char *acc, unsigned char *out);
+__asm__(
+    ".text\n"
+    ".globl vlong\n"
+    ".type vlong, %function\n"
+    "vlong:\n"
+    "  ldr q2, [x2]\n"
+    "  ldr q0, [x0]\n"
+    "  ldr q1, [x1]\n"
+    "  umlal v2.2d, v0.2s, v1.2s\n"
+    "  str q2, [x3], #16\n"
+    "  ldr q2, [x2]\n"
+    "  smlal v2.2d, v0.2s, v1.2s\n"
+    "  str q2, [x3], #16\n"
+    "  ldr q2, [x2]\n"
+    "  umlsl v2.2d, v0.2s, v1.2s\n"
+    "  str q2, [x3], #16\n"
+    "  ldr q2, [x2]\n"
+    "  umlal2 v2.2d, v0.4s, v1.4s\n"
+    "  str q2, [x3], #16\n"
+    "  ldr q2, [x2]\n"
+    "  smlal2 v2.2d, v0.4s, v1.4s\n"
+    "  str q2, [x3], #16\n"
+    "  ldr q2, [x2]\n"
+    "  umlal v2.4s, v0.4h, v1.4h\n"
+    "  str q2, [x3], #16\n"
+    "  ldr q2, [x2]\n"
+    "  smlal v2.4s, v0.4h, v1.4h\n"
+    "  str q2, [x3], #16\n"
+    "  ldr q2, [x2]\n"
+    "  umlsl v2.4s, v0.4h, v1.4h\n"
+    "  str q2, [x3], #16\n"
+    "  ldr q2, [x2]\n"
+    "  umlal2 v2.4s, v0.8h, v1.8h\n"
+    "  str q2, [x3], #16\n"
+    "  ldr q2, [x2]\n"
+    "  smlal2 v2.4s, v0.8h, v1.8h\n"
+    "  str q2, [x3], #16\n"
+    "  ret\n"
+    ".size vlong, .-vlong\n");
+
 static void hex(const char *what, const unsigned char *p, int n) {
     printf("%s", what);
     for (int i = 0; i < n; i++) printf(" %02x", p[i]);
@@ -181,6 +224,17 @@ int main(void) {
     hex("bsl", bsl, 16);
     hex("bit", bit, 16);
     hex("bif", bif, 16);
+    // Values chosen so the signed and unsigned readings of every lane differ.
+    unsigned char a[16], b[16], acc[16], out[160];
+    for (int i = 0; i < 16; i++) {
+        a[i] = (unsigned char)(0xf0 + i * 3);
+        b[i] = (unsigned char)(0x11 * (i + 1));
+        acc[i] = (unsigned char)(i * 29 + 7);
+    }
+    vlong(a, b, acc, out);
+    const char *names[] = {"umlal2d", "smlal2d", "umlsl2d", "umlal2_2d", "smlal2_2d",
+                           "umlal4s", "smlal4s", "umlsl4s", "umlal2_4s", "smlal2_4s"};
+    for (int i = 0; i < 10; i++) hex(names[i], out + i * 16, 16);
     printf("vops: done\n");
     return 0;
 }
