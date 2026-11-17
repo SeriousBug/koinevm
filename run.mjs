@@ -49,9 +49,45 @@ const recent = [];
 // ARMJIT_TRACE_PRINT prints the state *before* each instruction, which is what the translator wrote
 // to the shadow: pc, packed NZCV and the registers named in ARMJIT_TRACE_REGS.
 const traceRegs = (process.env.ARMJIT_TRACE_REGS || "8").split(",").map(Number);
+// ARMJIT_WATCH_PC=0xADDR ARMJIT_WATCH_DUMP=0xADDR:LEN,... reads guest memory the first time that
+// instruction runs. It needs a module translated with --trace, which is what calls this.
+const watchPc = process.env.ARMJIT_WATCH_PC ? parseInt(process.env.ARMJIT_WATCH_PC, 16) : null;
+const watchRanges = (process.env.ARMJIT_WATCH_DUMP || "")
+  .split(",")
+  .filter(Boolean)
+  .map((s) => s.split(":").map((v) => parseInt(v, 16)));
+// ARMJIT_WATCH_MEM=0xADDR reports the instruction after which those eight bytes change, which is
+// the only way to find what wrote to a guest address.
+const watchMem = process.env.ARMJIT_WATCH_MEM ? parseInt(process.env.ARMJIT_WATCH_MEM, 16) : null;
+let watchedValue = null;
+let watched = null;
+function watchWrite(pc) {
+  const value = new DataView(memory.buffer).getBigUint64(watchMem, true);
+  if (watchedValue === null) watchedValue = value;
+  else if (value !== watchedValue) {
+    console.error(
+      `write 0x${watchMem.toString(16)}: 0x${watchedValue.toString(16)} -> 0x${value.toString(16)} at pc 0x${pc.toString(16)}`,
+    );
+    watchedValue = value;
+  }
+}
+function watch(pc) {
+  if (watchMem !== null) watchWrite(pc);
+  if (watchPc === null || watched !== null) return;
+  if (pc !== watchPc) return;
+  watched = pc;
+  const bytes = new Uint8Array(memory.buffer);
+  for (const [at, len] of watchRanges) {
+    const slice = bytes.subarray(at, at + len);
+    const hex = Buffer.from(slice).toString("hex");
+    const text = Buffer.from(slice).toString("latin1");
+    console.error(`watch 0x${at.toString(16)}: ${hex} ${JSON.stringify(text)}`);
+  }
+}
 function trace2(pc, sp) {
   recent.push([pc >>> 0, BigInt.asUintN(64, sp)]);
   if (recent.length > 64) recent.shift();
+  watch(pc >>> 0);
   if (!process.env.ARMJIT_TRACE_PRINT) return;
   const view = new DataView(memory.buffer);
   const regs = traceRegs.map((r) => `x${r}=0x${view.getBigUint64(r * 8, true).toString(16)}`);

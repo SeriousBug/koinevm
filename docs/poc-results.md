@@ -2,7 +2,9 @@
 
 What exists now: a translator that takes an AArch64 Linux ELF (static or dynamically linked, with its
 interpreter) and emits one wasm module, plus a host that provides the kernel: syscalls, a soft page
-table, a root filesystem. `node run.mjs out.wasm` runs the guest.
+table, a root filesystem. `node run.mjs out.wasm` runs the guest. The translator also stays alive for
+the length of the run, answering requests for the pages the guest jumps into as it jumps into them,
+so a library the loader maps while it runs executes without being known in advance.
 
 ## What it does
 
@@ -32,6 +34,12 @@ table, a root filesystem. `node run.mjs out.wasm` runs the guest.
   a soft page table of one byte per 4 KiB page, the dispatch table, images from 4 MiB, heap above
   the images, stack at the top. The translator fills in the page table for what it maps; `mmap` and
   `mprotect` will maintain the rest.
+- Translation on demand: `armjit page` reads `page <elf> <base> <address>` requests and answers with a
+  module that imports the host's memory and exports the regions it found, plus the block starts of
+  each. The host puts those functions in the running image's table, patches the dispatch table with
+  the same open-addressing probe the translator uses, and resumes: `run(entry, sp, resume)` reloads
+  the guest state the previous run stored in the shadow. Which pages run is only known while the guest
+  runs, so this is the only way a `libc.so.6` mapped by `ld.so` can be executed.
 - Syscall boundary shaped like a Linux ABI layer: number in x8, args in x0-x5, result or `-errno` in
   x0, unknown numbers answer `-ENOSYS` and say so once on stderr with `ARMJIT_SYSCALLS=1`. Memory:
   `brk`, `mmap` (anonymous and file-backed, `MAP_FIXED`), `munmap`, `mprotect`, with a free-span
@@ -52,12 +60,15 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `hello` | string setup, a loop, integer division by magic multiply, `umulh`, `strb`, exit code | exact |
 | `call` | recursion (`fib(20)`), a function pointer table called through `blr`, `stp`/`ldp` frames, signed division, printing | exact, exit 7 |
 | `flags` | `tst`/`ccmp` chains, `adcs`/`sbc` multi-word arithmetic, `csel`/`cset` over a matrix, `b.hi` | exact |
+| `simd` | 838 vector cases: load/store widths, three-same, two-misc, across, three-different, shifts by immediate, copy/permute/`tbl`/`tbx`/`ext`, and every conversion between general and FP registers | exact |
+| `bits` | `rbit`, `clz`, `cls`, `rev`, `rev32`, `rev16` over 76 patterns, and the `rbit; clz; lsr #2` sequence glibc finds a byte with | exact |
+| `stack` | frames sized at run time: `sub sp, sp, xN` in the shifted and extended forms, `and sp, xn, #-16`, `alloca` with calls while the frame is open, recursion with a buffer per level | exact |
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
-30/30 oracle cases pass: three guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Six more cases have no native oracle and assert the ABI themselves: the loader
+58 oracle cases pass: six guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
+checks on and off. Eight more cases have no native oracle and assert the ABI themselves: the loader
 handoff (`tests/dyn.sh`), the memory syscalls (`tests/mem.sh`) and the file syscalls
-(`tests/files.sh`), each in both address-check modes. `bash tests/run.sh` runs all 36.
+(`tests/files.sh`), each in both address-check modes. `bash tests/run.sh` runs all 66.
 
 ## Performance
 
@@ -91,39 +102,44 @@ Two things follow.
 
 ## What this does not prove, in order of how much it matters
 
-- **A loader run to the end.** Debian's own `ld-linux-aarch64.so.1` is translated with dash and
-  executes from `_dl_start` through the tunable scan, `/etc/ld.so.preload`, and the start of path
-  substitution, then stops at a function it reaches only through a computed value. A prompt, a
-  `libc.so.6` mapped at run time and a shell are all still missing.
-- **Code that appears at run time.** Translation is ahead-of-time over the images given to the
-  translator. `ld.so` maps `libc.so.6` while it runs, so the first call into it will stop with
-  "jumped to untranslated address". Making that work needs translation at run time and a resume
-  protocol, not a bigger AOT pass.
-- **Page permissions.** The page table records them and `mprotect` maintains them, but a translated
-  store does not consult them: a write to a read-only page lands instead of faulting.
-- **Self-modifying code and guest JITs.** Nothing invalidates a translation. Node-in-the-tab needs
-  page-granular invalidation, which the design allows for but does not implement.
-- **Signals.** A trap kills the run instead of being delivered to a guest handler.
-- **Threads, `fork`/`exec`, a real block device.** One process, one thread, and files come from a host
-  directory rather than a disk image.
-- **The kernel's own memory is guest-addressable.** Guest virtual addresses are linear-memory
-  offsets, so the shadow register file and the page table sit in low memory where a wild guest write
-  can reach them. A real kernel keeps them out of the address space entirely; here the map is
-  documented and the reserved ranges are the ones the guest must not be mapped at.
+- **A shell prompt.** Debian's own `ld-linux-aarch64.so.1` is translated with dash and runs from
+  `_dl_start` through the tunable scan, `/etc/ld.so.preload`, the library search path, the mapping of
+  `libc.so.6` (its segments at the addresses the loader chose, its relocations applied, its `relro`
+  protected) and into glibc's start-up: `set_tid_address`, `set_robust_list`, `rseq`, dash's `_init`,
+  then `main`. Along the way the guest reaches 52 pages of libc, each translated when it was first
+  jumped to. What stops it now is dash's own error path: dash reports an error and its `outfmt` never
+  reaches the `write` syscall, re-entering the error reporter until the guest stack runs out, with
+  `stderr` itself unreachable from the trace so far.
 - **Scalar floating point arithmetic.** The vector register file is translated and compared against
   the oracle case by case, as are the moves and conversions between the general and FP registers.
   `fadd`, `fmul`, `fdiv`, `fsqrt`, `fcmp`, `fcsel`, `fneg`/`fabs`/`fmax`/`fmin` and `fcvt` between
-  precisions are still refused at the instruction that reaches them.
+  precisions are refused at the instruction that reaches them, and glibc's own pages already report
+  them: `scalar floating point arithmetic is not translated yet` at `0x4004cec8`.
+- **Instruction coverage of a big library.** Threads of libc build (a page of `strlen` variants) that
+  are unreachable from the entries the translator finds report `undecoded instruction`, up to 116
+  words in one page. They are where the `-mgeneral-regs-only` gap and the crypto/atomics gap would
+  show up in real code rather than in a fixture.
+- **Page permissions.** The page table records them and `mprotect` maintains them, but a translated
+  store does not consult them: a write to a read-only page lands instead of faulting.
+- **Self-modifying code and guest JITs.** Nothing invalidates a translation. Adding a page module is
+  already dynamic, so invalidation has somewhere to live, but it is not implemented.
+- **Signals.** A trap kills the run instead of being delivered to a guest handler.
+- **Threads, `fork`/`exec`, a real block device.** One process, one thread, and files come from a host
+  directory rather than a disk image. `wait4`, `execve`, `clone` and `getdents64` are not there, so a
+  shell would have nothing to run and nothing to list.
+- **The kernel's own memory is guest-addressable.** Guest virtual addresses are linear-memory
+  offsets, so the shadow register file and the page table sit in low memory where a wild guest write
+  can reach them, and a relocation written with a zero bias would land there silently instead of
+  faulting. A real kernel keeps them out of the address space entirely.
 - **Instruction coverage is compiler output, not the ISA.** Hand-written or obfuscated code that uses
-  `rmif`, `setf*`, `ldraa`, pointer authentication, `mrs` of anything else, exclusive/atomic
-  accesses, or `SVE` is refused rather than mistranslated. That is the right failure mode but it is
-  not coverage.
-- **Untranslated indirect targets.** Translation is ahead of time over the whole executable range
-  plus symbols, call targets, code addresses that `adrp` + `add` spells out, and code addresses an
-  image stores in its data. Those last two are heuristics: ld.so builds and stores addresses in ways
-  the scan does not see, and each miss is reported rather than translated. Enumerating function
-  entries from `.eh_frame`, and a translate-on-demand tier that spills the registers, translates the
-  page that faulted and resumes, are both still missing.
+  `rmif`, `setf*`, `ldraa`, pointer authentication, `mrs` of anything else, the LSE atomics, or `SVE`
+  is refused rather than mistranslated. That is the right failure mode but it is not coverage.
+- **Untranslated indirect targets.** A jump into an image is translated on demand now, so an entry
+  the ahead-of-time scan misses costs a page translation instead of stopping the run. The ahead-of-time
+  pass still decides what a region is, so a wrong guess about where code starts costs a page: the
+  region is emitted as a trap and its later blocks are left out, which is what turns a bad entry into
+  a run-time translation of the address that is really there.
 - **No optimisation tier.** Flags are always materialised, direct calls always go through the
   dispatcher, blocks are never linked or inlined, no branch hints. The IR exists to make those
-  passes additive.
+  passes additive, and a page translated on demand is emitted by the same code as an ahead-of-time
+  region, so nothing here is a special case.

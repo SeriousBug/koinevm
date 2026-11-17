@@ -128,8 +128,6 @@ export class AddressSpace {
     len = roundUp(len, PAGE);
     if (len <= 0) return -EINVAL;
     const at = this.reserve(len, addr, flags & MAP.FIXED);
-    if (process.env.ARMJIT_TRACE_SYSCALLS)
-      console.error(`  reserve(0x${addr.toString(16)}, 0x${len.toString(16)}, fixed=${flags & MAP.FIXED}) -> ${at}`);
     if (at < 0) return at;
     const view = this.bytes(at, len);
     view.fill(0);
