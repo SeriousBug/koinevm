@@ -9,6 +9,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 rootfs=${ARMJIT_ROOTFS:-rootfs/debian}
+# The environment a Debian program expects to find. A process started by a shell inherits one, and
+# a package manager checks for `PATH` before it does anything.
+env=${ARMJIT_ENV:-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,HOME=/root}
 prog=$1
 shift
 
@@ -16,13 +19,13 @@ shift
 argv=$prog
 for a in "$@"; do argv="$argv,$a"; done
 
-key=$(printf '%s_' "$prog" "$@" | tr -c 'A-Za-z0-9_.-' '_')${ARMJIT_TRACE:+_trace}${ARMJIT_TRACE_LOOPS:+_loops}
+key=$(printf '%s_' "$prog" "$@" "$env" | tr -c 'A-Za-z0-9_.-' '_')${ARMJIT_TRACE:+_trace}${ARMJIT_TRACE_LOOPS:+_loops}
 wasm="target/tmp/rootfs_$key.wasm"
 mkdir -p target/tmp
 
 if [[ ! -f $wasm || -n ${ARMJIT_RETRANSLATE:-} ]]; then
     if ! ./target/release/armjit translate "$rootfs$prog" -o "$wasm" --rootfs="$rootfs" \
-            --argv="$argv" ${ARMJIT_TRACE:+--trace} ${ARMJIT_TRACE_LOOPS:+--trace-loops} \
+            --argv="$argv" --env="$env" ${ARMJIT_TRACE:+--trace} ${ARMJIT_TRACE_LOOPS:+--trace-loops} \
             > "target/tmp/rootfs_$key.log" 2>&1; then
         echo "translate failed:" >&2
         tail -20 "target/tmp/rootfs_$key.log" >&2
