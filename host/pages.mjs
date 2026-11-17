@@ -116,54 +116,42 @@ export class Mach {
     return inst;
   }
 
-  /// What the dispatch table says about a pc, for checking an insert against the answer.
-  lookup(pc) {
+  /// Where a pc's entry is, or the empty slot it would take: open addressing with linear probing,
+  /// the same probe the translator uses to build the table. The probe is bounded by the table, so a
+  /// table with no room left reports itself instead of searching for an empty slot forever.
+  probe(pc) {
     const key = pc >>> 2;
     const want = key + 1;
     const mask = this.meta.table_mask >>> 0;
     let at = (key & mask) >>> 0;
-    for (;;) {
+    for (let n = 0; n <= mask; n++) {
       const addr = this.meta.table_base + at * TABLE_SLOT;
       const tag = this.view.getUint32(addr + 4, true);
-      if (tag === want) return this.view.getUint32(addr, true);
-      if (tag === 0) return 0;
+      if (tag === want || tag === 0) return { addr, tag, want };
       at = (at + 1) & mask;
     }
+    throw new Error(`no room in the dispatch table for 0x${pc.toString(16)}`);
   }
 
-  /// Open-addressing insert, the same probe the translator uses to build the table.
+  /// What the dispatch table says about a pc, for checking an insert against the answer.
+  lookup(pc) {
+    const { addr, tag, want } = this.probe(pc);
+    return tag === want ? this.view.getUint32(addr, true) : 0;
+  }
+
   dispatch(pc, slot, block) {
-    const key = pc >>> 2;
-    const want = key + 1;
-    const mask = this.meta.table_mask >>> 0;
-    let at = (key & mask) >>> 0;
-    for (;;) {
-      const addr = this.meta.table_base + at * TABLE_SLOT;
-      const tag = this.view.getUint32(addr + 4, true);
-      if (tag === want) return; // another page already claimed this address
-      if (tag === 0) {
-        this.view.setUint32(addr, ((slot + 1) | (block << 16)) >>> 0, true);
-        this.view.setUint32(addr + 4, want, true);
-        if (process.env.ARMJIT_DISPATCH_PC && pc === Number(process.env.ARMJIT_DISPATCH_PC)) {
-          console.error(`dispatch 0x${pc.toString(16)} -> slot 0x${slot.toString(16)} block ${block}`);
-        }
-        return;
-      }
-      at = (at + 1) & mask;
+    const { addr, tag, want } = this.probe(pc);
+    if (tag === want) return; // another page already claimed this address
+    this.view.setUint32(addr, ((slot + 1) | (block << 16)) >>> 0, true);
+    this.view.setUint32(addr + 4, want, true);
+    if (process.env.ARMJIT_DISPATCH_PC && pc === Number(process.env.ARMJIT_DISPATCH_PC)) {
+      console.error(`dispatch 0x${pc.toString(16)} -> slot 0x${slot.toString(16)} block ${block}`);
     }
   }
 
   hasDispatch(pc) {
-    const key = pc >>> 2;
-    const want = key + 1;
-    const mask = this.meta.table_mask >>> 0;
-    let at = (key & mask) >>> 0;
-    for (;;) {
-      const tag = this.view.getUint32(this.meta.table_base + at * TABLE_SLOT + 4, true);
-      if (tag === want) return true;
-      if (tag === 0) return false;
-      at = (at + 1) & mask;
-    }
+    const { tag, want } = this.probe(pc);
+    return tag === want;
   }
 
   growTo(want) {
@@ -172,10 +160,12 @@ export class Mach {
   }
 
   async translateAndResume(pc) {
+    const T = [performance.now()];
     const image = this.kernel.space.imageOf(pc);
     if (!image) throw new Error(`nothing to translate 0x${pc.toString(16)} from`);
 
     const key = `${image.host}:${image.base}:${pc}`;
+    T.push(performance.now());
     let page = pageModules.get(key);
     if (!page) {
       const answer = await this.translator.page(image.host, image.base, pc);
@@ -202,6 +192,7 @@ export class Mach {
       }
     }
 
+    T.push(performance.now());
     // The slot a page's regions take is a property of the lineage, not of this run: the fork's
     // memory holds dispatch words that name them.
     let base = this.lineage.slotOf.get(key);
@@ -228,9 +219,14 @@ export class Mach {
         this.dispatch(region.blocks[b], base + i, b);
       }
     }
+    T.push(performance.now());
     if (!this.hasDispatch(pc)) {
       throw new Error(`translated 0x${pc.toString(16)} but no block starts there`);
     }
-    return this.instance.exports.run(0, 0n, 1);
+    const out = this.instance.exports.run(0, 0n, 1);
+    T.push(performance.now());
+    if (process.env.ARMJIT_TRACE_PAGES)
+      console.error(`  phases ${T.slice(1).map((t, i) => (t - T[i]).toFixed(1)).join(" ")} status ${out}`);
+    return out;
   }
 }

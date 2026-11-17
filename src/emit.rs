@@ -238,15 +238,16 @@ fn build_dispatch_table(regions: &[Region], failed: &[bool]) -> Result<(Vec<u8>,
         .zip(failed)
         .map(|(r, &bad)| if bad { 1 } else { r.blocks.len() })
         .sum();
-    let mut slots = 64u64;
-    while slots < blocks as u64 * 4 {
-        slots *= 2;
-    }
-    if slots > TABLE_MAX_SLOTS {
+    // How many slots a run needs is not known when the program is translated: the host translates a
+    // page of a library the first time the guest jumps into it, and every block of it takes a slot.
+    // A table sized to the initial image fills up part way through a package manager and the insert
+    // that cannot find an empty slot has nowhere to go, so the arena is always the whole of it.
+    if blocks as u64 * 2 > TABLE_MAX_SLOTS {
         return Err(format!(
-            "{blocks} blocks needs {slots} dispatch slots, more than the arena holds"
+            "{blocks} blocks needs more than the {TABLE_MAX_SLOTS} dispatch slots the arena holds"
         ));
     }
+    let slots = TABLE_MAX_SLOTS;
     let mask = (slots - 1) as u32;
     let mut table = vec![0u8; (slots * TABLE_SLOT) as usize];
     for (region_idx, region) in regions.iter().enumerate() {
