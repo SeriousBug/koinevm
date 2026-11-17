@@ -65,8 +65,22 @@ function trap(kind, addr, at) {
 }
 
 // The instruction history a module translated with --trace leaves in the host: the ring in memory
-// records dispatched blocks, and a wrong value needs the instructions that made it.
-const recent = [];
+// records dispatched blocks, and a wrong value needs the instructions that made it. A ring rather
+// than a growing array, because removing the oldest entry of a million-element array copies it,
+// and that costs a memmove per instruction.
+const recent = new Int32Array(1 << 20);
+const recentMask = recent.length - 1;
+let recentLen = 0;
+function recentAdd(pc) {
+  recent[recentLen++ & recentMask] = pc;
+}
+/** The last `n` pcs, oldest first. */
+function recentTail(n) {
+  const count = Math.min(recentLen, recent.length, n);
+  const out = new Array(count);
+  for (let k = 0; k < count; k++) out[k] = recent[(recentLen - count + k) & recentMask];
+  return out;
+}
 // ARMJIT_TRACE_PRINT prints the state *before* each instruction, which is what the translator wrote
 // to the shadow: pc, packed NZCV and the registers named in ARMJIT_TRACE_REGS.
 const traceRegs = (process.env.ARMJIT_TRACE_REGS || "8").split(",").map(Number);
@@ -175,7 +189,7 @@ const ARM_RING = Number(process.env.ARMJIT_LAST || 24);
 // Where the time went in the last `n` instructions, which is how a loop this large shows itself.
 function hot(n) {
   const counts = new Map();
-  for (const pc of recent.slice(-n)) counts.set(pc, (counts.get(pc) ?? 0) + 1);
+  for (const pc of recentTail(n)) counts.set(pc, (counts.get(pc) ?? 0) + 1);
   return [...counts]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 6)
@@ -217,7 +231,7 @@ function report(pc) {
   console.error(state());
   console.error(backtrace());
   console.error(`  ring ${ring(40).map(where).join(" -> ")}`);
-  console.error(`  last ${recent.slice(-ARM_RING).map(where).join(" -> ")}`);
+  console.error(`  last ${recentTail(ARM_RING).map(where).join(" -> ")}`);
 }
 // ARMJIT_HEARTBEAT=SECONDS reports where the guest is every so often, and ARMJIT_SPIN=N where one
 // instruction has run N times in the last few thousand. Both exist because the wasm call does not
@@ -230,22 +244,22 @@ let ticks = 0;
 const spins = new Map();
 function trace2(pc, sp) {
   const at = pc >>> 0;
-  recent.push(at);
-  if (recent.length > 1 << 20) recent.shift();
+  recentAdd(at);
   if (spin) {
     spins.set(at, (spins.get(at) ?? 0) + 1);
-    if (recent.length > 4096) {
-      const old = recent[recent.length - 4097];
+    if (recentLen > 4096) {
+      const old = recent[(recentLen - 4097) & recentMask];
       spins.set(old, spins.get(old) - 1);
     }
     const n = spins.get(at);
     if (n > spin) {
+      const window = Math.min(recentLen, recent.length);
       throw new Error(
-        `spin: ${where(at)} ran ${n} times in ${recent.length} instructions\n` +
+        `spin: ${where(at)} ran ${n} times in ${window} instructions\n` +
           state() +
           "\n" + backtrace() +
           memory_dump() +
-          `\n  trail ${recent.slice(-32).map(where).join(" -> ")}`,
+          `\n  trail ${recentTail(32).map(where).join(" -> ")}`,
       );
     }
   }
@@ -253,7 +267,7 @@ function trace2(pc, sp) {
     beat = Date.now();
     console.error(
       `heartbeat ${((beat - startedAt) / 1000).toFixed(0)}s at ${where(at)}` +
-        `\n  trail ${recent.slice(-16).map(where).join(" -> ")}` +
+        `\n  trail ${recentTail(16).map(where).join(" -> ")}` +
         "\n" + backtrace() +
         "\n  hot " + hot(4096),
     );

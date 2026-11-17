@@ -24,7 +24,7 @@ for g in $GUESTS; do
                 --argv=./tests/guest/${g}_dyn.elf > "$work/translate.log" 2>&1; then
             echo "FAIL $g bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
         fi
-        ARMJIT_ROOTFS=$rootfs node run.mjs "$wasm" > "$work/out" 2> "$work/err"
+        ARMJIT_ROOTFS=$rootfs timeout "${GUEST_TIMEOUT:-300}" node run.mjs "$wasm" > "$work/out" 2> "$work/err"
         code=$?
         if ! diff -q "tests/guest/$g.expected" "$work/out" > /dev/null; then
             echo "FAIL $g bounds=$mode, output:"
