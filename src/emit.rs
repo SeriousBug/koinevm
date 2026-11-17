@@ -2782,7 +2782,9 @@ impl<'a> RegionEmitter<'a> {
                 self.f.op(I64_AND);
                 self.f.ls(L_T0);
                 if opc == 0 && len < w {
-                    let sh = w - len;
+                    // The extension fills the whole register, so the shift is the register's width:
+                    // a 32-bit `sxtb w` still has to reach bit 63 for its result to be negative.
+                    let sh = 64 - len;
                     self.f.lg(L_T0);
                     self.f.i64c(sh as i64);
                     self.f.op(I64_SHL);
@@ -3178,26 +3180,31 @@ impl<'a> RegionEmitter<'a> {
                 if rd == 31 {
                     return Ok(());
                 }
+
                 self.push_cond(cond);
                 self.f.op(IF);
                 self.f.body.push(if sf { I64 } else { I32 });
                 self.get(rn, sf);
                 self.f.op(ELSE);
-                self.get(rm, sf);
                 match op2 {
                     1 => {
+                        // csinc adds one, which only looks like an or for an even operand.
+                        self.get(rm, sf);
                         self.push_imm(1, sf);
-                        self.f.op(if sf { I64_OR } else { I32_OR });
+                        self.f.op(if sf { I64_ADD } else { I32_ADD });
                     }
                     2 => {
+                        self.get(rm, sf);
                         self.push_imm(self.width_mask(sf) as u64, sf);
                         self.f.op(if sf { I64_XOR } else { I32_XOR });
                     }
                     3 => {
+                        // csneg is zero minus the operand, so the zero goes on the stack first.
                         self.push_imm(0, sf);
+                        self.get(rm, sf);
                         self.f.op(if sf { I64_SUB } else { I32_SUB });
                     }
-                    _ => {}
+                    _ => self.get(rm, sf),
                 }
                 self.f.end();
                 self.set(rd, sf);

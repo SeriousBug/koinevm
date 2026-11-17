@@ -93,6 +93,35 @@ static unsigned long cond_matrix(unsigned long a, unsigned long b) {
 static int signed_lt(long a, long b) { return a < b; }
 static int unsigned_lt(unsigned long a, unsigned long b) { return a < b; }
 
+/* The conditional select family. csinc adds one to its else operand and csinv inverts it, both of
+ * which a mask gets wrong in a way that only shows up on an odd operand, which is why the inputs
+ * here are as odd as they come. */
+static unsigned long sel_family(unsigned long a, unsigned long b) {
+    unsigned long inc, inv, neg, sel;
+    __asm__ volatile("cmp %4, %5\n"
+                     " csinc %0, %4, %5, eq\n"
+                     " csinv %1, %4, %5, ne\n"
+                     " csneg %2, %4, %5, lt\n"
+                     " csel %3, %4, %5, hi"
+                     : "=&r"(inc), "=&r"(inv), "=&r"(neg), "=&r"(sel)
+                     : "r"(a), "r"(b)
+                     : "cc");
+    return (inc ^ inv) + (neg ^ sel);
+}
+
+static unsigned long sel_family_w(unsigned long a, unsigned long b) {
+    unsigned int inc, inv, neg, sel;
+    __asm__ volatile("cmp %w4, %w5\n"
+                     " csinc %w0, %w4, %w5, eq\n"
+                     " csinv %w1, %w4, %w5, ne\n"
+                     " csneg %w2, %w4, %w5, lt\n"
+                     " csel %w3, %w4, %w5, hi"
+                     : "=&r"(inc), "=&r"(inv), "=&r"(neg), "=&r"(sel)
+                     : "r"(a), "r"(b)
+                     : "cc");
+    return (unsigned long)(inc ^ inv) + (unsigned long)(neg ^ sel);
+}
+
 // b.cond over the carry and overflow flags directly.
 static unsigned long classify(unsigned long a, unsigned long b) {
     unsigned long r = 0;
@@ -114,6 +143,8 @@ __attribute__((used)) void GUEST_ENTRY(void) {
         put_hex((unsigned long)signed_lt((long)v, (long)inputs[(i + 1) % N]));
         put_hex((unsigned long)unsigned_lt(v, inputs[(i + 1) % N]));
         put_hex(cond_matrix(v, inputs[(i + 1) % N]));
+        put_hex(sel_family(v, inputs[(i + 1) % N]));
+        put_hex(sel_family_w(v, inputs[(i + 1) % N]));
 
         volatile unsigned long a_lo = v;
         volatile unsigned long b_lo = inputs[(i + 3) % N];

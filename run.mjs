@@ -59,7 +59,7 @@ const recent = [];
 // ARMJIT_TRACE_PRINT prints the state *before* each instruction, which is what the translator wrote
 // to the shadow: pc, packed NZCV and the registers named in ARMJIT_TRACE_REGS.
 const traceRegs = (process.env.ARMJIT_TRACE_REGS || "8").split(",").map(Number);
-// ARMJIT_WATCH_PC=0xADDR[:SKIP],... ARMJIT_WATCH_DUMP=0xADDR:LEN,... reads guest memory the time
+// ARMJIT_WATCH_PC=0xADDR[:SKIP],... ARMJIT_WATCH_DUMP=0xADDR:LEN,... or xN+0xNN:LEN reads guest memory the time
 // that instruction runs, once the first SKIP hits have gone by. Each hit also reports the call chain
 // the frame pointers describe, because the caller is what says which call this is.
 const watches = (process.env.ARMJIT_WATCH_PC || "")
@@ -69,13 +69,25 @@ const watches = (process.env.ARMJIT_WATCH_PC || "")
     const [at, skip] = s.split(":");
     return { pc: parseInt(at, 16), skip: skip ? parseInt(skip, 10) : 0, hits: 0 };
   });
+// A dump address is absolute, `sp+0xNN`, or a register plus an offset, because the frame a value
+// lives in is only known once the run is there.
 const watchRanges = (process.env.ARMJIT_WATCH_DUMP || "")
   .split(",")
   .filter(Boolean)
   .map((s) => {
     const [at, len] = s.split(":");
-    return [at.startsWith("sp+") ? -parseInt(at.slice(3), 16) : parseInt(at, 16), parseInt(len, 16)];
+    const m = /^(sp|x(\d+))(?:(\+|-)(0x[0-9a-f]+))?$/.exec(at);
+    const range = m
+      ? { reg: m[1] === "sp" ? -1 : Number(m[2]), off: m[4] ? (m[3] === "-" ? -1 : 1) * parseInt(m[4], 16) : 0 }
+      : { reg: null, at: parseInt(at, 16), off: 0 };
+    return { ...range, len: parseInt(len, 16) };
   });
+
+function dumpAddress({ reg, at, off }) {
+  const view = new DataView(memory.buffer);
+  if (reg === null) return at + off;
+  return Number(view.getBigUint64((reg < 0 ? 0xf8 : reg * 8), true)) + off;
+}
 // ARMJIT_WATCH_MEM=0xADDR reports the instruction after which those eight bytes change, which is
 // the only way to find what wrote to a guest address.
 const watchMem = process.env.ARMJIT_WATCH_MEM ? parseInt(process.env.ARMJIT_WATCH_MEM, 16) : null;
@@ -165,9 +177,9 @@ function memory_dump() {
   const view = new DataView(memory.buffer);
   const bytes = new Uint8Array(memory.buffer);
   let out = "";
-  for (const [at, len] of watchRanges) {
-    const from = at < 0 ? Number(view.getBigUint64(0xf8, true)) + -at : at;
-    const slice = bytes.subarray(from, from + len);
+  for (const range of watchRanges) {
+    const from = dumpAddress(range);
+    const slice = bytes.subarray(from, from + range.len);
     out += `\n  mem 0x${from.toString(16)}: ${Buffer.from(slice).toString("hex")} ${JSON.stringify(Buffer.from(slice).toString("latin1"))}`;
   }
   return out;
@@ -184,10 +196,9 @@ function report(pc) {
     const text = cstr(Number(args[i]));
     if (text !== null) console.error(`  x${i} -> ${text}`);
   }
-  for (const [at, len] of watchRanges) {
-    // `sp+0xNN:len` reads a frame slot, whose address is only known once the run is at it.
-    const from = at < 0 ? Number(view.getBigUint64(0xf8, true)) + -at : at;
-    const slice = bytes.subarray(from, from + len);
+  for (const range of watchRanges) {
+    const from = dumpAddress(range);
+    const slice = bytes.subarray(from, from + range.len);
     const hex = Buffer.from(slice).toString("hex");
     const text = Buffer.from(slice).toString("latin1");
     console.error(`  mem 0x${from.toString(16)}: ${hex} ${JSON.stringify(text)}`);
@@ -254,7 +265,8 @@ function syscall(nr, a0, a1, a2, a3, a4, a5) {
   if (process.env.ARMJIT_TRACE_SYSCALLS) {
     const view = new DataView(memory.buffer);
     const pc = view.getInt32(0xf8 + 16, true) >>> 0;
-    console.error(`from 0x${pc.toString(16)}`);
+    const args = [a0, a1, a2, a3, a4, a5].map((v) => `0x${BigInt(v).toString(16)}`).join(" ");
+    console.error(`syscall ${nr} from 0x${pc.toString(16)}: ${args}`);
   }
   return kernel.call(nr, a0, a1, a2, a3, a4, a5);
 }

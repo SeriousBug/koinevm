@@ -76,7 +76,17 @@ static const unsigned long pat[] = {
     X(bfi_8_4, "bfi #8 #4", "mov %0, %1\n bfi %0, %1, #8, #4")                                \
     X(bfxil_4_6, "bfxil #4 #6", "mov %0, %1\n bfxil %0, %1, #4, #6")                          \
     X(bfc_3_2, "bfc #3 #2", "mov %0, %1\n bfc %0, #3, #2")                                    \
-    X(bfc_50_5, "bfc #50 #5", "mov %0, %1\n bfc %0, #50, #5")
+    X(bfc_50_5, "bfc #50 #5", "mov %0, %1\n bfc %0, #50, #5")                                 \
+    /* The 32-bit register forms: a compiler emits `sxtb w` for every `(signed char)` cast, and a
+     * sign extension that only reaches 32 bits has to fill the top half of the result with it. */ \
+    X(sxtb_w, "sxtb w", "sxtb %w0, %w1")                                                      \
+    X(sxth_w, "sxth w", "sxth %w0, %w1")                                                      \
+    X(uxtb_w, "uxtb w", "uxtb %w0, %w1")                                                      \
+    X(uxth_w, "uxth w", "uxth %w0, %w1")                                                      \
+    X(sbfx_w_3_7, "sbfx w #3 #7", "sbfx %w0, %w1, #3, #7")                                    \
+    X(ubfx_w_0_8, "ubfx w #0 #8", "ubfx %w0, %w1, #0, #8")                                    \
+    X(sbfiz_w_5_6, "sbfiz w #5 #6", "sbfiz %w0, %w1, #5, #6")                                 \
+    X(bfi_w_8_4, "bfi w #8 #4", "mov %w0, %w1\n bfi %w0, %w1, #8, #4")
 
 #define DEF(name, tag, body)                                                                  \
     __attribute__((noinline)) static unsigned long b_##name(unsigned long v) {                \
