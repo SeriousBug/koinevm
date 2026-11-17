@@ -13,7 +13,7 @@
 
 import fs from "node:fs";
 import { Kernel, ECHILD } from "./syscall.mjs";
-import { WOULD_BLOCK } from "./files.mjs";
+import { WOULD_BLOCK, ENOENT, EACCES } from "./files.mjs";
 import { Mach } from "./pages.mjs";
 
 const SHADOW = 0x0;
@@ -249,7 +249,17 @@ export class Session {
     if (typeof host === "number") return this.resume(proc, host);
     let answer;
     try {
-      fs.accessSync(host, fs.constants.R_OK);
+      const st = fs.statSync(host);
+      // A directory and a file without the execute bit are both EACCES, and a path that is not
+      // there is ENOENT: `execvp` walks PATH on ENOENT and EACCES, and runs the file through a
+      // shell on ENOEXEC, so answering the wrong one turns a missing program into a shell script.
+      if (!st.isFile()) return this.resume(proc, -EACCES);
+      fs.accessSync(host, fs.constants.X_OK);
+    } catch (e) {
+      if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${path}: ${e.code}`);
+      return this.resume(proc, -(e.code === "ENOENT" ? ENOENT : EACCES));
+    }
+    try {
       answer = await this.translator.image(host, request.argv, request.envp);
     } catch (e) {
       if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${path}: ${e.message}`);
