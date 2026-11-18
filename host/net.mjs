@@ -339,21 +339,43 @@ class Datagram {
   /// are what `getsockname` reports to a caller that connects to learn which interface it would
   /// leave by.
   connect(addr) {
+    const again = this.peer !== null;
     this.peer = addr;
     trace(`${this.id} peer ${addr.ip}:${addr.port}`);
     // The address the host's resolver answers is answered here, so nothing on the host's side ever
     // sees it, and asking the host to connect to an address it cannot route would only add an
     // error a guest could read.
     if (this.net.resolver?.handles(addr.ip)) return 0;
-    this.connecting = this.host()
-      .connect(addr.ip, addr.port)
+    this.connecting = (again ? this.replace() : Promise.resolve(0))
+      .then(() => this.host().connect(addr.ip, addr.port))
       .then((errno) => {
         this.connecting = null;
-        if (errno) this.error = -errno;
+        // The answer is the one the guest's `connect` returns: a program that sorts addresses
+        // decides what it can reach by whether this call succeeded, not by what arrives later.
+        if (errno) {
+          this.error = -errno;
+          this.peer = null;
+        }
         this.net.notify();
         return errno;
       });
-    return 0;
+    return this.connecting;
+  }
+
+  waitConnected() {
+    return this.connecting ?? Promise.resolve(0);
+  }
+
+  /// A second connect replaces the peer, and the host's socket is connected for good once it has
+  /// been: the replacement is a new socket, on the local address the guest had chosen where it had
+  /// chosen one, which is the part of the old socket a program can see.
+  replace() {
+    const bound = this.bound;
+    this.handle?.close();
+    this.handle = null;
+    this.sent = false;
+    this.bound = null;
+    return bound ? this.host().bind(bound.ip, bound.port) : Promise.resolve(0);
   }
 
   /// A connect to no address at all, which is how a datagram socket forgets its peer.

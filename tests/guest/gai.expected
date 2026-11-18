@@ -1,0 +1,10 @@
+ok   getaddrinfo of a name with both families answers
+ok   the answer has both a v4 and a v6 address
+ok   every answer is the address length its family says
+ok   every answer carries the port it was asked for
+ok   socket(AF_INET6, SOCK_DGRAM)
+ok   a v6 socket connects to the mapped form of a v4 address
+ok   getsockname after that connect
+ok   the address it reports is the socket's own family
+ok   and the source address of a v4 peer is the mapped form
+afamily: all checks passed
