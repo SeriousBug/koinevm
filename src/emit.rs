@@ -77,23 +77,26 @@ pub const ENGINE_HI: u64 = 0x1000;
 //
 //   0x00000000  control block: register shadow, trace ring
 //   0x00001000  soft page table, one byte per 4 KiB page (1 MiB, covers 4 GiB)
-//   0x00101000  dispatch table arena (8 MiB: twice what the largest image may need)
-//   0x01000000  images: non-PIE ET_EXEC link here, PIE and shared objects are placed here
+//   0x00400000  images: non-PIE ET_EXEC link here, PIE and shared objects are placed here
+//   0x20000000  dispatch table arena (16 MiB: two slots for every block an image may hold)
 //   ...         heap grows up from the end of the images, mmap areas grow down from the stack
 //   mem_size - stack reserve - 4 KiB   stack, growing down
 /// One PTE byte per 4 KiB page.
 pub const PTE_BASE: u64 = ENGINE_HI;
 pub const PTE_PAGES: u64 = 1 << 20;
-pub const TABLE_BASE: u64 = PTE_BASE + PTE_PAGES;
+/// Halfway up the address space, in the gap between the loader and the arena `mmap` fills: the
+/// table is twice the size of the largest image, and where the images go is the toolchain's to
+/// choose, so the two cannot share a corner of the map.
+pub const TABLE_BASE: u64 = 0x2000_0000;
 /// A dispatch slot is `[u32 payload][u32 tag]`: payload 0 is empty, else `block << 16 | region + 1`,
 /// tag is `pc >> 2` plus one so it is never zero.
 pub const TABLE_SLOT: u64 = 8;
-pub const TABLE_MAX_SLOTS: u64 = 1 << 20;
+pub const TABLE_MAX_SLOTS: u64 = 1 << 21;
 /// Region slots in the wasm table: a dispatch word holds `slot + 1` in 16 bits.
 pub const TABLE_SLOTS_MAX: u32 = 0xffff;
 /// PoC simplification against a real kernel's randomized layout: images start at fixed addresses.
 /// The program at 4 MiB, its dynamic loader well above the heap, `mmap` in between.
-pub const IMAGE_BASE: u64 = 0x100_0000;
+pub const IMAGE_BASE: u64 = 0x400000;
 pub const INTERP_BASE: u64 = 0x1000_0000;
 pub const MMAP_BASE: u64 = 0x4000_0000;
 
@@ -306,6 +309,10 @@ fn page_table(images: &[&Elf], stack_floor: u64, stack_top: u64) -> Vec<u8> {
 /// Data segments for the nonzero runs of `bytes`, so a mostly-empty page table costs its entries
 /// rather than its size: linear memory starts zeroed.
 fn push_sparse(m: &mut Module, base: u64, bytes: &[u8]) {
+    // A run reaches across a gap of zeros up to a page, so a segment is a page of an image rather
+    // than a run of instructions: an engine holds a hundred thousand data segments and a program of
+    // any size has more runs than that.
+    const GAP: usize = 4096;
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == 0 {
@@ -317,7 +324,7 @@ fn push_sparse(m: &mut Module, base: u64, bytes: &[u8]) {
         while i < bytes.len() {
             if bytes[i] != 0 {
                 last = i;
-            } else if i - last > 16 {
+            } else if i - last > GAP {
                 break;
             }
             i += 1;
@@ -664,7 +671,9 @@ pub fn translate(
             table_base: TABLE_BASE,
             table_mask,
             heap_base,
-            heap_limit: if images.interp.is_some() { INTERP_BASE } else { MMAP_BASE },
+            // The heap grows up from the images and stops at whichever fixed thing is above it:
+            // the loader when there is one, and never the dispatch arena.
+            heap_limit: if images.interp.is_some() { INTERP_BASE } else { MMAP_BASE.min(TABLE_BASE) },
             mmap_base: MMAP_BASE,
             stack_floor,
         },
@@ -1631,29 +1640,31 @@ fn high_half_mask(size: u32) -> [u8; 16] {
 fn modified_immediate(q: bool, op: bool, cmode: u32, imm8: u32) -> [u8; 16] {
     let bytes = if q { 16 } else { 8 }; // a Q register or a D one
     let mut out = [0u8; 16];
-    let (lane, shift) = match cmode {
-        0b0000 => (4, 0),
-        0b0010 => (4, 8),
-        0b0100 => (4, 16),
-        0b0110 => (4, 24),
-        0b1000 => (2, 0),
-        0b1010 => (2, 8),
-        0b1100 => (4, 8),
-        0b1101 => (4, 16),
-        0b1110 => (0, 0), // 8-bit lanes, or the 64-bit form when Q is clear
-        0b1111 => (0, 0),
-        _ => (1, 0),
+    let (lane, shift, low_ones) = match cmode {
+        0b0000 => (4, 0, false),
+        0b0010 => (4, 8, false),
+        0b0100 => (4, 16, false),
+        0b0110 => (4, 24, false),
+        0b1000 => (2, 0, false),
+        0b1010 => (2, 8, false),
+        0b1100 => (4, 8, true),  // the masked forms fill the bits under the immediate
+        0b1101 => (4, 16, true),
+        0b1110 => (1, 0, false), // 8-bit lanes, either 8 or 16 of them
+        _ => (1, 0, false),
     };
-    if lane == 0 && !q {
-        // 64-bit MOVI: each bit of imm8 becomes a byte of all ones or all zeros.
-        for i in 0..8 {
-            let set = (imm8 >> i) & 1 == 1;
-            out[i] = if set == op { 0xff } else { 0x00 };
+    // The bitmask form, which the assembler writes as `movi <Vd>.2d, #<imm64>`: each bit of imm8
+    // becomes one whole byte of the 64-bit pattern, which both halves repeat when Q is set.
+    if cmode == 0b1110 && op || cmode == 0b1111 && !op {
+        for i in 0..bytes {
+            out[i] = if (imm8 >> (i % 8)) & 1 == 1 { 0xff } else { 0x00 };
         }
         return out;
     }
-    let width = if lane == 0 { 1 } else { lane as usize };
-    let pattern = (imm8 as u64) << shift;
+    let width = lane as usize;
+    let mut pattern = (imm8 as u64) << shift;
+    if low_ones {
+        pattern |= (1u64 << shift) - 1;
+    }
     for i in 0..bytes {
         let byte = ((pattern >> (8 * (i % width))) & 0xff) as u8;
         out[i] = if op { !byte } else { byte };
@@ -2949,25 +2960,28 @@ impl<'a> RegionEmitter<'a> {
                 self.f.mem(I64_LOAD, 3, 0);
                 self.set(rt, true);
             }
+            // opc 2 sign-extends to the full register and opc 3 to 32 bits, which zeroes the top
+            // half: an `ldrsb x` whose sign stops at bit 31 puts 0x00000000ffffffff in a register
+            // where the guest expects 0xffffffffffffffff, and every index built from it is wrong.
             (0, 2) => {
-                self.f.mem(I32_LOAD8_S, 0, 0);
-                self.set(rt, false);
+                self.f.mem(I64_LOAD8_S, 0, 0);
+                self.set(rt, true);
             }
             (1, 2) => {
-                self.f.mem(I32_LOAD16_S, 1, 0);
-                self.set(rt, false);
+                self.f.mem(I64_LOAD16_S, 1, 0);
+                self.set(rt, true);
             }
             (2, 2) => {
                 self.f.mem(I64_LOAD32_S, 2, 0);
                 self.set(rt, true);
             }
             (0, 3) => {
-                self.f.mem(I64_LOAD8_S, 0, 0);
-                self.set(rt, true);
+                self.f.mem(I32_LOAD8_S, 0, 0);
+                self.set(rt, false);
             }
             (1, 3) => {
-                self.f.mem(I64_LOAD16_S, 1, 0);
-                self.set(rt, true);
+                self.f.mem(I32_LOAD16_S, 1, 0);
+                self.set(rt, false);
             }
             _ => unreachable!("load size/opc {size}/{opc}"),
         }
@@ -4070,12 +4084,14 @@ impl<'a> RegionEmitter<'a> {
                     self.f.simd(if op { simd::V128_ANDNOT } else { simd::V128_OR });
                     self.setv(rd);
                 } else if cmode == 0b1111 && op {
-                    // `fmov v.4s, #imm`: the eight-bit FP immediate, once per lane.
+                    // `fmov v.4s, #imm` and `fmov v.2d, #imm`: the eight-bit FP immediate, once per
+                    // lane, widened to the lane width the Q bit picks.
+                    let (lane, lanes) = (vfp_expand_imm(imm8, if q { 64 } else { 32 }), 2);
                     let mut bytes = [0u8; 16];
-                    let lane = vfp_expand_imm(imm8, 32) as u32;
-                    let lanes = if q { 4 } else { 2 };
+                    let width = 16 / lanes;
                     for i in 0..lanes {
-                        bytes[i * 4..i * 4 + 4].copy_from_slice(&lane.to_le_bytes());
+                        bytes[i * width..i * width + width]
+                            .copy_from_slice(&lane.to_le_bytes()[..width]);
                     }
                     self.f.v128c(bytes);
                     self.setv(rd);
@@ -4419,12 +4435,14 @@ impl<'a> RegionEmitter<'a> {
                     return Ok(());
                 }
 
-                // smlal/umlal and smlsl/umlsl, and the `2` forms: half-width lanes multiply into
-                // full-width ones and accumulate. The q bit takes the high half of each source, the
-                // way the `2` suffix says, and opcode bit 2 subtracts instead of adding. The
-                // destination is the whole register in every one of them, whatever q says.
+                // The long multiplies: half-width lanes multiply into full-width ones. opcode bit
+                // 3 is what says the destination is overwritten rather than added to, which is the
+                // whole of the difference between umull and umlal; bit 2 subtracts instead of
+                // adding. The q bit takes the high half of each source, the way the `2` suffix
+                // says, and the destination is the whole register whatever q says.
                 if op & 0b10011 == 0b10000 {
                     let high = q;
+                    let accumulate = op & 0b01000 == 0;
                     let sub = op & 0b00100 != 0;
                     let (mul, acc) = match (size, high, u) {
                         (1, false, false) => (simd::I32X4_EXTMUL_LOW_I16X8_S, simd::I32X4_ADD),
@@ -4449,10 +4467,12 @@ impl<'a> RegionEmitter<'a> {
                     self.getv(rn);
                     self.getv(rm);
                     self.f.simd(mul);
-                    self.f.ls(L_V0);
-                    self.getv(rd);
-                    self.f.lg(L_V0);
-                    self.f.simd(acc);
+                    if accumulate {
+                        self.f.ls(L_V0);
+                        self.getv(rd);
+                        self.f.lg(L_V0);
+                        self.f.simd(acc);
+                    }
                     self.setv(rd);
                     return Ok(());
                 }

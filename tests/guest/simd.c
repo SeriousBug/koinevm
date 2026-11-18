@@ -323,6 +323,14 @@ static void setup(void) {
     X(mvni_8h, "mvni 8h #0x5a", "mvni v2.8h, #0x5a")                                            \
     X(mvni_4s, "mvni 4s #0x0f", "mvni v2.4s, #0x0f")                                            \
     X(mvni_4s_lsl, "mvni 4s #0x0f, lsl 8", "mvni v2.4s, #0x0f, lsl #8")                         \
+    X(movi_4s_msl, "movi 4s #0x0f, msl 8", "movi v2.4s, #0x0f, msl #8")                         \
+    X(mvni_4s_msl, "mvni 4s #0x0f, msl 8", "mvni v2.4s, #0x0f, msl #8")                         \
+    X(mvni_4s_msl16, "mvni 4s #0x0f, msl 16", "mvni v2.4s, #0x0f, msl #16")                     \
+    X(movi_2s, "movi 2s #0x12", "movi v2.2s, #0x12")                                            \
+    X(mvni_2s, "mvni 2s #0x12", "mvni v2.2s, #0x12")                                            \
+    X(movi_2d, "movi 2d #ff00ff00ff00ff00", "movi v2.2d, #0xff00ff00ff00ff00")                  \
+    X(bic_2s, "bic 2s #0x0f", "mov v2.16b, v3.16b\n bic v2.2s, #0x0f")                         \
+    X(orr_4s, "orr 4s #0x0f", "mov v2.16b, v3.16b\n orr v2.4s, #0x0f")                         \
     X(rev16_16b, "rev16 16b", "rev16 v2.16b, v0.16b")                                           \
     X(rev32_16b, "rev32 16b", "rev32 v2.16b, v0.16b")                                           \
     X(rev32_8h, "rev32 8h", "rev32 v2.8h, v0.8h")                                               \
@@ -401,6 +409,16 @@ static void setup(void) {
     X(cmhs_2d, "cmhs 2d", "cmhs v2.2d, v0.2d, v1.2d")                                           \
     X(cmhi_16b, "cmhi 16b", "cmhi v2.16b, v0.16b, v1.16b")                                      \
     X(cmhi_4s, "cmhi 4s", "cmhi v2.4s, v0.4s, v1.4s")                                           \
+    /* The widening multiplies: a product is twice the width of its factors, so the pairs and the
+     * halves matter more than in any other form. */                                              \
+    X(umull_2d, "umull 2d", "umull v2.2d, v0.2s, v1.2s")                                         \
+    X(umull2_2d, "umull2 2d", "umull2 v2.2d, v0.4s, v1.4s")                                      \
+    X(smull_2d, "smull 2d", "smull v2.2d, v0.2s, v1.2s")                                         \
+    X(smull2_2d, "smull2 2d", "smull2 v2.2d, v0.4s, v1.4s")                                      \
+    X(umull_4s, "umull 4s", "umull v2.4s, v0.4h, v1.4h")                                         \
+    X(smull_4s, "smull 4s", "smull v2.4s, v0.4h, v1.4h")                                         \
+    X(umlal_2d, "umlal 2d", "mov v2.16b, v3.16b\n umlal v2.2d, v0.2s, v1.2s")                    \
+    X(umlsl_2d, "umlsl 2d", "mov v2.16b, v3.16b\n umlsl v2.2d, v0.2s, v1.2s")                    \
     X(umaxp_16b, "umaxp 16b", "umaxp v2.16b, v0.16b, v1.16b")                                   \
     X(umaxp_4s, "umaxp 4s", "umaxp v2.4s, v0.4s, v1.4s")                                        \
     X(smaxp_16b, "smaxp 16b", "smaxp v2.16b, v0.16b, v1.16b")                                   \
@@ -424,6 +442,19 @@ static void setup(void) {
     X(usra_4s, "usra 4s #7", "mov v2.16b, v3.16b\n usra v2.4s, v0.4s, #7")                      \
     X(ssra_2d, "ssra 2d #13", "mov v2.16b, v3.16b\n ssra v2.2d, v0.2d, #13")                    \
     X(ushl_4s, "ushl 4s", "ushl v2.4s, v0.4s, v1.4s")                                           \
+    X(ushl_2s, "ushl 2s", "ushl v2.2s, v0.2s, v1.2s")                                           \
+    X(ushl_8h, "ushl 8h", "ushl v2.8h, v0.8h, v1.8h")                                           \
+    X(and_8b, "and 8b", "and v2.8b, v0.8b, v1.8b")                                              \
+    X(add_2s, "add 2s", "add v2.2s, v0.2s, v1.2s")                                              \
+    X(mul_2s, "mul 2s", "mul v2.2s, v0.2s, v1.2s")                                              \
+    X(mls_2s, "mls 2s", "mov v2.16b, v3.16b\n mls v2.2s, v0.2s, v1.2s")                          \
+    X(mls_8h, "mls 8h", "mov v2.16b, v3.16b\n mls v2.8h, v0.8h, v1.8h")                          \
+    X(orr_8b, "orr 8b", "orr v2.8b, v0.8b, v1.8b")                                              \
+    X(ins_b_lane3, "ins v2.b[3], w9", "ldr w9, [%0]\n mov v2.16b, v0.16b\n mov v2.b[3], w9")    \
+    X(ins_h_lane3, "ins v2.h[3], w9", "ldr w9, [%0]\n mov v2.16b, v0.16b\n mov v2.h[3], w9")    \
+    X(ins_s_lane3, "ins v2.s[3], w9", "ldr w9, [%0]\n mov v2.16b, v0.16b\n mov v2.s[3], w9")    \
+    X(ins_d_lane1, "ins v2.d[1], x9", "ldr x9, [%0]\n mov v2.16b, v0.16b\n mov v2.d[1], x9")    \
+    X(movi_8b, "movi 8b #0x30", "movi v2.8b, #0x30")                                            \
     X(sshl_16b, "sshl 16b", "sshl v2.16b, v0.16b, v1.16b")                                      \
     /* copy, move, immediate */                                                                 \
     X(ins_s_el, "ins s[1], s[3]", "mov v2.16b, v0.16b\n ins v2.s[1], v0.s[3]")                  \

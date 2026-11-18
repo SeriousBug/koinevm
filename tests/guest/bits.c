@@ -136,7 +136,17 @@ static const unsigned long pat[] = {
     X(add_x_uxth_1, "add x uxth lsl#1", "add %0, %1, %w1, uxth #1")                             \
     X(sub_x_sxth_3, "sub x sxth lsl#3", "sub %0, %1, %w1, sxth #3")                             \
     X(add_w_uxtb, "add w uxtb", "add %w0, %w1, %w1, uxtb")                                      \
-    X(add_x_uxtw_2, "add x uxtw lsl#2", "add %0, %1, %w1, uxtw #2")
+    X(add_x_uxtw_2, "add x uxtw lsl#2", "add %0, %1, %w1, uxtw #2")                            \
+    /* The multiplies a compiler turns a division by ten into: a 32-bit product widened to 64, and
+     * the fused multiply-subtract that leaves the remainder. */                                  \
+    X(umull_x, "umull x", "umull %0, %w1, %w1")                                                  \
+    X(smull_x, "smull x", "smull %0, %w1, %w1")                                                  \
+    X(mul_w, "mul w", "mul %w0, %w1, %w1")                                                       \
+    X(mul_x, "mul x", "mul %0, %1, %1")                                                          \
+    X(msub_w, "msub w", "msub %w0, %w1, %w1, %w1")                                               \
+    X(msub_x, "msub x", "msub %0, %1, %1, %1")                                                   \
+    X(madd_w, "madd w", "madd %w0, %w1, %w1, %w1")                                               \
+    X(madd_x, "madd x", "madd %0, %1, %1, %1")
 
 #define DEF(name, tag, body)                                                                  \
     __attribute__((noinline)) static unsigned long b_##name(unsigned long v) {                \

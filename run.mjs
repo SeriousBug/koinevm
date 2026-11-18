@@ -54,10 +54,14 @@ function ring(n) {
 }
 
 function trap(kind, addr, at) {
+  // The address is a 64-bit guest address: a load whose base went wrong carries the high half, and
+  // truncating it to 32 bits reports an address that is inside the image.
+  const at64 = BigInt.asUintN(64, addr);
   throw new Error(
     `guest pc trail: ${ring(24).map(where).join(" -> ")}\n` +
-      `guest trap ${Number(kind)} at address ${where(Number(addr) >>> 0)}` +
-      ` (0x${(Number(addr) >>> 0).toString(16)}) from ${where(at >>> 0)}\n` +
+      `guest trap ${Number(kind)} at address 0x${at64.toString(16)}` +
+      (at64 < 1n << 32n ? ` (${where(Number(at64))})` : "") +
+      ` from ${where(at >>> 0)}\n` +
       state() +
       "\n" + backtrace() +
       memory_dump(),

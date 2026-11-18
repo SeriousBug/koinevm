@@ -22,7 +22,7 @@ for mode in $MODES; do
     code=$?
     # marker proves the loader image really moved to its own base; the rest is the auxv it was given.
     if ! head -1 "$work/out" | grep -qE \
-            '^ld-fake: marker=0x[0-9a-f]+ base=0x0*10000000 entry=0x0*1001000 phdr=0x0*1000040 pagesz=0x0*1000$'; then
+            '^ld-fake: marker=0x[0-9a-f]+ base=0x0*10000000 entry=0x0*401000 phdr=0x0*400040 pagesz=0x0*1000$'; then
         echo "FAIL hello_pie bounds=$mode, loader line:"; head -1 "$work/out"; cat "$work/err"; fail=1; continue
     fi
     if ! tail -n +2 "$work/out" | diff -q tests/guest/hello.expected - > /dev/null; then

@@ -12,7 +12,7 @@ restriction real PIE code has before `ld.so` applies its relative relocations.
 import struct
 import sys
 
-TEXT_VADDR = 0x1000000
+TEXT_VADDR = 0x400000
 RODATA_VADDR = 0x410000
 
 R_ABS64 = 257
@@ -223,7 +223,7 @@ def main():
     entry_name = positional[2] if len(positional) > 2 else "_start"
 
     etype = 3 if opts.get("type") == "dyn" else 2
-    base = int(opts.get("base", "0x1000000" if etype == 2 else "0"), 0)
+    base = int(opts.get("base", "0x400000" if etype == 2 else "0"), 0)
     interp = opts.get("interp")
     _, _, _, text_off = file_layout(interp)
     text_vaddr = base + text_off
