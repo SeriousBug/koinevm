@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-GUESTS=${GUESTS:-"fmt resolve afamily gai"}
+GUESTS=${GUESTS:-"fmt resolve afamily gai sha512dyn"}
 
 for g in $GUESTS; do
     # A C++ fixture needs the other compiler and library, and its own source suffix.
@@ -20,12 +20,25 @@ for g in $GUESTS; do
         cc="g++"
         pkgs="g++ libstdc++-12-dev"
     fi
+    # A fixture with a `.lib.c` beside it keeps the code under test in a library the program
+    # loads, so the guest translates it a page at a time instead of with the image. The library
+    # has to be at the same path in the container and in the rootfs, which is what rpath /tmp
+    # gives both of them.
+    lib=""
+    link=""
+    if [ -f "tests/guest/$g.lib.c" ]; then
+        lib="gcc -O2 -fPIC -shared -o /tmp/lib$g.so tests/guest/$g.lib.c &&
+            cp /tmp/lib$g.so rootfs/debian/tmp/ &&"
+        link="-L/tmp -l$g -Wl,-rpath,/tmp"
+    fi
+
     echo "== guest: $g, dynamically linked against bookworm's glibc =="
     docker run --rm -v "$PWD":/w -w /w debian:bookworm sh -c "
         apt-get update -qq >/dev/null &&
         apt-get install -y -qq $pkgs >/dev/null &&
+        $lib
         $cc -O2 -fno-builtin -D_FORTIFY_SOURCE=2 -fno-stack-protector \
-            -o tests/guest/${g}_dyn.elf $src &&
+            -o tests/guest/${g}_dyn.elf $src $link &&
         ./tests/guest/${g}_dyn.elf > tests/guest/$g.expected
     "
     echo "oracle output:"
