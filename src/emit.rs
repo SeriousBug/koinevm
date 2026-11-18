@@ -197,12 +197,15 @@ fn narrows_to_low_half(i: &Insn) -> bool {
         | Insn::VecStruct { q, .. }
         | Insn::VecLd1r { q, .. }
         | Insn::VecThreeSame { q, .. }
-        | Insn::VecTwoMisc { q, .. }
+        | Insn::VecTwoMisc { q, u: false, .. }
         | Insn::VecAcross { q, .. }
         | Insn::VecModImm { q, .. }
         | Insn::VecPermute { q, .. }
         | Insn::VecExt { q, .. }
         | Insn::VecTbl { q, .. } => !q,
+        // `shll` widens into the whole register, so the q bit picks which half of the source it
+        // reads rather than how much it writes.
+        Insn::VecTwoMisc { q, op, .. } => !q && op != 0b10011,
         // The long multiplies write the whole destination even with the q bit clear, and so do
         // sshll and ushll: q picks which half of the sources widen, not how much is written.
         Insn::VecThreeDiff { q, op, .. } => {
@@ -1387,6 +1390,16 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
 
 
 /// All ones in the low 64 bits and zeros above: what a D-register operation writes.
+/// The sign bit of every lane: what `fneg` flips and `fabs` clears.
+fn sign_mask(double: bool) -> [u8; 16] {
+    let width = if double { 8 } else { 4 };
+    let mut m = [0u8; 16];
+    for lane in 0..16 / width {
+        m[lane * width + width - 1] = 0x80;
+    }
+    m
+}
+
 fn low_half_mask() -> [u8; 16] {
     let mut out = [0xffu8; 16];
     for b in 8..16 {
@@ -4294,6 +4307,51 @@ impl<'a> RegionEmitter<'a> {
                             self.vec_pairwise(size, o, rn, rm, rd);
                         }
                     }
+                    // The FP group. Bit 22 is the lane type and bit 23 the low bit of the opcode
+                    // where the operation has a pair, so the size field carries both: an odd size
+                    // is double, and the pairs (add/sub, mla/mls) take the second when it is set.
+                    (false, 0 | 1, 0b11010) => {
+                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_ADD } else { simd::F32X4_ADD })
+                    }
+                    (false, 2 | 3, 0b11010) => {
+                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB })
+                    }
+                    (true, 2 | 3, 0b11010) => {
+                        // fabd: the absolute value of the difference.
+                        self.getv(rn);
+                        self.getv(rm);
+                        self.f.simd(if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB });
+                        self.f.simd(if size & 1 == 1 { simd::F64X2_ABS } else { simd::F32X4_ABS });
+                        self.setv(rd);
+                    }
+                    (false, 0 | 1, 0b11011) | (true, 0 | 1, 0b11011) => {
+                        // fmul and fmulx, which differ only for zero times infinity.
+                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_MUL } else { simd::F32X4_MUL })
+                    }
+                    (true, 0 | 1, 0b11111) => {
+                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_DIV } else { simd::F32X4_DIV })
+                    }
+                    (false, 0 | 1, 0b11001) | (false, 2 | 3, 0b11001) => {
+                        // fmla and fmls multiply into the destination rather than into a product of
+                        // its own, so the rounding of the sum is the one place they differ from a
+                        // separate multiply and add.
+                        let (mul, add) = if size & 1 == 1 {
+                            (simd::F64X2_MUL, simd::F64X2_ADD)
+                        } else {
+                            (simd::F32X4_MUL, simd::F32X4_ADD)
+                        };
+                        let op = if size & 2 != 0 {
+                            if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB }
+                        } else {
+                            add
+                        };
+                        self.getv(rd);
+                        self.getv(rn);
+                        self.getv(rm);
+                        self.f.simd(mul);
+                        self.f.simd(op);
+                        self.setv(rd);
+                    }
                     _ => return self.refuse(format!("unsupported vector operation {op:05b} u={u} size={size} at 0x{addr:x}")),
                 }
             }
@@ -4363,6 +4421,48 @@ impl<'a> RegionEmitter<'a> {
                         self.getv(rn);
                         self.f.ls(L_V0);
                         self.shuffle(L_V0, L_V0, mask);
+                        self.setv(rd);
+                    }
+                    // The FP forms of the two-register group, whose type field has bit 23 set.
+                    (false, 2 | 3, 0b01111) => {
+                        // fabs: clear the sign bit of every lane.
+                        self.getv(rn);
+                        self.f.v128c(sign_mask(size & 1 == 1));
+                        self.f.simd(simd::V128_ANDNOT);
+                        self.setv(rd);
+                    }
+                    (true, 2 | 3, 0b01111) => {
+                        // fneg: flip it. A NaN keeps its payload, which is what the instruction does.
+                        self.getv(rn);
+                        self.f.v128c(sign_mask(size & 1 == 1));
+                        self.f.simd(simd::V128_XOR);
+                        self.setv(rd);
+                    }
+                    (true, 2 | 3, 0b11111) => self.vec2(
+                        rn,
+                        rd,
+                        if size & 1 == 1 { simd::F64X2_SQRT } else { simd::F32X4_SQRT },
+                    ),
+                    (true, 0..=2, 0b10011) => {
+                        // shll: widen one half of the source and shift it up by the width of the
+                        // destination's lanes, which is what the alias of ushll by the element size
+                        // means. The widened bits fall off the top, so whether the widening kept
+                        // the sign is not visible.
+                        let widen = match (size, q) {
+                            (0, false) => simd::I16X8_EXTEND_LOW_I8X16_U,
+                            (0, true) => simd::I16X8_EXTEND_HIGH_I8X16_U,
+                            (1, false) => simd::I32X4_EXTEND_LOW_I16X8_U,
+                            (1, true) => simd::I32X4_EXTEND_HIGH_I16X8_U,
+                            (2, false) => simd::I64X2_EXTEND_LOW_I32X4_U,
+                            _ => simd::I64X2_EXTEND_HIGH_I32X4_U,
+                        };
+                        let shl = self
+                            .lanes_op(size, [simd::I16X8_SHL, simd::I32X4_SHL, simd::I64X2_SHL, simd::I64X2_SHL])
+                            .ok_or_else(|| format!("bad widening shift at 0x{addr:x}"))?;
+                        self.getv(rn);
+                        self.f.simd(widen);
+                        self.f.i32c(8 << size);
+                        self.f.simd(shl);
                         self.setv(rd);
                     }
                     _ => return self.refuse(format!("unsupported two-register vector op {op:05b} u={u} size={size} at 0x{addr:x}")),
@@ -5060,6 +5160,21 @@ impl<'a> RegionEmitter<'a> {
                 }
                 self.fp_put(rd, double);
             }
+            Insn::FpScalarSame { double, multiply, rn, rm, rd } => {
+                self.fp_base();
+                self.fp_get(rn, double);
+                self.fp_get(rm, double);
+                if multiply {
+                    // `fmulx` differs from a plain multiply only for zero times infinity, which it
+                    // answers with 2.0 where a multiply gives a NaN.
+                    self.f.op(if double { F64_MUL } else { F32_MUL });
+                } else {
+                    // `fabd`: the absolute value of the difference.
+                    self.f.op(if double { F64_SUB } else { F32_SUB });
+                    self.f.op(if double { F64_ABS } else { F32_ABS });
+                }
+                self.fp_put(rd, double);
+            }
             Insn::FpFused { size, negate_product, subtract, rn, rm, ra, rd } => {
                 if size > 1 {
                     return self.refuse(format!("half precision floating point at 0x{addr:x}"));
@@ -5268,6 +5383,35 @@ impl<'a> RegionEmitter<'a> {
                 } else {
                     self.f.simd_lane(simd::I32X4_EXTRACT_LANE, 0);
                     self.f.op(F32_CONVERT_I32_S);
+                }
+                self.fp_put(rd, double);
+            }
+            Insn::FpFromIntFixed { sf, unsigned, size, fbits, rn, rd } => {
+                // The integer becomes a float, then scales by a power of two: scaling moves the
+                // significand without changing it, so the one rounding the instruction asks for is
+                // the one that happens.
+                if size > 1 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
+                }
+                let double = size == 1;
+                self.fp_base();
+                self.get(rn, sf);
+                self.f.op(match (sf, double, unsigned) {
+                    (true, true, false) => F64_CONVERT_I64_S,
+                    (true, true, true) => F64_CONVERT_I64_U,
+                    (true, false, false) => F32_CONVERT_I64_S,
+                    (true, false, true) => F32_CONVERT_I64_U,
+                    (false, true, false) => F64_CONVERT_I32_S,
+                    (false, true, true) => F64_CONVERT_I32_U,
+                    (false, false, false) => F32_CONVERT_I32_S,
+                    (false, false, true) => F32_CONVERT_I32_U,
+                });
+                if double {
+                    self.f.f64c(2f64.powi(-(fbits as i32)).to_bits());
+                    self.f.op(F64_MUL);
+                } else {
+                    self.f.f32c(2f32.powi(-(fbits as i32)).to_bits());
+                    self.f.op(F32_MUL);
                 }
                 self.fp_put(rd, double);
             }

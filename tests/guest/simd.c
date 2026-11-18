@@ -336,7 +336,16 @@ static void setup(void) {
     X(rev32_8h, "rev32 8h", "rev32 v2.8h, v0.8h")                                               \
     X(rev64_16b, "rev64 16b", "rev64 v2.16b, v0.16b")                                           \
     X(rev64_4s, "rev64 4s", "rev64 v2.4s, v0.4s")                                               \
-    X(cnt_16b, "cnt 16b", "cnt v2.16b, v0.16b")
+    X(cnt_16b, "cnt 16b", "cnt v2.16b, v0.16b")                                                 \
+    X(fabs_4s, "fabs 4s", "fabs v2.4s, v0.4s")                                                  \
+    X(fabs_2d, "fabs 2d", "fabs v2.2d, v0.2d")                                                  \
+    X(fneg_4s, "fneg 4s", "fneg v2.4s, v0.4s")                                                  \
+    X(fneg_2d, "fneg 2d", "fneg v2.2d, v0.2d")                                                  \
+    X(fsqrt_2s, "fsqrt 2s", "fsqrt v2.2s, v0.2s")                                               \
+    X(fsqrt_2d, "fsqrt 2d", "fsqrt v2.2d, v0.2d")                                               \
+    X(shll_8h, "shll 8h", "shll v2.8h, v0.8b, #8")                                              \
+    X(shll_4s, "shll 4s", "shll v2.4s, v0.4h, #16")                                             \
+    X(shll2_2d, "shll2 2d", "shll2 v2.2d, v0.4s, #32")
 
 #define X_CASES(X)                                                                              \
     X(umov_b3, "umov %w0, b[3]", "umov %w0, v0.b[3]")                                           \
@@ -478,7 +487,23 @@ static void setup(void) {
     X(trn2_4s, "trn2 4s", "trn2 v2.4s, v0.4s, v1.4s")                                           \
     X(tbl_1reg, "tbl 16b, 1 table", "tbl v2.16b, {v0.16b}, v1.16b")                             \
     X(tbl_2reg, "tbl 16b, 2 tables", "tbl v2.16b, {v0.16b, v1.16b}, v4.16b")                    \
-    X(tbx_1reg, "tbx 16b, 1 table", "mov v2.16b, v3.16b\n tbx v2.16b, {v0.16b}, v1.16b")
+    X(tbx_1reg, "tbx 16b, 1 table", "mov v2.16b, v3.16b\n tbx v2.16b, {v0.16b}, v1.16b")        \
+    /* Floating point on vectors: the four arithmetic operations at both widths, the absolute
+     * difference, and the multiply-accumulate pair. */                                           \
+    X(fadd_4s, "fadd 4s", "fadd v2.4s, v0.4s, v1.4s")                                           \
+    X(fadd_2s, "fadd 2s", "fadd v2.2s, v0.2s, v1.2s")                                           \
+    X(fadd_2d, "fadd 2d", "fadd v2.2d, v0.2d, v1.2d")                                           \
+    X(fsub_4s, "fsub 4s", "fsub v2.4s, v0.4s, v1.4s")                                           \
+    X(fsub_2d, "fsub 2d", "fsub v2.2d, v0.2d, v1.2d")                                           \
+    X(fmul_4s, "fmul 4s", "fmul v2.4s, v0.4s, v1.4s")                                           \
+    X(fmul_2d, "fmul 2d", "fmul v2.2d, v0.2d, v1.2d")                                           \
+    X(fdiv_4s, "fdiv 4s", "fdiv v2.4s, v0.4s, v1.4s")                                           \
+    X(fdiv_2d, "fdiv 2d", "fdiv v2.2d, v0.2d, v1.2d")                                           \
+    X(fabd_4s, "fabd 4s", "fabd v2.4s, v0.4s, v1.4s")                                           \
+    X(fabd_2d, "fabd 2d", "fabd v2.2d, v0.2d, v1.2d")                                           \
+    X(fmulx_4s, "fmulx 4s", "fmulx v2.4s, v0.4s, v1.4s")                                        \
+    X(fmla_2d, "fmla 2d", "mov v2.16b, v3.16b\n fmla v2.2d, v0.2d, v1.2d")                      \
+    X(fmls_4s, "fmls 4s", "mov v2.16b, v3.16b\n fmls v2.4s, v0.4s, v1.4s")
 
 /* Scalar floating point: moves between the GPR and FP register files, the integer conversions, and
  * the forms that work on the bit patterns rather than on the values. Arithmetic on the values
@@ -505,7 +530,21 @@ static void setup(void) {
     X(fmov_d1_keeps_low, "fmov v2.d[1], x keeps d2", "fmov d2, %3\n fmov v2.d[1], %4\n fmov %0, d2") \
     /* fccmp compares only when its condition holds, and takes the flags it was given otherwise. */ \
     X(fccmp_taken, "fccmp, condition holds", "fcmp d0, d1\n fccmp d0, d1, #0x0, eq\n cset %0, ne") \
-    X(fccmp_skipped, "fccmp, condition does not hold", "fcmp d0, d1\n fccmp d1, d0, #0x6, eq\n cset %0, ne")
+    X(fccmp_skipped, "fccmp, condition does not hold", "fcmp d0, d1\n fccmp d1, d0, #0x6, eq\n cset %0, ne") \
+    X(fabd_d, "fabd d", "fmov d0, %3\n fmov d1, %4\n fabd d2, d0, d1\n" D2X)                  \
+    X(fabd_s, "fabd s", "fmov s0, %w1\n fmov s1, %w2\n fabd s2, s0, s1\n" S2W)                  \
+    X(fmulx_d, "fmulx d", "fmov d0, %3\n fmov d1, %4\n fmulx d2, d0, d1\n" D2X)                \
+    X(fmulx_s, "fmulx s", "fmov s0, %w1\n fmov s1, %w2\n fmulx s2, s0, s1\n" S2W)              \
+    /* A conversion with a fraction-bit count, which scales the integer before it becomes a
+     * float: the form a compiler uses for a value held as a fixed-point fraction. */              \
+    X(scvtf_d_w_f24, "scvtf d, w, #24", "scvtf d2, %w1, #0x18\n" D2X)                           \
+    X(scvtf_d_w_f8, "scvtf d, w, #8", "scvtf d2, %w1, #0x8\n" D2X)                              \
+    X(ucvtf_d_w_f30, "ucvtf d, w, #30", "ucvtf d2, %w1, #0x1e\n" D2X)                           \
+    X(scvtf_s_w_f3, "scvtf s, w, #3", "scvtf s2, %w1, #0x3\n" S2W)                              \
+    X(ucvtf_s_w_f20, "ucvtf s, w, #20", "ucvtf s2, %w1, #0x14\n" S2W)                           \
+    X(scvtf_d_x_f10, "scvtf d, x, #10", "scvtf d2, %3, #0xa\n" D2X)                             \
+    X(ucvtf_d_x_f32, "ucvtf d, x, #32", "ucvtf d2, %3, #0x20\n" D2X)                            \
+    X(scvtf_s_x_f40, "scvtf s, x, #40", "scvtf s2, %3, #0x28\n" S2W)
 
 struct vcase {
     void (*fn)(void);

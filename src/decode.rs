@@ -142,10 +142,14 @@ pub enum Insn {
     GprToFp { sf: bool, signed: bool, size: u32, rmode: u32, opcode: u32, rn: u32, rd: u32 },
     /// `fcvtzs`/`fcvtzu` with a fraction-bit count: the fixed-point conversion a scaled cast uses.
     FpToGprFixed { sf: bool, unsigned: bool, size: u32, fbits: u32, rn: u32, rd: u32 },
+    /// `scvtf`/`ucvtf` with a fraction-bit count, the other direction of the same conversion.
+    FpFromIntFixed { sf: bool, unsigned: bool, size: u32, fbits: u32, rn: u32, rd: u32 },
     /// Scalar FP arithmetic on one register: `fmov`, `fabs`, `fneg`, `fsqrt`, `fcvt`, ...
     FpOneSource { size: u32, opcode: u32, rn: u32, rd: u32 },
     /// Scalar FP arithmetic on two registers: `fadd`, `fdiv`, `fmax`, ...
     FpTwoSource { size: u32, opcode: u32, rn: u32, rm: u32, rd: u32 },
+    /// The two scalar FP forms that live in the three-same space: `fabd`, and `fmulx`.
+    FpScalarSame { double: bool, multiply: bool, rn: u32, rm: u32, rd: u32 },
     /// `fcmp`/`fcmpe`: a comparison that writes NZCV instead of a register. `zero` compares the
     /// register against `+0.0` in the form that names no second register.
     FpCompare { size: u32, signaling: bool, zero: bool, rn: u32, rm: u32 },
@@ -1047,6 +1051,31 @@ fn decode_scalar_fp(w: u32) -> Insn {
             rn,
             rm,
             ra: (w >> 10) & 31,
+            rd,
+        };
+    }
+
+    // The same conversion the other way: an integer scaled by a power of two becomes a float. Bit 16
+    // is the sign, bit 31 the width of the integer, and the count is 64 minus the fraction bits.
+    if w & 0x7f3f0000 == 0x1e020000 || w & 0x7f3f0000 == 0x1e030000 {
+        return Insn::FpFromIntFixed {
+            sf,
+            unsigned: (w >> 16) & 1 == 1,
+            size: (w >> 22) & 3,
+            fbits: 64 - ((w >> 10) & 0x3f),
+            rn,
+            rd,
+        };
+    }
+
+    // The two scalar FP forms of the three-same group, `fabd` and `fmulx`: bit 23 is which of them
+    // it is, and bit 22 is the type, as in the vector forms they mirror.
+    if w & 0xffa0fc00 == 0x7ea0d400 || w & 0xffa0fc00 == 0x5e20dc00 {
+        return Insn::FpScalarSame {
+            double: (w >> 22) & 1 == 1,
+            multiply: (w >> 23) & 1 == 0,
+            rn,
+            rm,
             rd,
         };
     }
