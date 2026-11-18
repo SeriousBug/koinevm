@@ -15,10 +15,12 @@ waiting on the network.
 
 | | |
 |---|---|
-| `socket` (198) | `AF_INET`/`AF_INET6` `SOCK_DGRAM`; `SOCK_CLOEXEC` and `SOCK_NONBLOCK` |
+| `socket` (198) | `AF_INET`/`AF_INET6`, `SOCK_DGRAM` or `SOCK_STREAM`; `SOCK_CLOEXEC` and `SOCK_NONBLOCK` |
 | `socketpair` (199) | `AF_UNIX`, stream or dgram: two queues inside the process |
 | `bind` (200) | awaits the host; port 0 reports the port the host chose |
-| `connect` (203) | a datagram socket records the peer and sends nothing, as Linux does |
+| `connect` (203) | a datagram socket records the peer and sends nothing, as Linux does; a connection reaches the host, and one the guest asked not to wait on answers `EINPROGRESS` and completes through `poll` and `SO_ERROR` |
+| `listen`, `accept`, `accept4` (201, 202, 242) | a backlog of connections, each accepted one a descriptor of its own |
+| `shutdown` (210) | including the half-close a client that has said everything does |
 | `getsockname`, `getpeername` (204, 205) | including the implicit bind a first send performs |
 | `sendto`, `recvfrom` (206, 207) | `MSG_PEEK`, `MSG_DONTWAIT`, `MSG_TRUNC` |
 | `sendmsg`, `recvmsg` (211, 212) | the iovecs gathered or scattered; no control data yet |
@@ -29,9 +31,14 @@ waiting on the network.
 | `fcntl` `F_GETFL`/`F_SETFL` | `O_NONBLOCK`, which is what `recvfrom` answers `EAGAIN` for |
 | `ioctl` `FIONREAD` (29) | the size of the datagram a receive would take, which is what a resolver sizes its buffer from |
 
-Not there yet: TCP (`EPROTONOSUPPORT`), names for `AF_UNIX` sockets (`EAFNOSUPPORT`, so a
-`socket(AF_UNIX, ...)` fails while `socketpair` works), control data (`SCM_RIGHTS`), `shutdown`,
-`epoll`, and `SO_RCVTIMEO` on a pair.
+Not there yet: names for `AF_UNIX` sockets (`EAFNOSUPPORT`, so a `socket(AF_UNIX, ...)` fails while
+`socketpair` works), control data (`SCM_RIGHTS`), `epoll`, `SO_RCVTIMEO` on a pair, and the address
+`recvfrom` reports on a connection, which is the peer it is already talking to.
+
+A send answers the count and does not wait for the host, so what a program writes faster than the
+peer reads stays in the host's buffer. Bytes arriving for a guest that is not reading them stop in
+the host instead, once a quarter of a megabyte has queued, which is the direction that can deadlock
+a guest and so the direction that is bounded.
 
 ## The interface a host implements
 

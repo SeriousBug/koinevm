@@ -14,7 +14,7 @@
 import fs from "node:fs";
 import { Kernel, ECHILD, EBADF, EFAULT } from "./syscall.mjs";
 import { WOULD_BLOCK, ENOENT, EACCES } from "./files.mjs";
-import { Net } from "./net.mjs";
+import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
 import { Mach } from "./pages.mjs";
 
@@ -272,6 +272,8 @@ export class Session {
         return this.connect(proc, thread, request);
       case "address":
         return this.address(proc, thread, request);
+      case "accept":
+        return this.accept(proc, thread, request);
       case "poll":
         return this.pollWait(proc, thread, request);
       case "select":
@@ -395,10 +397,17 @@ export class Session {
     timer.unref?.();
   }
 
+  /// A request that has waited as long as its socket's timeout allows: the answer is EAGAIN, the
+  /// same one a socket the guest set non-blocking gives.
+  expired(request) {
+    return request.deadline > 0 && Date.now() >= request.deadline;
+  }
+
   /// A receive there was nothing for: answer it from what has arrived since, or keep waiting.
   recv(proc, thread, request) {
     const answer = proc.kernel.recvInto(request.fd, request.buf, request.len, request.flags, request.addr, request.lenp);
     if (answer && answer.host) {
+      if (this.expired(request)) return this.resume(proc, thread, -EAGAIN);
       this.park(thread, request, request.deadline);
       return 0;
     }
@@ -409,6 +418,7 @@ export class Session {
   recvMsg(proc, thread, request) {
     const answer = proc.kernel.recvMsgInto(request.fd, request.msg, request.flags);
     if (answer && answer.host) {
+      if (this.expired(request)) return this.resume(proc, thread, -EAGAIN);
       this.park(thread, request, request.deadline);
       return 0;
     }
@@ -419,6 +429,7 @@ export class Session {
   recvMMsg(proc, thread, request) {
     const answer = proc.kernel.recvMMsgInto(request.fd, request.vec, request.vlen, request.flags, request.deadline);
     if (answer && answer.host) {
+      if (this.expired(request)) return this.resume(proc, thread, -EAGAIN);
       this.park(thread, request, request.deadline);
       return 0;
     }
@@ -435,7 +446,17 @@ export class Session {
   async connect(proc, thread, request) {
     const desc = proc.kernel.socketDesc(request.fd);
     if (typeof desc === "number") return this.resume(proc, thread, desc);
-    const answer = await desc.connect(request.addr);
+    return this.resume(proc, thread, await desc.waitConnected());
+  }
+
+  /// An accept there was no connection for.
+  accept(proc, thread, request) {
+    const answer = proc.kernel.acceptInto(request.fd, request.addr, request.lenp, request.flags);
+    if (answer && answer.host) {
+      if (this.expired(request)) return this.resume(proc, thread, -EAGAIN);
+      this.park(thread, request, request.deadline);
+      return 0;
+    }
     return this.resume(proc, thread, answer);
   }
 

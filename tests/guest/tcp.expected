@@ -1,0 +1,38 @@
+ok   the echo server's port is the guest's argument
+ok   socket(AF_INET, SOCK_STREAM) returns a descriptor
+ok   connect to the host succeeds
+ok   a connected socket has a local port
+ok   getpeername reports the address it connected to
+ok   write sends the bytes
+ok   read answers what was sent
+ok   shutdown(SHUT_WR) half-closes the writing end
+ok   a read after the peer's end is end of stream
+ok   close of a connection
+ok   the socket is set non-blocking
+ok   a non-blocking connect answers EINPROGRESS
+ok   poll reports the connection writable once it is made
+ok   SO_ERROR reports that the connection succeeded
+ok   nothing is there to read yet
+ok   write on a non-blocking connection
+ok   the answer makes it readable
+ok   the non-blocking client reads it
+ok   close of the non-blocking connection
+ok   a socket to listen on
+ok   bind to a port of its own
+ok   the listener knows the port it was given
+ok   a bound socket is not accepting yet
+ok   listen
+ok   a listening socket says it is accepting
+ok   a listener with no connection is not readable
+ok   fork
+ok   fork
+ok   accept answers the child's connection
+ok   accept says where the connection came from
+ok   the accepted connection has the bytes
+ok   and then the end of the child's stream
+ok   close of an accepted connection
+ok   the child exited with zero
+ok   close of the listener
+ok   accept without listen is EINVAL
+ok   close of it
+tcp: all checks passed

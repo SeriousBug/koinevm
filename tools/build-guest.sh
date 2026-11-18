@@ -60,6 +60,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
     -c tests/guest/net.c -o tests/guest/net.o
 python3 tools/minilink.py tests/guest/net.o tests/guest/net.elf _start
 
+echo "== guest: tcp (connect/accept/listen/shutdown, and a child that connects) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+    -c tests/guest/tcp.c -o tests/guest/tcp.o
+python3 tools/minilink.py tests/guest/tcp.o tests/guest/tcp.elf _start
+
 echo "== guest: dns (a query over UDP, to the resolver the guest is given) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
     -c tests/guest/dns.c -o tests/guest/dns.o

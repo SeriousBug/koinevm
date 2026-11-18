@@ -17,6 +17,7 @@ import {
   EPROTONOSUPPORT,
   EAFNOSUPPORT,
   EDESTADDRREQ,
+  EINPROGRESS,
 } from "./net.mjs";
 
 export const ENOSYS = 38;
@@ -706,6 +707,30 @@ export class Kernel {
     return (Number(flags) & 0x20) !== 0 ? got.full : got.data.length;
   }
 
+  /// accept: the descriptor the new connection gets, the address it came from written back, or a
+  /// thread parked until a connection arrives.
+  acceptInto(fd, addr, lenp, flags) {
+    const desc = this.socketDesc(fd);
+    if (typeof desc === "number") return desc;
+    const conn = desc.accept();
+    if (conn === null) {
+      if (desc.nonblock) return -EAGAIN;
+      return this.ask({
+        kind: "accept",
+        fd,
+        addr,
+        lenp,
+        flags,
+        deadline: desc.timeout ? Date.now() + desc.timeout : 0,
+      });
+    }
+    if (typeof conn === "number") return conn;
+    if (this.addr(addr) !== 0 && conn.peer && !this.putAddr(addr, lenp, conn.peer)) return -EFAULT;
+    conn.nonblock = (flags & 0x800) !== 0 || desc.nonblock;
+    trace(`${desc.id} accepted ${conn.id} from ${conn.peer?.ip}:${conn.peer?.port}`);
+    return this.files.add({ kind: "socket", desc: conn, cloexec: (flags & 0x80000) !== 0 });
+  }
+
   /// The iovecs of a guest `struct msghdr`: where the bytes are, and how many.
   iovecs(msg) {
     const count = Number(this.u64(msg + 24));
@@ -925,13 +950,41 @@ export class Kernel {
       return k.ask({ kind: "bind", fd: Number(fd), addr: want });
     });
 
+    this.on(201, (k, fd, backlog) => {
+      const desc = k.socketDesc(Number(fd));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      return [BigInt(desc.listen(Number(backlog))), 0];
+    });
+
+    // accept and accept4: the next connection as a descriptor of its own, or a thread parked until
+    // one arrives.
+    this.on(202, (k, fd, addr, lenp) => k.done(k.acceptInto(Number(fd), k.addr(addr), k.addr(lenp), 0)));
+    this.on(242, (k, fd, addr, lenp, flags) =>
+      k.done(k.acceptInto(Number(fd), k.addr(addr), k.addr(lenp), Number(flags))),
+    );
+
     this.on(203, (k, fd, addr, len) => {
       const desc = k.socketDesc(Number(fd));
       if (typeof desc === "number") return [BigInt(desc), 0];
       const want = k.guestAddr(addr, len);
       if (want === undefined) return k.fail(EFAULT);
       if (want === null) return k.fail(EINVAL);
-      return k.ask({ kind: "connect", fd: Number(fd), addr: want });
+      // A datagram socket's connect records the peer and answers now. A connection has to reach the
+      // host: a guest that asked not to wait gets EINPROGRESS and learns the outcome from `poll`
+      // and SO_ERROR, which is the path every non-blocking client takes.
+      const started = desc.connect(want);
+      if (typeof started === "number") return [BigInt(started), 0];
+      if (desc.nonblock) {
+        started.catch(() => {});
+        return k.fail(EINPROGRESS);
+      }
+      return k.ask({ kind: "connect", fd: Number(fd) });
+    });
+
+    this.on(210, (k, fd, how) => {
+      const desc = k.socketDesc(Number(fd));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      return [BigInt(desc.shutdown(Number(how))), 0];
     });
 
     this.on(204, (k, fd, addr, lenp) => {
@@ -1171,6 +1224,10 @@ export class Kernel {
 
 
 export { EFAULT, ENOMEM, EINVAL };
+
+function trace(text) {
+  if (process.env.ARMJIT_TRACE_SOCKETS) console.error(`sockets: ${text}`);
+}
 
 /// A guest `char *const argv[]`: every string up to the null terminator.
 function stringVector(k, vec) {

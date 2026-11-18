@@ -11,6 +11,7 @@
 // cannot tell.
 
 import dgram from "node:dgram";
+import net from "node:net";
 import { WOULD_BLOCK } from "./files.mjs";
 
 export const AF_UNIX = 1;
@@ -193,7 +194,7 @@ export class Net {
     if (domain === AF_INET || domain === AF_INET6) {
       const any = protocol === 0;
       if (kind === SOCK_DGRAM && (any || protocol === 17)) return new Datagram(this, domain);
-      if (kind === SOCK_STREAM && (any || protocol === 6)) return -EPROTONOSUPPORT;
+      if (kind === SOCK_STREAM && (any || protocol === 6)) return new Stream(this, domain);
       return -EAFNOSUPPORT;
     }
     // One AF_UNIX socket has nothing to talk to until something binds a name for it, and a name is
@@ -303,7 +304,7 @@ class Datagram {
   connect(addr) {
     this.peer = addr;
     trace(`${this.id} peer ${addr.ip}:${addr.port}`);
-    return Promise.resolve(0);
+    return 0;
   }
 
   /// The bytes queued for sending, or a negative errno. Sending does not wait for the host: a
@@ -427,6 +428,266 @@ class Datagram {
     trace(`${this.id} closed`);
     this.handle?.close();
     this.handle = null;
+  }
+}
+
+/// A TCP socket: a connection, or the listener that makes them. The host does the protocol, so what
+/// is here is the shape the guest's calls expect - bytes in a queue, the end of the stream as a
+/// zero-length read, a connecting socket that is writable only once it is connected - and the
+/// backpressure that keeps a fast sender from filling memory with a slow reader's bytes.
+class Stream {
+  constructor(net, domain, sock = null) {
+    this.net = net;
+    this.id = (Stream.serial = (Stream.serial ?? 0) + 1);
+    this.domain = domain;
+    this.type = SOCK_STREAM;
+    this.queue = [];
+    /// Connections waiting for `accept`, each one a socket of its own.
+    this.accepted = [];
+    this.state = sock ? "connected" : "idle";
+    this.error = 0;
+    this.ended = false;
+    this.readClosed = false;
+    this.listening = false;
+    this.bound = null;
+    this.peer = sock ? { family: domain, ip: sock.remoteAddress, port: sock.remotePort } : null;
+    this.refs = 1;
+    this.nonblock = false;
+    this.timeout = 0;
+    this.noDelay = false;
+    this.sock = sock;
+    this.handle = null;
+    this.listener = null;
+    this.connecting = null;
+    this.paused = false;
+    // A connection the host accepted is already readable: its bytes are only queued once something
+    // is listening for them, and that is this socket's host object.
+    if (sock) this.host();
+  }
+
+  host() {
+    if (this.handle) return this.handle;
+    this.handle = this.net.network.connection({
+      ipv6: this.domain === AF_INET6,
+      sock: this.sock,
+      noDelay: this.noDelay,
+      onData: (bytes) => {
+        this.queue.push(bytes);
+        if (this.queued() > 256 * 1024 && !this.paused) {
+          this.paused = true;
+          this.handle.pause();
+        }
+        this.net.notify();
+      },
+      onEnd: () => {
+        this.ended = true;
+        this.net.notify();
+      },
+      onError: (errno) => {
+        this.error = errno;
+        this.net.notify();
+      },
+    });
+    return this.handle;
+  }
+
+  queued() {
+    return this.queue.reduce((n, chunk) => n + chunk.length, 0);
+  }
+
+  // ---- the listener
+
+  async bind(addr) {
+    if (this.bound || this.listener) return -EINVAL;
+    const listener = this.net.network.listener({
+      ipv6: this.domain === AF_INET6,
+      onConnection: (sock) => {
+        this.accepted.push(new Stream(this.net, this.domain, sock));
+        this.net.notify();
+      },
+      onError: (errno) => {
+        this.error = errno;
+        this.net.notify();
+      },
+    });
+    const errno = await listener.listen(addr.ip, addr.port);
+    if (errno) {
+      listener.close();
+      return errno;
+    }
+    this.listener = listener;
+    this.bound = { family: this.domain, ...listener.address() };
+    trace(`${this.id} listening on ${this.bound.ip}:${this.bound.port}`);
+    return 0;
+  }
+
+  listen() {
+    if (!this.listener) return -EINVAL;
+    this.listening = true;
+    return 0;
+  }
+
+  /// The next connection, or null when there is none yet and an errno when this socket is not a
+  /// listener to begin with.
+  accept() {
+    if (!this.listener) return -EINVAL;
+    if (!this.listening) return -EINVAL;
+    const conn = this.accepted.shift();
+    return conn ?? null;
+  }
+
+  // ---- the connection
+
+  connect(addr) {
+    if (this.state === "connected") return -EISCONN;
+    if (this.connecting) return this.connecting;
+    this.peer = { family: addr.family, ip: addr.ip, port: addr.port };
+    this.state = "connecting";
+    trace(`${this.id} connecting to ${addr.ip}:${addr.port}`);
+    this.connecting = this.host()
+      .connect(addr.ip, addr.port)
+      .then((errno) => {
+        if (errno) {
+          this.state = "failed";
+          this.error = -errno;
+          this.net.notify();
+          return errno;
+        }
+        this.state = "connected";
+        const got = this.handle.peer();
+        if (got) this.peer = { family: this.domain, ...got };
+        this.net.notify();
+        return 0;
+      });
+    return this.connecting;
+  }
+
+  waitConnected() {
+    return this.connecting ?? Promise.resolve(0);
+  }
+
+  send(bytes) {
+    if (this.state !== "connected") return -ENOTCONN;
+    return this.host().send(bytes);
+  }
+
+  recv(max, peek = false) {
+    if (this.queue.length) {
+      const first = this.queue[0];
+      const data = first.subarray(0, max);
+      if (!peek) {
+        if (data.length === first.length) this.queue.shift();
+        else this.queue[0] = first.subarray(data.length);
+        if (this.paused && this.queued() < 64 * 1024) {
+          this.paused = false;
+          this.handle.resume();
+        }
+      }
+      return { data, from: null, full: data.length };
+    }
+    if (this.error && this.state === "failed") {
+      const errno = this.error;
+      this.error = 0;
+      return { errno };
+    }
+    // The peer is done sending: a read answers zero, which is the end of the stream.
+    if (this.ended) return { data: Buffer.alloc(0), from: null, full: 0 };
+    return WOULD_BLOCK;
+  }
+
+  status() {
+    return {
+      read: this.queue.length > 0 || this.ended,
+      // A connecting socket is not writable yet, which is how a guest waiting on a non-blocking
+      // connect learns that it finished.
+      write: this.state === "connected",
+      err: this.state === "failed",
+      hup: this.ended,
+    };
+  }
+
+  pending() {
+    return this.queued();
+  }
+
+  addressPending() {
+    return this.state === "connecting";
+  }
+
+  async ready() {
+    if (this.state === "connecting") await this.connecting;
+    return this.address();
+  }
+
+  address() {
+    if (this.bound) return this.bound;
+    if (this.listener) {
+      const got = this.listener.address();
+      if (got) return { family: this.domain, ...got };
+    }
+    if (this.handle) {
+      const got = this.handle.address();
+      if (got) return { family: this.domain, ...got };
+    }
+    return { family: this.domain, ip: this.domain === AF_INET6 ? "::" : "0.0.0.0", port: 0 };
+  }
+
+  shutdown(how) {
+    // SHUT_RD, SHUT_WR or both. A half-close is the peer's end of stream, which is what a client
+    // that has said everything it has to say does.
+    if (how === 0 || how === 2) this.readClosed = true;
+    if (how === 1 || how === 2) this.host().shutdownWrite();
+    if (how === 2) this.ended = true;
+    return 0;
+  }
+
+  option(level, name, value) {
+    if (level === 1 && name === 20) {
+      if (!value || value.length < 16) return -EINVAL;
+      const sec = Number(value.readBigInt64LE(0));
+      const usec = Number(value.readBigInt64LE(8));
+      this.timeout = Math.max(0, sec * 1000 + Math.round(usec / 1000));
+      return 0;
+    }
+    if (level === 6 && name === 1) {
+      // TCP_NODELAY, which a program sets to stop the host waiting for a full segment.
+      this.noDelay = !(value && value.length >= 4 && value.readInt32LE(0) === 0);
+      if (this.handle) this.handle.setNoDelay(this.noDelay);
+      return 0;
+    }
+    return 0;
+  }
+
+  get(level, name) {
+    switch (`${level}:${name}`) {
+      case "1:3":
+        return this.type;
+      case "1:4": {
+        const errno = this.error;
+        this.error = 0;
+        return errno;
+      }
+      case "1:8":
+      case "1:7":
+        return 212992;
+      case "1:30":
+        return this.listening ? 1 : 0;
+      case "1:38":
+        return 6;
+      case "1:39":
+        return this.domain;
+      default:
+        return null;
+    }
+  }
+
+  release() {
+    if (--this.refs > 0) return;
+    this.state = "closed";
+    trace(`${this.id} closed`);
+    for (const conn of this.accepted.splice(0)) conn.release();
+    this.listener?.close();
+    this.handle?.close();
   }
 }
 
@@ -595,6 +856,140 @@ export const nodeNetwork = {
       close() {
         try {
           sock.close();
+        } catch {}
+      },
+    };
+  },
+
+  /// A TCP connection, or the socket a connection will be made on. A socket the host accepted is
+  /// handed over already connected, so this wraps it as it is.
+  connection({ ipv6, sock = null, noDelay = false, onData, onError, onEnd }) {
+    const socket = sock ?? new net.Socket();
+    socket.on("data", (bytes) => onData(Buffer.from(bytes)));
+    socket.on("end", () => onEnd());
+    socket.on("close", () => onEnd());
+    socket.on("error", (e) => onError(errnoOf(e)));
+    if (noDelay) {
+      try {
+        socket.setNoDelay(true);
+      } catch {}
+    }
+    // An accepted socket arrives paused, so the bytes stay in the kernel until there is somewhere
+    // to put them; this is the where.
+    socket.resume();
+    return {
+      connect(ip, port) {
+        return new Promise((resolve) => {
+          const finish = (errno) => {
+            socket.off("connect", ready);
+            socket.off("error", failed);
+            resolve(errno);
+          };
+          const ready = () => finish(0);
+          const failed = (e) => finish(errnoOf(e));
+          socket.on("connect", ready);
+          socket.on("error", failed);
+          try {
+            socket.connect({ host: ip, port });
+          } catch (e) {
+            finish(errnoOf(e));
+          }
+        });
+      },
+      send(bytes) {
+        if (socket.destroyed || socket.writableEnded) return -EPIPE;
+        socket.write(bytes);
+        return bytes.length;
+      },
+      shutdownWrite() {
+        try {
+          socket.end();
+        } catch {}
+      },
+      address() {
+        try {
+          const got = socket.address();
+          return got && typeof got === "object" ? { ip: got.address, port: got.port } : null;
+        } catch {
+          return null;
+        }
+      },
+      peer() {
+        return socket.remoteAddress ? { ip: socket.remoteAddress, port: socket.remotePort } : null;
+      },
+      pause() {
+        try {
+          socket.pause();
+        } catch {}
+      },
+      resume() {
+        try {
+          socket.resume();
+        } catch {}
+      },
+      setNoDelay(on) {
+        try {
+          socket.setNoDelay(on);
+        } catch {}
+      },
+      close() {
+        try {
+          socket.destroy();
+        } catch {}
+      },
+    };
+  },
+
+  /// The listening side: every connection the host accepts is handed over as a socket, and the
+  /// layer above wraps it into a descriptor of its own.
+  listener({ onConnection, onError }) {
+    // The connection is handed over paused: the layer above builds a descriptor out of it first,
+    // and only then does anything read it.
+    const server = net.createServer({ pauseOnConnect: true }, (sock) => onConnection(sock));
+    server.on("error", (e) => onError(errnoOf(e)));
+    let listening = false;
+    let announce;
+    const listeningOnce = new Promise((resolve) => {
+      announce = resolve;
+    });
+    server.on("listening", () => {
+      listening = true;
+      announce();
+    });
+    const address = () => {
+      try {
+        const got = server.address();
+        return got ? { ip: got.address, port: got.port } : null;
+      } catch {
+        return null;
+      }
+    };
+    return {
+      listen(ip, port) {
+        return new Promise((resolve) => {
+          const finish = (errno) => {
+            server.off("listening", onListening);
+            server.off("error", failed);
+            resolve(errno);
+          };
+          const onListening = () => finish(0);
+          const failed = (e) => finish(errnoOf(e));
+          server.on("listening", onListening);
+          server.on("error", failed);
+          try {
+            server.listen({ host: ip, port, backlog: 511 });
+          } catch (e) {
+            finish(errnoOf(e));
+          }
+        });
+      },
+      address,
+      ready() {
+        return listening ? Promise.resolve(address()) : listeningOnce.then(address);
+      },
+      close() {
+        try {
+          server.close();
         } catch {}
       },
     };
