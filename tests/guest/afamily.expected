@@ -1,0 +1,18 @@
+ok   socket(AF_INET6, SOCK_DGRAM) returns a descriptor
+ok connect(AF_INET6 socket, an AF_INET address)
+ok sendto(AF_INET6 socket, an AF_INET address)
+EINVAL bind(AF_INET6 socket, an AF_INET address)
+ok   connect(AF_INET6 socket, a v4-mapped AF_INET6 address) succeeds
+EINVAL connect of a 16-byte address to an AF_INET6 socket
+ok   socket(AF_INET, SOCK_DGRAM) returns a descriptor
+EAFNOSUPPORT connect(AF_INET socket, an AF_INET6 address)
+EAFNOSUPPORT sendto(AF_INET socket, an AF_INET6 address)
+EAFNOSUPPORT bind(AF_INET socket, an AF_INET6 address)
+ok connect to an address of family 0
+ok   getsockname of an AF_INET6 socket says AF_INET6
+ok   getsockname reports an AF_INET6 address's length
+ok   an unbound socket has port 0
+ok   socketpair for a peer address
+ok   an unnamed pair end's peer has no family of its own
+ok   and the length is a bare family, which is all it holds
+afamily: all checks passed

@@ -14,6 +14,7 @@ import dgram from "node:dgram";
 import net from "node:net";
 import { WOULD_BLOCK } from "./files.mjs";
 
+export const AF_UNSPEC = 0;
 export const AF_UNIX = 1;
 export const AF_INET = 2;
 export const AF_INET6 = 10;
@@ -46,22 +47,25 @@ export const EHOSTUNREACH = 113;
 export const EINPROGRESS = 115;
 
 /// A `struct sockaddr` as the guest wrote it. Anything this layer does not speak is null, which the
-/// syscall turns into EAFNOSUPPORT rather than pretending the address was understood.
+/// syscall turns into the errno for it. RFC 2553 made 24 bytes the length of a v6 address, so four
+/// bytes less than the structure is still an address: the scope id is the only part missing.
 export function decodeSockaddr(bytes) {
   if (!bytes || bytes.length < 2) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const family = view.getUint16(0, true);
+  if (family === AF_UNSPEC) return { family };
   if (family === AF_INET) {
     if (bytes.length < 16) return null;
     const port = view.getUint16(2, false);
     return { family, ip: `${bytes[4]}.${bytes[5]}.${bytes[6]}.${bytes[7]}`, port };
   }
   if (family === AF_INET6) {
-    if (bytes.length < 28) return null;
+    if (bytes.length < 24) return null;
     const port = view.getUint16(2, false);
     const groups = [];
     for (let i = 0; i < 8; i++) groups.push(view.getUint16(8 + i * 2, false));
-    return { family, ip: formatV6(groups), port, scope: view.getUint32(24, true) };
+    const scope = bytes.length >= 28 ? view.getUint32(24, true) : 0;
+    return { family, ip: formatV6(groups), port, scope };
   }
   if (family === AF_UNIX) {
     let end = 2;
@@ -69,6 +73,27 @@ export function decodeSockaddr(bytes) {
     return { family, path: bytes.toString("latin1", 2, end) };
   }
   return null;
+}
+
+/// An address as the socket it is given to holds it, or the errno a kernel answers with.
+///
+/// An AF_INET6 socket speaks both families, and a v4 address given to one is the v4-mapped form of
+/// the same address: that is the address a real socket reports back from `getsockname`, and glibc
+/// reads it looking for exactly that shape. Nothing maps the other way, and a `bind` maps nothing
+/// in either direction, because it names a local address rather than a destination.
+export function sockaddrFor(domain, addr, bind = false) {
+  if (addr.family === domain || addr.family === AF_UNSPEC) return addr;
+  if (domain === AF_INET6 && addr.family === AF_INET) return bind ? -EINVAL : mappedV4(addr);
+  return -EAFNOSUPPORT;
+}
+
+/// The v4-mapped form of a v4 address, written the way the 16 bytes it becomes are written: the
+/// first ten bytes zero, two bytes of ones, then the address.
+function mappedV4(addr) {
+  const [a, b, c, d] = String(addr.ip).split(".").map(Number);
+  const hi = ((a << 8) | b).toString(16);
+  const lo = ((c << 8) | d).toString(16);
+  return { family: AF_INET6, ip: `::ffff:${hi}:${lo}`, port: addr.port, scope: 0 };
 }
 
 /// The 16, 28 or 110 bytes a `getsockname`, a `getpeername` or the address a datagram came from
@@ -120,11 +145,20 @@ function formatV6(groups) {
 function parseV6(ip) {
   const text = String(ip ?? "::");
   const [head, tail] = text.split("::");
-  const left = head ? head.split(":") : [];
-  const right = tail === undefined ? [] : tail ? tail.split(":") : [];
+  const groups = (part) => (part ? part.split(":") : []).flatMap(splitV6Group);
+  const left = groups(head);
+  const right = groups(tail);
   const fill = 8 - left.length - right.length;
-  const all = [...left, ...Array(Math.max(fill, 0)).fill("0"), ...right];
-  return all.slice(0, 8).map((g) => parseInt(g || "0", 16) & 0xffff);
+  const all = [...left, ...Array(Math.max(fill, 0)).fill(0), ...right];
+  return all.slice(0, 8).map((g) => g & 0xffff);
+}
+
+/// One group of a v6 address, which the text may write as a dotted v4 pair at the end: the mapped
+/// form of a v4 address reads `::ffff:127.0.0.1` as often as `::ffff:7f00:1`.
+function splitV6Group(group) {
+  if (!group.includes(".")) return [parseInt(group || "0", 16)];
+  const [a, b, c, d] = group.split(".").map(Number);
+  return [(a << 8) | b, (c << 8) | d];
 }
 
 /// What the host's own errno would be, from the error an operation on a host socket threw or
@@ -254,6 +288,7 @@ class Datagram {
     this.binding = false;
     this.closed = false;
     this.sent = false;
+    this.connecting = null;
   }
 
   host() {
@@ -299,11 +334,34 @@ class Datagram {
     return 0;
   }
 
-  /// A datagram socket's connect puts the peer on the description and sends nothing, which is what
-  /// Linux does: a connected datagram socket only accepts traffic from that address.
+  /// A datagram socket's connect puts the peer on the description and sends no datagram, but it is
+  /// still a connection: the host picks the local address and port the route gives it, and those
+  /// are what `getsockname` reports to a caller that connects to learn which interface it would
+  /// leave by.
   connect(addr) {
     this.peer = addr;
     trace(`${this.id} peer ${addr.ip}:${addr.port}`);
+    // The address the host's resolver answers is answered here, so nothing on the host's side ever
+    // sees it, and asking the host to connect to an address it cannot route would only add an
+    // error a guest could read.
+    if (this.net.resolver?.handles(addr.ip)) return 0;
+    this.connecting = this.host()
+      .connect(addr.ip, addr.port)
+      .then((errno) => {
+        this.connecting = null;
+        if (errno) this.error = -errno;
+        this.net.notify();
+        return errno;
+      });
+    return 0;
+  }
+
+  /// A connect to no address at all, which is how a datagram socket forgets its peer.
+  disconnect() {
+    this.peer = null;
+    try {
+      this.handle?.disconnect();
+    } catch {}
     return 0;
   }
 
@@ -313,6 +371,9 @@ class Datagram {
   send(bytes, addr) {
     const to = addr ?? this.peer;
     if (!to) return -EDESTADDRREQ;
+    // A connected socket sends to the peer it was connected to, and a send anywhere else is the one
+    // answer Linux gives rather than a datagram that ignores the description.
+    if (this.peer && addr && (addr.ip !== this.peer.ip || addr.port !== this.peer.port)) return -EISCONN;
     // A query for the address the guest's resolver file names is answered by the host's own
     // resolver instead of reaching a network: the answer arrives on this socket, from that address,
     // which is what a resolver waiting for one expects.
@@ -360,16 +421,18 @@ class Datagram {
     return this.queue.length ? this.queue[0].data.length : 0;
   }
 
-  /// Whether the address is one the host has yet to choose: a socket that has sent without being
-  /// bound gets its port a moment after the send.
+  /// Whether the address is one the host has yet to choose: a socket that has sent or connected
+  /// without being bound gets its address from the route a moment later.
   addressPending() {
-    return this.sent && this.bound === null;
+    return this.connecting !== null || (this.sent && this.bound === null);
   }
 
-  /// The address once the host has chosen one, for a guest that asks in the same breath as the
-  /// send that bound the socket.
+  /// The address once the host has chosen one, for a guest that asks in the same breath as the send
+  /// or the connection that gave it one.
   async ready() {
-    if (!this.addressPending() || !this.handle) return this.address();
+    if (this.connecting) await this.connecting;
+    if (!this.handle) return this.address();
+    if (!this.sent && this.bound !== null) return this.address();
     const got = await this.handle.ready();
     if (got && !this.bound) this.bound = { family: this.domain, ...got };
     return this.address();
@@ -564,6 +627,12 @@ class Stream {
 
   waitConnected() {
     return this.connecting ?? Promise.resolve(0);
+  }
+
+  /// A connection has nothing to forget: the request to connect to no address is the one answer
+  /// Linux gives a stream socket, whatever state it was in.
+  disconnect() {
+    return -EAFNOSUPPORT;
   }
 
   send(bytes) {
@@ -789,6 +858,7 @@ export const nodeNetwork = {
     // A socket is bound either by `bind` or by the host's own choice on the first send, and both
     // end with the same event.
     let bound = false;
+    let peer = null;
     let announce;
     const listeningOnce = new Promise((resolve) => {
       announce = resolve;
@@ -826,13 +896,47 @@ export const nodeNetwork = {
           }
         });
       },
+      /// A connection, which for a datagram socket binds it: the local address and port are the
+      /// route's answer, and the peer is the only address it will send to afterwards.
+      connect(ip, port) {
+        return new Promise((resolve) => {
+          const settle = (errno) => {
+            sock.off("connect", done);
+            sock.off("error", failed);
+            peer = errno ? null : { ip, port };
+            resolve(errno);
+          };
+          const done = () => settle(0);
+          const failed = (e) => settle(errnoOf(e));
+          sock.on("connect", done);
+          sock.on("error", failed);
+          try {
+            sock.connect(port, ip);
+          } catch (e) {
+            settle(errnoOf(e));
+          }
+        });
+      },
+      disconnect() {
+        peer = null;
+        try {
+          sock.disconnect();
+        } catch {}
+      },
       send(bytes, ip, port) {
         // The callback is where the network reports a failure it found on the way out; the answer
-        // is the count, which is what a sender gets.
+        // is the count, which is what a sender gets. A connected socket already holds the address,
+        // and the host's own call refuses one besides.
         try {
-          sock.send(bytes, port, ip, (e) => {
-            if (e) onError(errnoOf(e));
-          });
+          if (peer && peer.ip === ip && peer.port === port) {
+            sock.send(bytes, (e) => {
+              if (e) onError(errnoOf(e));
+            });
+          } else {
+            sock.send(bytes, port, ip, (e) => {
+              if (e) onError(errnoOf(e));
+            });
+          }
         } catch (e) {
           return -errnoOf(e);
         }

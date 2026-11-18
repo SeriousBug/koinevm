@@ -11,6 +11,10 @@ import {
   Net,
   decodeSockaddr,
   encodeSockaddr,
+  sockaddrFor,
+  AF_UNSPEC,
+  AF_INET,
+  AF_INET6,
   EAGAIN,
   ENOTSOCK,
   ENOTCONN,
@@ -809,8 +813,20 @@ export class Kernel {
   guestAddr(addr, len) {
     if (this.addr(addr) === 0) return null;
     const bytes = this.read(addr, Math.min(Math.max(Number(len), 0), 128));
-    if (bytes === null) return undefined;
-    return decodeSockaddr(bytes) ?? undefined;
+    if (bytes === null) return -EFAULT;
+    // A structure shorter than the family it names is not an address, and reading one anyway is
+    // how a kernel reports a caller's own mistake.
+    const family = bytes.length >= 2 ? bytes[0] | (bytes[1] << 8) : 0;
+    const need = family === AF_INET ? 16 : family === AF_INET6 ? 24 : 2;
+    if (bytes.length < need) return -EINVAL;
+    return decodeSockaddr(bytes) ?? -EAFNOSUPPORT;
+  }
+
+  /// The address a socket call names, held as the socket's own domain holds it, or the errno.
+  socketAddr(desc, addr, len, bind = false) {
+    const want = this.guestAddr(addr, len);
+    if (want === null || typeof want === "number") return want;
+    return sockaddrFor(desc.domain, want, bind);
   }
 
   /// Write an address back, and the length it really is: the caller's own limit bounds the copy,
@@ -901,8 +917,8 @@ export class Kernel {
     if (!this.inBounds(msg, Kernel.MSGHDR)) return -EFAULT;
     const name = Number(this.u64(msg));
     const namelen = new DataView(this.memory.buffer).getUint32(msg + 8, true);
-    const to = this.guestAddr(name, namelen);
-    if (to === undefined) return -EFAULT;
+    const to = this.socketAddr(desc, name, namelen);
+    if (typeof to === "number") return to;
     const iovs = this.iovecs(msg);
     if (!iovs) return -EINVAL;
     const parts = [];
@@ -1096,9 +1112,9 @@ export class Kernel {
     this.on(200, (k, fd, addr, len) => {
       const desc = k.socketDesc(Number(fd));
       if (typeof desc === "number") return [BigInt(desc), 0];
-      const want = k.guestAddr(addr, len);
-      if (want === undefined) return k.fail(EFAULT);
+      const want = k.socketAddr(desc, addr, len, true);
       if (want === null) return k.fail(EINVAL);
+      if (typeof want === "number") return [BigInt(want), 0];
       return k.ask({ kind: "bind", fd: Number(fd), addr: want });
     });
 
@@ -1118,9 +1134,12 @@ export class Kernel {
     this.on(203, (k, fd, addr, len) => {
       const desc = k.socketDesc(Number(fd));
       if (typeof desc === "number") return [BigInt(desc), 0];
-      const want = k.guestAddr(addr, len);
-      if (want === undefined) return k.fail(EFAULT);
+      const want = k.socketAddr(desc, addr, len);
       if (want === null) return k.fail(EINVAL);
+      if (typeof want === "number") return [BigInt(want), 0];
+      // A datagram socket told to forget its peer is disconnected rather than refused, which is how
+      // a program that sends to a new destination each time is written.
+      if (want.family === AF_UNSPEC) return [BigInt(desc.disconnect?.() ?? -EAFNOSUPPORT), 0];
       // A datagram socket's connect records the peer and answers now. A connection has to reach the
       // host: a guest that asked not to wait gets EINPROGRESS and learns the outcome from `poll`
       // and SO_ERROR, which is the path every non-blocking client takes.
@@ -1162,8 +1181,8 @@ export class Kernel {
     this.on(206, (k, fd, buf, len, flags, addr, addrlen) => {
       const desc = k.socketDesc(Number(fd));
       if (typeof desc === "number") return [BigInt(desc), 0];
-      const to = k.guestAddr(addr, addrlen);
-      if (to === undefined) return k.fail(EFAULT);
+      const to = k.socketAddr(desc, addr, addrlen);
+      if (typeof to === "number") return [BigInt(to), 0];
       const bytes = k.read(buf, Math.min(Number(len), 0x7ffff000));
       if (bytes === null) return k.fail(EFAULT);
       return [BigInt(desc.send(Buffer.from(bytes), to)), 0];
