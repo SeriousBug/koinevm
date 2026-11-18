@@ -906,8 +906,9 @@ pub fn build_initial_stack(
     auxv.push((13, 0));
     auxv.push((14, 0));
     auxv.push((15, platform_addr));
-    // AT_HWCAP stays 0. FP and ASIMD are not translated yet; claiming them turns into a trap on the
-    // first vector instruction instead of an honest refusal.
+    // AT_HWCAP stays 0, which puts glibc on its baseline routines. The ones it would pick for a CPU
+    // with FP and ASIMD are hand-written assembly - the string, memory and crypto paths - and that is
+    // the instruction coverage that has been checked least; a refusal there kills the run.
     auxv.push((16, 0));
     auxv.push((17, 100));
     auxv.push((23, 0));

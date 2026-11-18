@@ -60,21 +60,30 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `hello` | string setup, a loop, integer division by magic multiply, `umulh`, `strb`, exit code | exact |
 | `call` | recursion (`fib(20)`), a function pointer table called through `blr`, `stp`/`ldp` frames, signed division, printing | exact, exit 7 |
 | `flags` | `tst`/`ccmp` chains, `adcs`/`sbc` multi-word arithmetic, `csel`/`cset` over a matrix, `b.hi` | exact |
-| `simd` | 838 vector cases: load/store widths, three-same, two-misc, across, three-different, shifts by immediate, copy/permute/`tbl`/`tbx`/`ext`, and every conversion between general and FP registers | exact |
+| `simd` | load/store widths, three-same, two-misc, across, three-different, shifts by immediate, copy/permute/`tbl`/`tbx`/`ext`, every conversion between general and FP registers, and the one-lane scalar forms | exact |
 | `bits` | `rbit`, `clz`, `cls`, `rev`, `rev32`, `rev16` over 76 patterns, and the `rbit; clz; lsr #2` sequence glibc finds a byte with | exact |
 | `stack` | frames sized at run time: `sub sp, sp, xN` in the shifted and extended forms, `and sp, xn, #-16`, `alloca` with calls while the frame is open, recursion with a buffer per level | exact |
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
-58 oracle cases pass: six guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Eight more cases have no native oracle and assert the ABI themselves: the loader
-handoff (`tests/dyn.sh`), the memory syscalls (`tests/mem.sh`) and the file syscalls
-(`tests/files.sh`), each in both address-check modes. `bash tests/run.sh` runs all 66.
+80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
+checks on and off. Seventeen more have no native oracle and assert the ABI themselves: the loader
+handoff (`tests/dyn.sh`), the memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`,
+which makes two names that differ only in case and checks they stay two files), and the socket,
+epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all 97.
 
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
 a container and records the oracle there) through the translated `ld-linux` and `libc.so.6`, in both
-address-check modes. `bash tests/shell.sh` runs Debian's own `dash` under 33 `-c` scripts, translated
+address-check modes. `bash tests/shell.sh` runs Debian's own `dash` under 53 `-c` scripts, translated
 and inside `chroot` on a container's kernel, and compares stdout, stderr and exit status of each.
+
+The toolchain is the other test, because it is the thing that exercises every instruction the way
+real code does. `apt-get install` unpacks and configures Debian's own packages inside the guest -
+`gcc`, `g++`, `make`, `python3-dev`, `linux-libc-dev` and what they pull in - and `gcc -O2` then
+compiles a C file to assembly that is byte for byte what the same gcc 12.2 emits natively, with every
+pass of `-fdump-tree-all` and `-fdump-rtl-all` matching apart from the addresses the compiler's own
+allocator landed on. `pip install --no-binary :all: msgpack` compiles a C extension with that gcc and
+imports it: a shared object built and `dlopen`ed inside the guest.
 
 ## Performance
 
@@ -116,9 +125,10 @@ Two things follow.
   `dash: 1: nosuchcommand: not found` and exits 127, `-c ':;exit 7'` exits 7, all matching the same
   binary on a real kernel.
 - **Variable expansion and control flow.** Parameters, substrings, defaults, assignments,
-  arithmetic, quotes, `if`/`while`/`for`/`case`, functions and `printf` all behave: 33 `-c` scripts
-  print what the same binary prints on a real kernel and exit the same way. What is left is what
-  needs a second process: a pipe, a subshell, or any external command other than a builtin.
+  arithmetic, quotes, `if`/`while`/`for`/`case`, functions and `printf` all behave: 53 `-c` scripts
+  print what the same binary prints on a real kernel and exit the same way. Pipes, command
+  substitution, subshells, background jobs with `wait` and external commands are in that set. A pipe
+  is two processes over one descriptor table, which is what `fork` and `execve` are here.
 - **Scalar floating point.** Every shape is translated and compared against the oracle: `fadd`,
   `fsub`, `fmul`, `fdiv`, `fnmul`, `fmax`/`fmin` and their number forms (with the NaN each of them
   hands back, bit for bit), `fabs`, `fneg`, `fsqrt`, `fmov` with a register and with the eight-bit
@@ -128,9 +138,6 @@ Two things follow.
   infinities, a quiet and a signalling NaN, a denormal and values that only differ in the last bit.
   One known inexactness: wasm has no fused multiply-add, so `fmadd` and its siblings round twice and
   can differ from the instruction in the last bit.
-  `fadd`, `fmul`, `fdiv`, `fsqrt`, `fcmp`, `fcsel`, `fneg`/`fabs`/`fmax`/`fmin` and `fcvt` between
-  precisions are refused at the instruction that reaches them, and glibc's own pages already report
-  them: `scalar floating point arithmetic is not translated yet` at `0x4004cec8`.
 - **Instruction coverage of a big library.** Threads of libc build (a page of `strlen` variants) that
   are unreachable from the entries the translator finds report `undecoded instruction`, up to 116
   words in one page. They are where the `-mgeneral-regs-only` gap and the crypto/atomics gap would
@@ -140,9 +147,11 @@ Two things follow.
 - **Self-modifying code and guest JITs.** Nothing invalidates a translation. Adding a page module is
   already dynamic, so invalidation has somewhere to live, but it is not implemented.
 - **Signals.** A trap kills the run instead of being delivered to a guest handler.
-- **Threads, `fork`/`exec`, a real block device.** One process, one thread, and files come from a host
-  directory rather than a disk image. `wait4`, `execve`, `clone` and `getdents64` are not there, so a
-  shell would have nothing to run and nothing to list.
+- **Threads are coroutines, and nothing has a disk.** `clone` makes a thread inside one instance with
+  its own registers and stack, and the scheduler runs whichever thread asks the host for nothing; no
+  thread is preempted, so a guest that spins without a syscall stalls the others. Files come from a
+  host directory rather than a block device or an ext4 image, which is what `docs/fs.md` is about.
+  `ptrace` is not implemented, so a debugger cannot attach.
 - **The kernel's own memory is guest-addressable.** Guest virtual addresses are linear-memory
   offsets, so the shadow register file and the page table sit in low memory where a wild guest write
   can reach them, and a relocation written with a zero bias would land there silently instead of
