@@ -991,8 +991,9 @@ fn decode_scalar_fp(w: u32) -> Insn {
 
     // Scalar FP compare against zero. Bit 23 is set where the other scalar forms of this shape leave
     // it clear, so the type is bit 22, and the four bits at 15:12 pick which comparison it is: the
-    // two that are not `gt` differ in the U bit as well.
-    if (w >> 23) & 1 == 1 && (w >> 16) & 0x1f == 0 && (w >> 10) & 7 == 0b010 {
+    // two that are not `gt` differ in the U bit as well. Bits 11:10 are the marker `10`, which is
+    // what tells these from the register forms of the same comparisons and from `cmtst`.
+    if (w >> 23) & 1 == 1 && (w >> 16) & 0x1f == 0 && (w >> 10) & 3 == 0b10 {
         // Comparisons against zero come in the same shape twice: bit 14 set is the floating point
         // family, clear is the integer one on the 64-bit lane.
         let u = (w >> 29) & 1 == 1;

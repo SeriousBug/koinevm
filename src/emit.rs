@@ -5353,8 +5353,9 @@ impl<'a> RegionEmitter<'a> {
                 self.close_if();
             }
             Insn::ScalarThree { u, size, op, rn, rm, rd } => {
-                // One 64-bit lane and the rest of the register left as it was: `add d0, d1, d2` is
-                // the 64-bit integer add a program's own number code reaches for.
+                // One 64-bit lane, and the rest of the register cleared: a write in a scalar form
+                // sets every bit above the value it produces to zero. `add d0, d1, d2` is the
+                // 64-bit integer add a program's own number code reaches for.
                 if size != 3 {
                     return self.refuse(format!("half precision floating point at 0x{addr:x}"));
                 }
@@ -5367,7 +5368,7 @@ impl<'a> RegionEmitter<'a> {
                         ))
                     }
                 };
-                self.getv(rd);
+                self.f.v128c([0; 16]);
                 self.getv(rn);
                 self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
                 self.getv(rm);
@@ -5377,24 +5378,27 @@ impl<'a> RegionEmitter<'a> {
                 self.setv(rd);
             }
             Insn::ScalarTwoMisc { size, negate, rn, rd } => {
-                // One lane of the register, as wide as the instruction names, with the rest left as
-                // it was.
+                // One lane of the register, as wide as the instruction names, and the rest of the
+                // register cleared, as every scalar write does.
                 if size < 2 {
                     return self.refuse(format!("scalar two-register width {size} at 0x{addr:x}"));
                 }
                 let wide = size == 3;
-                self.getv(rd);
-                self.getv(rn);
-                self.f.simd_lane(if wide { simd::I64X2_EXTRACT_LANE } else { simd::I32X4_EXTRACT_LANE }, 0);
+                self.f.v128c([0; 16]);
                 if negate {
+                    // The zero goes under the lane: both subtracts take the lane off it, and the
+                    // other order leaves the lane as it was.
                     if wide {
                         self.f.i64c(0);
-                        self.f.op(I64_SUB);
                     } else {
                         self.f.i32c(0);
-                        self.f.op(I32_SUB);
                     }
+                    self.getv(rn);
+                    self.f.simd_lane(if wide { simd::I64X2_EXTRACT_LANE } else { simd::I32X4_EXTRACT_LANE }, 0);
+                    self.f.op(if wide { I64_SUB } else { I32_SUB });
                 } else if wide {
+                    self.getv(rn);
+                    self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
                     // `abs` as `(x ^ (x >> 63)) - (x >> 63)`, which is the value without its sign
                     // bit and wraps the same way the instruction does for the most negative one.
                     self.f.ls(L_T2);
@@ -5408,15 +5412,17 @@ impl<'a> RegionEmitter<'a> {
                     self.f.lg(L_T3);
                     self.f.op(I64_SUB);
                 } else {
-                    self.f.ls(L_T2);
-                    self.f.lg(L_T2);
+                    self.getv(rn);
+                    self.f.simd_lane(simd::I32X4_EXTRACT_LANE, 0);
+                    self.f.ls(L_TI);
+                    self.f.lg(L_TI);
                     self.f.i32c(31);
                     self.f.op(I32_SHR_S);
-                    self.f.ls(L_T3);
+                    self.f.ls(L_T2);
+                    self.f.lg(L_TI);
                     self.f.lg(L_T2);
-                    self.f.lg(L_T3);
                     self.f.op(I32_XOR);
-                    self.f.lg(L_T3);
+                    self.f.lg(L_T2);
                     self.f.op(I32_SUB);
                 }
                 self.f.simd_lane(if wide { simd::I64X2_REPLACE_LANE } else { simd::I32X4_REPLACE_LANE }, 0);

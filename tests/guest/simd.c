@@ -336,6 +336,13 @@ static void setup(void) {
     X(rev32_8h, "rev32 8h", "rev32 v2.8h, v0.8h")                                               \
     X(rev64_16b, "rev64 16b", "rev64 v2.16b, v0.16b")                                           \
     X(rev64_4s, "rev64 4s", "rev64 v2.4s, v0.4s")                                               \
+    /* The scalar forms work on the one 64-bit lane a `d` register names and leave the other half
+     * alone, which is what makes them usable for integer arithmetic on 128-bit halves. */        \
+    X(neg_d, "neg d", "mov v2.16b, v0.16b\n neg d2, d0")                                        \
+    X(abs_d, "abs d", "mov v2.16b, v0.16b\n abs d2, d0")                                        \
+    X(cmeq_d_z, "cmeq d #0", "cmeq d2, d0, #0")                                                 \
+    X(cmge_d_z, "cmge d #0", "cmge d2, d0, #0")                                                 \
+    X(cmgt_d_z, "cmgt d #0", "cmgt d2, d0, #0")                                                 \
     X(cnt_16b, "cnt 16b", "cnt v2.16b, v0.16b")                                                 \
     X(fabs_4s, "fabs 4s", "fabs v2.4s, v0.4s")                                                  \
     X(fabs_2d, "fabs 2d", "fabs v2.2d, v0.2d")                                                  \
@@ -374,6 +381,9 @@ static void setup(void) {
     X(sub_8h, "sub 8h", "sub v2.8h, v0.8h, v1.8h")                                              \
     X(sub_4s, "sub 4s", "sub v2.4s, v0.4s, v1.4s")                                              \
     X(sub_2d, "sub 2d", "sub v2.2d, v0.2d, v1.2d")                                              \
+    /* The scalar integer forms move 128-bit halves through the register file. */                \
+    X(add_d, "add d", "add d2, d0, d1")                                    \
+    X(sub_d, "sub d", "sub d2, d0, d1")                                    \
     X(mul_16b, "mul 16b", "mul v2.16b, v0.16b, v1.16b")                                         \
     X(mul_8h, "mul 8h", "mul v2.8h, v0.8h, v1.8h")                                              \
     X(mul_4s, "mul 4s", "mul v2.4s, v0.4s, v1.4s")                                              \
