@@ -32,6 +32,12 @@ export const WOULD_BLOCK = Symbol("would block");
 
 export const AT_FDCWD = -100;
 
+/// The prefix a name is stored under when the host directory already holds a name that differs only
+/// in case: Debian's kernel headers hold both `xt_connmark.h` and `xt_CONNMARK.h`, and a volume that
+/// does not tell them apart would let one overwrite the other. The guest name is the hex of its
+/// bytes, which no name it can ask for collides with, and the walk decodes it back.
+const CASE_ESCAPE = ".armjit.case.";
+
 const DT = { file: 8, dir: 4, link: 10, fifo: 1, sock: 12, chr: 2, blk: 6 };
 
 /// The character devices a program expects to find: a rootfs unpacked by `apt` has an empty /dev,
@@ -78,6 +84,9 @@ export class Files {
     this.random = 1n;
     this.cwd = "/";
     this.umask = 0o022;
+    /// What each host directory holds, by the directory's own timestamp: the exact spelling of a
+    /// name is only visible in a listing.
+    this.names = new Map();
     this.map.set(0, { kind: "stdin" });
     this.map.set(1, { kind: "stdout" });
     this.map.set(2, { kind: "stderr" });
@@ -107,46 +116,95 @@ export class Files {
         done.pop();
         continue;
       }
+      const at = this.hostName(done.length ? done[done.length - 1] : this.rootfs, name);
       // The form that does not follow its last component, which is the one that unlinks a link or
       // renames it, names the link itself.
       if (queue.length === 0 && !follow) {
-        done.push(name);
+        done.push(at);
         break;
       }
-      const at = `/${[...done, name].join("/")}`;
       let st;
       try {
-        st = fs.lstatSync(path.join(this.rootfs, at));
+        st = fs.lstatSync(at);
       } catch (e) {
         // A component that is not there is the caller's to report, and the last one is a file that
         // an open with O_CREAT is about to make.
         if (queue.length) return -ENOENT;
-        done.push(name);
+        done.push(at);
         break;
       }
       if (!st.isSymbolicLink()) {
-        done.push(name);
+        done.push(at);
         continue;
       }
       if (++links > 40) return -ELOOP;
       let target;
       try {
-        target = fs.readlinkSync(path.join(this.rootfs, at));
+        target = fs.readlinkSync(at);
       } catch (e) {
         return -EINVAL;
       }
       if (target.startsWith("/")) done.length = 0;
       queue.unshift(...target.split("/").filter((p) => p !== "" && p !== "."));
     }
-    const host = path.join(this.rootfs, `/${done.join("/")}`);
+    const host = done.length ? done[done.length - 1] : this.rootfs;
     if (host !== this.rootfs && !host.startsWith(this.rootfs + path.sep)) return -EACCES;
     return host;
   }
 
+  /// The host name a guest name is stored under in this host directory. A volume that folds case
+  /// answers to a name it holds spelled another way, so a name the directory does not hold as asked
+  /// is stored escaped where a name that differs only in case is in the way. Which of the two a name
+  /// got is what the directory holds, not what its neighbours hold now: `dpkg` writes its temporary
+  /// under the target's name and renames it later, by which time the sibling that forced the escape
+  /// may be gone.
+  hostName(dir, name) {
+    const plain = path.join(dir, name);
+    const names = this.namesOf(dir);
+    if (!names) return plain;
+    const escape = CASE_ESCAPE + Buffer.from(name, "utf8").toString("hex");
+    if (names.includes(escape)) return path.join(dir, escape);
+    if (names.includes(name)) return plain;
+    const lower = name.toLowerCase();
+    if (!names.some((n) => n.toLowerCase() === lower)) return plain;
+    return path.join(dir, escape);
+  }
+
+  /// The names a host directory holds, spelled as it holds them: the only place the exact case of a
+  /// name is visible. Cached against the directory's own timestamp, because every component of every
+  /// path is looked up here.
+  namesOf(dir) {
+    let st;
+    try {
+      st = fs.statSync(dir, { bigint: true });
+    } catch (e) {
+      return null;
+    }
+    const stamp = `${st.mtimeNs}/${st.ino}`;
+    const cached = this.names.get(dir);
+    if (cached && cached.stamp === stamp) return cached.list;
+    let list;
+    try {
+      list = fs.readdirSync(dir);
+    } catch (e) {
+      return null;
+    }
+    this.names.set(dir, { stamp, list });
+    return list;
+  }
+
+  /// The guest name an entry of a host directory stands for.
+  guestName(name) {
+    if (!name.startsWith(CASE_ESCAPE)) return name;
+    const hex = name.slice(CASE_ESCAPE.length);
+    if (!/^([0-9a-f]{2})+$/.test(hex)) return name;
+    return Buffer.from(hex, "hex").toString("utf8");
+  }
+
   /// The guest path a host path inside the tree stands for.
   guestOf(host) {
-    const rel = path.relative(this.rootfs, host).split(path.sep).join("/");
-    return rel ? `/${rel}` : "/";
+    const rel = path.relative(this.rootfs, host).split(path.sep).filter((p) => p !== "");
+    return rel.length ? `/${rel.map((p) => this.guestName(p)).join("/")}` : "/";
   }
 
   /// A `*at` call's path: an absolute one is the guest's root, a relative one is the directory
@@ -450,7 +508,7 @@ export class Files {
     add(".", entry.host);
     add("..", path.join(entry.host, ".."));
     for (const d of fs.readdirSync(entry.host, { withFileTypes: true })) {
-      add(d.name, path.join(entry.host, d.name));
+      add(this.guestName(d.name), path.join(entry.host, d.name));
     }
     entry.entries = out;
     return out;

@@ -170,6 +170,36 @@ __attribute__((used)) void _start(void) {
     check(fstat_(temp, statbuf) == 0, "fstat an unlinked file", 0);
     check(close_(temp) == 0, "close an unlinked file", 0);
 
+    // Two names that differ only in case are two files: Debian's kernel headers hold both
+    // `xt_connmark.h` and `xt_CONNMARK.h`, and a host directory that folds case must still tell
+    // them apart, contents and all.
+    long low = openat_("/case-a.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    long high = openat_("/CASE-A.TXT", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    check(low >= 3 && high >= 3 && low != high, "two names that differ in case open twice", 0);
+    check(write_(low, "the lower one\n", 14) == 14, "write one of the two names", 0);
+    check(write_(high, "THE UPPER ONE\n", 14) == 14, "write the other name", 0);
+    check(close_(low) == 0 && close_(high) == 0, "close both names", 0);
+    low = openat_("/case-a.txt", O_RDONLY, 0);
+    n = low >= 3 ? read_(low, buf, sizeof(buf)) : -1;
+    check(n == 14 && bytes_equal(buf, "the lower one\n", 14), "the first name kept its bytes",
+          (unsigned long)n);
+    if (low >= 3) close_(low);
+    high = openat_("/CASE-A.TXT", O_RDONLY, 0);
+    n = high >= 3 ? read_(high, buf, sizeof(buf)) : -1;
+    check(n == 14 && bytes_equal(buf, "THE UPPER ONE\n", 14), "the second name kept its bytes",
+          (unsigned long)n);
+    if (high >= 3) close_(high);
+    check(openat_("/Case-A.txt", O_RDONLY, 0) == -2, "a third spelling is a third name", 0);
+    check(sc6(35, AT_FDCWD, (long)"/case-a.txt", 0, 0, 0, 0) == 0, "unlink the first name", 0);
+    high = openat_("/CASE-A.TXT", O_RDONLY, 0);
+    check(high >= 3, "the other name survives it", 0);
+    if (high >= 3) {
+        check(read_(high, buf, sizeof(buf)) == 14 && bytes_equal(buf, "THE UPPER ONE\n", 14),
+              "and still holds its own bytes", 0);
+        close_(high);
+    }
+    check(sc6(35, AT_FDCWD, (long)"/CASE-A.TXT", 0, 0, 0, 0) == 0, "unlink the other name", 0);
+
     put(failures ? "files: FAILURES\n" : "files: all checks passed\n");
     guest_exit(failures ? 1 : 0);
 }

@@ -47,10 +47,20 @@ an exception.
 
 ## Two names, one file
 
-The rootfs is a directory on this machine, so the tree is only as expressive as the host's
-filesystem. A default APFS volume does not tell `xt_connmark.h` from `xt_CONNMARK.h`, and Debian's
-kernel headers hold both: `apt-get install linux-libc-dev` unpacks the first and fails on the
-second, because dpkg's `rename` finds the temporary file gone, renamed to the other name. The same
-applies to `xt_mark.h`, `xt_dscp.h` and the rest of that family. A case-sensitive volume for the
-rootfs - an APFS volume made with `case-sensitive`, or any Linux filesystem mounted here - is what a
-Debian tree needs, and nothing inside the guest can make up the difference.
+The rootfs is a directory on this machine, and a default APFS volume does not tell `xt_connmark.h`
+from `xt_CONNMARK.h`. Debian's kernel headers hold both, along with `xt_mark.h`, `xt_dscp.h` and the
+rest of that family, so a filesystem that folds case would let one of each pair overwrite the other.
+
+What the walk does instead is keep the two apart by name. A name is looked up as the directory holds
+it spelled, which only a listing can say, and a name that another entry would answer to as well is
+stored under `.armjit.case.` and the hex of its bytes: `xt_connmark.h` becomes
+`.armjit.case.78745f636f6e6e6d61726b2e68`. The escape stays with the name, so once a file is created
+that way it is found there by every later lookup, even after the entry that forced the escape is
+gone - `dpkg` writes its temporary under the target's own name and renames it after, by which time
+the sibling is usually not there any more. `readdir` decodes the escapes back, so the guest sees the
+names it created and never the hex.
+
+The host tree shows the escaped spelling for the second of a pair, and a guest name that begins with
+`.armjit.case.` followed by hex is read back as the hex means, so an escaped tree is not a tree to
+edit from the host side and hand back. `apt-get install linux-libc-dev` unpacks its whole header set
+now, which is what `libc6-dev`, `g++` and every `-dev` package depend on.
