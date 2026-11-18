@@ -6,6 +6,12 @@
 // in its dispatch table, and resumes the same run.
 
 import { spawn } from "node:child_process";
+import { readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/// Distinguishes the module files of one host from another's, since they share a temporary folder.
+let imageSerial = 0;
 
 const SHADOW_PC = 0x108;
 const TABLE_SLOT = 8;
@@ -69,11 +75,20 @@ export class Translator {
   }
 
   /// A whole image, which is what `execve` needs: the program, its loader, and the stack built for
-  /// the arguments it was given.
-  image(path, argv, envp) {
+  /// the arguments it was given. The module comes back in a file rather than in the answer, because
+  /// a program the size of `cc1` translates to more wasm than a line of hex can carry.
+  async image(path, argv, envp) {
     const hex = (bytes) => (bytes.length ? Buffer.from(bytes).toString("hex") : "-");
     const args = [...argv.map(hex), String(envp.length), ...envp.map(hex)].join(" ");
-    return this.ask(`image ${path} ${argv.length} ${args}`);
+    const out = join(tmpdir(), `armjit-image-${process.pid}-${(imageSerial += 1)}.wasm`);
+    const answer = await this.ask(`image ${path} ${out} ${argv.length} ${args}`);
+    if (!answer.ok) return answer;
+    try {
+      answer.wasm = readFileSync(out);
+    } finally {
+      rmSync(out, { force: true });
+    }
+    return answer;
   }
 
   stop() {

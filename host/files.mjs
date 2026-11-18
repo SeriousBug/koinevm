@@ -54,6 +54,15 @@ const O_APPEND = 0x400;
 const O_DIRECTORY = 0x4000;
 const O_CLOEXEC = 0x80000;
 
+/// A path operation as it happened on this machine, when the trace names a part of the path: the
+/// guest's name for a file is not the host's, and a package manager that fails one file at a time
+/// says which of the two it meant.
+function tracePath(op, text, result) {
+  const want = process.env.ARMJIT_TRACE_PATHS;
+  if (!want || !text.includes(want)) return;
+  console.error(`${op} ${text} -> ${result}`);
+}
+
 export class Files {
   constructor(rootfs, options = {}) {
     this.rootfs = rootfs ? path.resolve(rootfs) : null;
@@ -305,6 +314,7 @@ export class Files {
         fs.writeFileSync(host, Buffer.alloc(0), { mode: this.mask(mode || 0o666) });
       }
       const st = fs.statSync(host);
+      tracePath("open", host, 0);
       if ((flags & O_DIRECTORY) && !st.isDirectory()) return -ENOTDIR;
       if (st.isDirectory()) {
         if (entry.desc.writable) return -EISDIR;
@@ -612,6 +622,7 @@ export class Files {
     if (host < 0) return host;
     try {
       fs.mkdirSync(host, { mode: this.mask(mode) | 0o700 });
+      tracePath("mkdir", host, "ok");
       return 0;
     } catch (e) {
       return fromErrno(e, -EEXIST);
@@ -623,6 +634,7 @@ export class Files {
     if (host < 0) return host;
     try {
       fs.rmdirSync(host);
+      tracePath("rmdir", host, "ok");
       return 0;
     } catch (e) {
       return fromErrno(e, -ENOTEMPTY);
@@ -634,8 +646,10 @@ export class Files {
     if (host < 0) return host;
     try {
       fs.unlinkSync(host);
+      tracePath("unlink", host, "ok");
       return 0;
     } catch (e) {
+      tracePath("unlink", host, fromErrno(e, -ENOENT));
       return fromErrno(e, -ENOENT);
     }
   }
@@ -647,8 +661,10 @@ export class Files {
     if (b < 0) return b;
     try {
       fs.renameSync(a, b);
+      tracePath("rename", `${a} -> ${b}`, "ok");
       return 0;
     } catch (e) {
+      tracePath("rename", `${a} -> ${b}`, `${fromErrno(e, -EXDEV)} ${e.code}`);
       return fromErrno(e, -EXDEV);
     }
   }

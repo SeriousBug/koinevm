@@ -164,6 +164,8 @@ pub enum Insn {
     FpImm { size: u32, imm8: u32, rd: u32 },
     /// The scalar three-same group: a vector operation on the one 64-bit lane a `d` register names.
     ScalarThree { u: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
+    /// The scalar forms of the two-register group: `abs` and `neg` of the integer in one lane.
+    ScalarTwoMisc { size: u32, negate: bool, rn: u32, rd: u32 },
     /// `fmov x0, v0.d[1]`: the high half of a vector register into a general one.
     VecHighToGpr { rn: u32, rd: u32 },
     /// `fmov v0.d[1], x0`: a general register into the high half of a vector one.
@@ -1133,6 +1135,12 @@ fn decode_scalar_fp(w: u32) -> Insn {
             0b10 => Insn::FpTwoSource { size, opcode: (w >> 12) & 0xf, rn, rm, rd },
             _ => Insn::Undefined,
         };
+    }
+
+    // Scalar `abs` and `neg` of the integer in one lane: the two-register group with bit 28 set,
+    // where bit 23 stays clear and the U bit names the sign operation.
+    if w & 0xff3ffc00 == 0x5e20b800 || w & 0xff3ffc00 == 0x7e20b800 {
+        return Insn::ScalarTwoMisc { size: (w >> 22) & 3, negate: (w >> 29) & 1 == 1, rn, rd };
     }
 
     // The scalar three-same group shares this space with the scalar two-register one, and its

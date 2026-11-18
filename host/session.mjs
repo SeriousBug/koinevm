@@ -709,7 +709,7 @@ export class Session {
     // address space, the page tables and every translation in them do not.
     const files = proc.kernel.files;
     files.keepAcrossExec();
-    proc.module = new WebAssembly.Module(Buffer.from(answer.wasm, "hex"));
+    proc.module = new WebAssembly.Module(answer.wasm);
     proc.meta = meta;
     // The ids are the process's, not the address space's: a program that dropped privileges stays
     // dropped when it execs.

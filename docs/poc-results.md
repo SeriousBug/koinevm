@@ -147,6 +147,13 @@ Two things follow.
   offsets, so the shadow register file and the page table sit in low memory where a wild guest write
   can reach them, and a relocation written with a zero bias would land there silently instead of
   faulting. A real kernel keeps them out of the address space entirely.
+- **A program the size of `cc1` translates to a module the engine will not compile.** `gcc` installs
+  and runs, and `cc1` is where it stops: 1373914 blocks, 5.1 million instructions, a 271 MB module of
+  41371 functions, the largest 2 MB. V8 aborts compiling that one with `Fatal process out of memory:
+  Zone`, so a region is where the limit lives - the emitter inlines a whole region into one function,
+  and a region is as long as the code between two branch targets. Bounding a region's size, or
+  starting from a page and letting the rest arrive on demand as library pages already do, is what
+  would carry it. `python3.11` at 210987 blocks is 40 MB and compiles in a few seconds.
 - **Instruction coverage is compiler output, not the ISA.** Hand-written or obfuscated code that uses
   `rmif`, `setf*`, `ldraa`, pointer authentication, `mrs` of anything else, the LSE atomics, or `SVE`
   is refused rather than mistranslated. That is the right failure mode but it is not coverage.

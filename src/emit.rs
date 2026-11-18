@@ -91,7 +91,13 @@ pub const TABLE_BASE: u64 = 0x2000_0000;
 /// A dispatch slot is `[u32 payload][u32 tag]`: payload 0 is empty, else `block << 16 | region + 1`,
 /// tag is `pc >> 2` plus one so it is never zero.
 pub const TABLE_SLOT: u64 = 8;
-pub const TABLE_MAX_SLOTS: u64 = 1 << 21;
+/// The smallest arena any image is given. The table is open-addressed, so it is two slots for every
+/// block the image holds and a power of two for the mask, and the host adds blocks later when it
+/// translates a page of a library the guest jumps into: the floor is what leaves room for those.
+pub const TABLE_MIN_SLOTS: u64 = 1 << 21;
+/// The most the arena may grow to. `cc1` is 1373914 blocks, which is more than the floor holds; at
+/// four slots a block a gigabyte of code would still fit, and no image this machine runs is that.
+pub const TABLE_MAX_SLOTS: u64 = 1 << 23;
 /// Region slots in the wasm table: a dispatch word holds `slot + 1` in 16 bits.
 pub const TABLE_SLOTS_MAX: u32 = 0xffff;
 /// PoC simplification against a real kernel's randomized layout: images start at fixed addresses.
@@ -253,12 +259,14 @@ fn build_dispatch_table(regions: &[Region], failed: &[bool]) -> Result<(Vec<u8>,
     // page of a library the first time the guest jumps into it, and every block of it takes a slot.
     // A table sized to the initial image fills up part way through a package manager and the insert
     // that cannot find an empty slot has nowhere to go, so the arena is always the whole of it.
-    if blocks as u64 * 2 > TABLE_MAX_SLOTS {
+    // Two slots per block keeps the probes short, and the count is rounded up to a power of two so
+    // that the mask that names a slot is one.
+    let slots = (blocks as u64 * 2).next_power_of_two().max(TABLE_MIN_SLOTS);
+    if slots > TABLE_MAX_SLOTS {
         return Err(format!(
             "{blocks} blocks needs more than the {TABLE_MAX_SLOTS} dispatch slots the arena holds"
         ));
     }
-    let slots = TABLE_MAX_SLOTS;
     let mask = (slots - 1) as u32;
     let mut table = vec![0u8; (slots * TABLE_SLOT) as usize];
     for (region_idx, region) in regions.iter().enumerate() {
@@ -4451,6 +4459,49 @@ impl<'a> RegionEmitter<'a> {
                         rd,
                         if size & 1 == 1 { simd::F64X2_SQRT } else { simd::F32X4_SQRT },
                     ),
+                    // The conversions between an integer vector and a float one, which only the
+                    // 4s and 2d widths have: the 2d form has no wasm equivalent, so its two lanes
+                    // convert one at a time.
+                    (false, 0, 0b11101) => {
+                        self.getv(rn);
+                        self.f.simd(simd::F32X4_CONVERT_I32X4_S);
+                        self.setv(rd);
+                    }
+                    (true, 0, 0b11101) => {
+                        self.getv(rn);
+                        self.f.simd(simd::F32X4_CONVERT_I32X4_U);
+                        self.setv(rd);
+                    }
+                    (false, 1, 0b11101) | (true, 1, 0b11101) => {
+                        self.f.v128c([0; 16]);
+                        for lane in 0..2 {
+                            self.getv(rn);
+                            self.f.simd_lane(simd::I64X2_EXTRACT_LANE, lane);
+                            self.f.op(if u { F64_CONVERT_I64_U } else { F64_CONVERT_I64_S });
+                            self.f.simd_lane(simd::F64X2_REPLACE_LANE, lane);
+                        }
+                        self.setv(rd);
+                    }
+                    // sadalp/uaddlp: the pairs of one lane width added into the next one up.
+                    (u, 0, 0b00010) | (u, 1, 0b00010) => {
+                        let op = if u {
+                            self.lanes_op(size, [
+                                simd::I16X8_EXTADD_PAIRWISE_I8X16_U,
+                                simd::I32X4_EXTADD_PAIRWISE_I16X8_U,
+                                0,
+                                0,
+                            ])
+                        } else {
+                            self.lanes_op(size, [
+                                simd::I16X8_EXTADD_PAIRWISE_I8X16_S,
+                                simd::I32X4_EXTADD_PAIRWISE_I16X8_S,
+                                0,
+                                0,
+                            ])
+                        };
+                        let op = op.ok_or_else(|| format!("bad pairwise add at 0x{addr:x}"))?;
+                        self.vec2(rn, rd, op);
+                    }
                     (true, 0..=2, 0b10011) => {
                         // shll: widen one half of the source and shift it up by the width of the
                         // destination's lanes, which is what the alias of ushll by the element size
@@ -5296,6 +5347,52 @@ impl<'a> RegionEmitter<'a> {
                 self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
                 self.f.op(want);
                 self.f.simd_lane(simd::I64X2_REPLACE_LANE, 0);
+                self.setv(rd);
+            }
+            Insn::ScalarTwoMisc { size, negate, rn, rd } => {
+                // One lane of the register, as wide as the instruction names, with the rest left as
+                // it was.
+                if size < 2 {
+                    return self.refuse(format!("scalar two-register width {size} at 0x{addr:x}"));
+                }
+                let wide = size == 3;
+                self.getv(rd);
+                self.getv(rn);
+                self.f.simd_lane(if wide { simd::I64X2_EXTRACT_LANE } else { simd::I32X4_EXTRACT_LANE }, 0);
+                if negate {
+                    if wide {
+                        self.f.i64c(0);
+                        self.f.op(I64_SUB);
+                    } else {
+                        self.f.i32c(0);
+                        self.f.op(I32_SUB);
+                    }
+                } else if wide {
+                    // `abs` as `(x ^ (x >> 63)) - (x >> 63)`, which is the value without its sign
+                    // bit and wraps the same way the instruction does for the most negative one.
+                    self.f.ls(L_T2);
+                    self.f.lg(L_T2);
+                    self.f.i64c(63);
+                    self.f.op(I64_SHR_S);
+                    self.f.ls(L_T3);
+                    self.f.lg(L_T2);
+                    self.f.lg(L_T3);
+                    self.f.op(I64_XOR);
+                    self.f.lg(L_T3);
+                    self.f.op(I64_SUB);
+                } else {
+                    self.f.ls(L_T2);
+                    self.f.lg(L_T2);
+                    self.f.i32c(31);
+                    self.f.op(I32_SHR_S);
+                    self.f.ls(L_T3);
+                    self.f.lg(L_T2);
+                    self.f.lg(L_T3);
+                    self.f.op(I32_XOR);
+                    self.f.lg(L_T3);
+                    self.f.op(I32_SUB);
+                }
+                self.f.simd_lane(if wide { simd::I64X2_REPLACE_LANE } else { simd::I32X4_REPLACE_LANE }, 0);
                 self.setv(rd);
             }
             Insn::VecHighToGpr { rn, rd } => {

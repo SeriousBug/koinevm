@@ -44,3 +44,13 @@ Character devices are provided rather than found: `/dev/null`, `/dev/zero`, `/de
 Changing the tree - `rename`, `link`, `mkdir`, `rmdir`, `unlink`, `symlink` - is the host's own
 operation on the rootfs, and a failure comes back as the errno a program branches on rather than as
 an exception.
+
+## Two names, one file
+
+The rootfs is a directory on this machine, so the tree is only as expressive as the host's
+filesystem. A default APFS volume does not tell `xt_connmark.h` from `xt_CONNMARK.h`, and Debian's
+kernel headers hold both: `apt-get install linux-libc-dev` unpacks the first and fails on the
+second, because dpkg's `rename` finds the temporary file gone, renamed to the other name. The same
+applies to `xt_mark.h`, `xt_dscp.h` and the rest of that family. A case-sensitive volume for the
+rootfs - an APFS volume made with `case-sensitive`, or any Linux filesystem mounted here - is what a
+Debian tree needs, and nothing inside the guest can make up the difference.

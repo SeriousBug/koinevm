@@ -49,6 +49,22 @@ const CLONE_VFORK = 0x4000;
 const CLONE_THREAD = 0x10000;
 const WNOHANG = 1;
 
+/// An argument as a printable string, when it points at one: a trace of a path-walking program is
+/// unreadable without the paths.
+function traceArg(k, v) {
+  const a = Number(BigInt.asUintN(64, v));
+  if (a === 0 || a + 2 > k.memory.buffer.byteLength) return null;
+  const view = new Uint8Array(k.memory.buffer, a, Math.min(256, k.memory.buffer.byteLength - a));
+  let end = 0;
+  while (end < view.length && view[end] !== 0) end++;
+  if (end < 2 || end === view.length) return null;
+  for (let i = 0; i < end; i++) {
+    const c = view[i];
+    if (c < 0x20 || c > 0x7e) return null;
+  }
+  return new TextDecoder().decode(view.subarray(0, end));
+}
+
 export class Kernel {
   constructor(memory, meta, options = {}) {
     this.memory = memory;
@@ -180,8 +196,14 @@ export class Kernel {
 
   call(nr, a0, a1, a2, a3, a4, a5) {
     if (process.env.ARMJIT_TRACE_SYSCALLS) {
+      // An argument that points at a printable string is shown as one, because a path is what
+      // makes a trace of a program like `dpkg` readable.
       const args = [a0, a1, a2, a3, a4, a5]
-        .map((v) => "0x" + BigInt.asUintN(64, v).toString(16))
+        .map((v) => {
+          const text = traceArg(this, v);
+          const hex = "0x" + BigInt.asUintN(64, v).toString(16);
+          return text === null ? hex : `${hex} "${text}"`;
+        })
         .join(", ");
       console.error(`syscall ${Number(nr)}(${args}) pid ${this.pid}`);
     }

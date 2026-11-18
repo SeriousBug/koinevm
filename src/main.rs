@@ -400,23 +400,24 @@ fn run(args: &[String]) -> Result<(), String> {
                     Some("image") => {
                         let parsed = (|| -> Result<String, String> {
                             let path = req.get(1).ok_or("image needs a program")?.to_string();
+                            // The module goes to a file of the host's choosing: an image like `cc1`
+                            // is a quarter of a gigabyte of wasm, and a line of hex that long does
+                            // not fit in a JavaScript string.
+                            let out = req.get(2).ok_or("image needs an output path")?;
                             let count = |at: usize, what: &str| -> Result<usize, String> {
                                 req.get(at)
                                     .ok_or_else(|| format!("image needs {what} count"))?
                                     .parse()
                                     .map_err(|_| format!("bad {what} count"))
                             };
-                            let nargv = count(2, "argument")?;
-                            let (argv, at) = strings(&req, 3, nargv)?;
+                            let nargv = count(3, "argument")?;
+                            let (argv, at) = strings(&req, 4, nargv)?;
                             let nenv = count(at, "environment")?;
                             let (envp, _) = strings(&req, at + 1, nenv)?;
                             let placed =
                                 place(&path, &cfg, &argv, &envp, &rootfs, None, emit::INTERP_BASE)?;
-                            Ok(format!(
-                                "{{\"ok\":true,\"wasm\":\"{}\",\"meta\":{}}}",
-                                hex(&placed.output.wasm),
-                                placed.meta.trim_end()
-                            ))
+                            std::fs::write(out, &placed.output.wasm).map_err(|e| e.to_string())?;
+                            Ok(format!("{{\"ok\":true,\"meta\":{}}}", placed.meta.trim_end()))
                         })();
                         match parsed {
                             Ok(text) => reply.push_str(&text),
