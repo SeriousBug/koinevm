@@ -817,6 +817,19 @@ export class Session {
     for (const { p, t } of blocked) {
       console.error(`  pid ${p.pid} thread ${t.tid} waits for ${this.reason(t)}`);
     }
+    // The descriptors each process holds, because a deadlock between two of them is usually a pipe
+    // whose two ends are not where the program thinks.
+    for (const proc of this.processes) {
+      if (proc.state === "exited") continue;
+      const fds = [...proc.kernel.files.map]
+        .sort((a, b) => a[0] - b[0])
+        .map(([fd, entry]) => {
+          if (entry.kind === "pipe") return `${fd}=pipe${entry.desc.id}${entry.end === "read" ? "r" : "w"}`;
+          if (entry.kind === "socket") return `${fd}=socket${entry.desc.id ?? ""}`;
+          return `${fd}=${entry.kind}`;
+        });
+      console.error(`  pid ${proc.pid} fds ${fds.join(" ")}`);
+    }
     return 1;
   }
 }
