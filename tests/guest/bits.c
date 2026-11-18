@@ -30,7 +30,7 @@ static void guest_exit(long code) {
 #define GUEST_ENTRY _start
 #endif
 
-static char out[1 << 18];
+static char out[1 << 20];
 static int out_n;
 
 static void put(char c) { out[out_n++] = c; }
@@ -106,7 +106,37 @@ static const unsigned long pat[] = {
     X(adcs_after_adds, "adcs after adds", "adds %0, %1, %1\n adcs %0, %0, %1")                   \
     X(sbcs_after_subs, "sbcs after subs", "subs %0, %1, %1\n sbcs %0, %1, %0")                   \
     X(adcs_w, "adcs w", "adds %w0, %w1, %w1\n adcs %w0, %w0, %w1")                               \
-    X(sbcs_w, "sbcs w", "subs %w0, %w1, %w1\n sbcs %w0, %w1, %w0")
+    X(sbcs_w, "sbcs w", "subs %w0, %w1, %w1\n sbcs %w0, %w1, %w0")                             \
+    /* The logical forms take a shifted or rotated second operand, which is the shape every hash
+     * round has: `eor x16,x16,x25,ror#18` is three of SHA-512's sigma functions. */              \
+    X(eor_x_ror18, "eor x ror#18", "eor %0, %1, %1, ror #18")                                  \
+    X(eor_x_ror41, "eor x ror#41", "eor %0, %1, %1, ror #41")                                   \
+    X(eor_x_lsr7, "eor x lsr#7", "eor %0, %1, %1, lsr #7")                                      \
+    X(eor_x_lsr6, "eor x lsr#6", "eor %0, %1, %1, lsr #6")                                      \
+    X(eor_x_lsl9, "eor x lsl#9", "eor %0, %1, %1, lsl #9")                                      \
+    X(eor_x_asr3, "eor x asr#3", "eor %0, %1, %1, asr #3")                                      \
+    X(orr_x_ror13, "orr x ror#13", "orr %0, %1, %1, ror #13")                                   \
+    X(and_x_lsr11, "and x lsr#11", "and %0, %1, %1, lsr #11")                                   \
+    X(bic_x_asr5, "bic x asr#5", "bic %0, %1, %1, asr #5")                                      \
+    X(orn_x_lsl7, "orn x lsl#7", "orn %0, %1, %1, lsl #7")                                      \
+    X(eor_w_ror13, "eor w ror#13", "eor %w0, %w1, %w1, ror #13")                                \
+    X(eor_w_lsr3, "eor w lsr#3", "eor %w0, %w1, %w1, lsr #3")                                   \
+    X(and_w_asr2, "and w asr#2", "and %w0, %w1, %w1, asr #2")                                   \
+    X(bic_w_lsl1, "bic w lsl#1", "bic %w0, %w1, %w1, lsl #1")                                   \
+    /* Adds and subs whose second operand is shifted or extended: the shape a length or an offset
+     * is computed in, and the one a hash uses to find the end of its input. */                   \
+    X(add_x_lsl4, "add x lsl#4", "add %0, %1, %1, lsl #4")                                      \
+    X(add_x_lsr3, "add x lsr#3", "add %0, %1, %1, lsr #3")                                      \
+    X(add_x_asr2, "add x asr#2", "add %0, %1, %1, asr #2")                                      \
+    X(sub_x_lsl2, "sub x lsl#2", "sub %0, %1, %1, lsl #2")                                      \
+    X(add_w_lsl4, "add w lsl#4", "add %w0, %w1, %w1, lsl #4")                                   \
+    X(sub_w_asr3, "sub w asr#3", "sub %w0, %w1, %w1, asr #3")                                   \
+    X(add_x_uxtb, "add x uxtb", "add %0, %1, %w1, uxtb")                                        \
+    X(add_x_sxtb_2, "add x sxtb lsl#2", "add %0, %1, %w1, sxtb #2")                             \
+    X(add_x_uxth_1, "add x uxth lsl#1", "add %0, %1, %w1, uxth #1")                             \
+    X(sub_x_sxth_3, "sub x sxth lsl#3", "sub %0, %1, %w1, sxth #3")                             \
+    X(add_w_uxtb, "add w uxtb", "add %w0, %w1, %w1, uxtb")                                      \
+    X(add_x_uxtw_2, "add x uxtw lsl#2", "add %0, %1, %w1, uxtw #2")
 
 #define DEF(name, tag, body)                                                                  \
     __attribute__((noinline)) static unsigned long b_##name(unsigned long v) {                \
