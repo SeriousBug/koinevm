@@ -17,6 +17,11 @@ tmp=build/guest
 mkdir -p "$tmp"
 
 CFLAGS_COMMON="$OPT -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables -mgeneral-regs-only"
+# The property fixtures - the ones with no native oracle, whose expected output is a fixed file -
+# are built at one level rather than swept. Their assertions do not depend on what the compiler
+# does, and the host's clang is not reliable enough to sweep them: at -Os it lays a mergeable
+# literal out one byte short, which is a toolchain bug that reads exactly like a JIT bug.
+CFLAGS_STATIC="${CFLAGS_COMMON/#$OPT/-O2}"
 # -mgeneral-regs-only also rejects the vector instructions in the asm of the fixture that is about
 # the vector register file.
 CFLAGS_FP="${CFLAGS_COMMON/-mgeneral-regs-only/}"
@@ -56,49 +61,49 @@ done
 
 # The memory syscalls have no oracle: tests/mem.sh requires the guest's own checks to pass.
 echo "== guest: mem (mmap/munmap/mprotect/brk) =="
-clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/mem.c -o tests/guest/mem.o
 python3 tools/minilink.py tests/guest/mem.o tests/guest/mem.elf _start
 
 echo "== guest: net (socket/bind/getsockname/sendto/recvfrom/ppoll/socketpair) =="
-clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/net.c -o tests/guest/net.o
 python3 tools/minilink.py tests/guest/net.o tests/guest/net.elf _start
 
 echo "== guest: epoll (pipes, a datagram and a watch that goes away) =="
-clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/epoll.c -o tests/guest/epoll.o
 python3 tools/minilink.py tests/guest/epoll.o tests/guest/epoll.elf _start
 
 echo "== guest: signals (kill, a disposition of its own, and the wait status it leaves) =="
-clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/signals.c -o tests/guest/signals.o
 python3 tools/minilink.py tests/guest/signals.o tests/guest/signals.elf _start
 
 echo "== guest: tcp (connect/accept/listen/shutdown, and a child that connects) =="
-clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/tcp.c -o tests/guest/tcp.o
 python3 tools/minilink.py tests/guest/tcp.o tests/guest/tcp.elf _start
 
 echo "== guest: dns (a query over UDP, to the resolver the guest is given) =="
-clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/dns.c -o tests/guest/dns.o
 python3 tools/minilink.py tests/guest/dns.o tests/guest/dns.elf guest_main
 
 echo "== guest: files (openat/read/pread/stat/readlinkat) =="
-clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/files.c -o tests/guest/files.o
 python3 tools/minilink.py tests/guest/files.o tests/guest/files.elf _start
 
 # The dynamically linked path: a PIE program and a stand-in for ld.so. No native oracle can run
 # these, so tests/dyn.sh asserts the loader's view of the initial stack instead.
 echo "== guest: ld-fake interpreter (ET_DYN) =="
-clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fpie -nostdlib \
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fpie -nostdlib \
     -c tests/guest/interp.c -o tests/guest/interp.o
 python3 tools/minilink.py tests/guest/interp.o tests/guest/interp.elf _start --type=dyn --base=0
 
 echo "== guest: hello_pie (ET_DYN, PT_INTERP=/lib/ld-fake.so) =="
-clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fpie -nostdlib \
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fpie -nostdlib \
     -c tests/guest/hello.c -o tests/guest/hello_pie.o
 python3 tools/minilink.py tests/guest/hello_pie.o tests/guest/hello_pie.elf _start \
     --type=dyn --base=0 --interp=/lib/ld-fake.so
