@@ -25,6 +25,67 @@ fn usage() -> String {
      armjit dump <elf>".into()
 }
 
+/// The host path a guest's absolute path names, following the tree's own symbolic links the way its
+/// kernel follows them: an absolute target restarts at the rootfs, because the guest's
+/// `/etc/alternatives/awk` is a file this machine does not have at that path.
+fn inside(root: &str, guest: &str) -> String {
+    let mut queue: std::collections::VecDeque<String> =
+        guest.split('/').filter(|c| !c.is_empty() && *c != ".").map(String::from).collect();
+    let mut done: Vec<String> = Vec::new();
+    let mut links = 0;
+    while let Some(name) = queue.pop_front() {
+        if name == ".." {
+            done.pop();
+            continue;
+        }
+        let mut at = root.to_string();
+        for c in &done {
+            at.push('/');
+            at.push_str(c);
+        }
+        at.push('/');
+        at.push_str(&name);
+        let target = match std::fs::symlink_metadata(&at) {
+            Ok(md) if md.file_type().is_symlink() => {
+                std::fs::read_link(&at).ok().map(|t| t.to_string_lossy().into_owned())
+            }
+            _ => None,
+        };
+        match target {
+            None => done.push(name),
+            Some(target) => {
+                links += 1;
+                if links > 40 {
+                    break;
+                }
+                if target.starts_with('/') {
+                    done.clear();
+                }
+                for c in target.split('/').filter(|c| !c.is_empty() && *c != ".").rev() {
+                    queue.push_front(c.to_string());
+                }
+            }
+        }
+    }
+    let mut out = root.to_string();
+    for c in &done {
+        out.push('/');
+        out.push_str(c);
+    }
+    out
+}
+
+/// A path that names a file in the tree the guest sees, as that file's host path.
+fn under_root(root: Option<&String>, path: &str) -> String {
+    match root {
+        Some(root) => match path.strip_prefix(root.as_str()) {
+            Some(rest) if rest.starts_with('/') => inside(root, rest),
+            _ => path.to_string(),
+        },
+        None => path.to_string(),
+    }
+}
+
 /// Parse an image and place it: `ET_EXEC` stays at its link addresses, `ET_DYN` lands at `base`.
 fn load_image(path: &str, base: Option<u64>) -> Result<elf::Elf, String> {
     let image = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
@@ -76,14 +137,17 @@ fn place(
     interp_path: Option<&str>,
     interp_base: u64,
 ) -> Result<Placed, String> {
-    let main = load_image(path, None)?;
+    // The image the guest names, and the loader it asks for, as the files in the tree hold them:
+    // `dpkg` runs programs through the alternatives links, which are the tree's own.
+    let main_host = under_root(rootfs.as_ref(), path);
+    let main = load_image(&main_host, None)?;
     let mut interp_host: Option<String> = None;
     let interp = match &main.interp {
         None => None,
         Some(want) => {
             let resolved = interp_path
                 .map(|p| p.to_string())
-                .or_else(|| rootfs.as_ref().map(|root| format!("{root}{want}")));
+                .or_else(|| rootfs.as_ref().map(|root| inside(root, want)));
             let resolved = resolved.ok_or_else(|| {
                 format!("{path} wants {want} as its interpreter: pass a rootfs or an interpreter")
             })?;
@@ -94,7 +158,7 @@ fn place(
     let res = emit::translate(emit::Images { main: &main, interp: interp.as_ref() }, cfg, argv, envp)?;
     // The images placed here, so the host can translate a page of one that a run reaches after the
     // scan is over: a jump table names code nothing in the image branches to.
-    let images: Vec<String> = std::iter::once((path.to_string(), &main))
+    let images: Vec<String> = std::iter::once((main_host.clone(), &main))
         .chain(interp_host.zip(interp.as_ref()))
         .map(|(host, image)| {
             format!(
@@ -386,12 +450,12 @@ fn run(args: &[String]) -> Result<(), String> {
                     return Err(format!("unknown argument {a}"));
                 }
             }
-            let main = load_image(path, None)?;
+            let main = load_image(&under_root(rootfs.as_ref(), path), None)?;
             let interp = match &main.interp {
                 None => None,
                 Some(want) => {
                     let resolved = interp_path.clone().or_else(|| {
-                        rootfs.as_ref().map(|root| format!("{root}{want}"))
+                        rootfs.as_ref().map(|root| inside(root, want))
                     });
                     match resolved {
                         Some(p) => Some(load_image(&p, Some(interp_base))?),

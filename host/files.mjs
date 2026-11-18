@@ -72,38 +72,86 @@ export class Files {
     this.map.set(2, { kind: "stderr" });
   }
 
-  /// The path the guest named, as its own absolute path.
+  /// The path the guest named, as its own absolute path, with the components left as they are: a
+  /// `..` that follows a symbolic link is that link's parent, not the parent of the name that
+  /// reached it, and only a walk that reads the links can tell which.
   guestPath(name) {
-    const absolute = name.startsWith("/") ? name : path.posix.join(this.cwd, name);
-    return path.posix.normalize(absolute);
+    return name.startsWith("/") ? name : `${this.cwd}/${name}`;
   }
 
-  /// Guest path to host path, refusing anything that leaves the rootfs.
-  resolve(guestPath) {
+  /// Guest path to host path, following the tree's own symbolic links: an absolute target restarts
+  /// at the guest's root and a relative one is joined to the directory its link sits in. The host's
+  /// `read` would follow them with this machine's root, where the guest's `/etc/alternatives/awk`
+  /// is a file that does not exist.
+  resolve(guestPath, follow = true) {
     if (!this.rootfs) return -ENOENT;
-    const clean = this.guestPath(guestPath);
-    if (clean.includes("\0")) return -ENOENT;
-    const host = path.join(this.rootfs, clean);
+    if (guestPath.includes("\0")) return -ENOENT;
+    const queue = this.guestPath(guestPath).split("/").filter((p) => p !== "" && p !== ".");
+    const done = [];
+    let links = 0;
+    while (queue.length) {
+      const name = queue.shift();
+      if (name === "..") {
+        // `..` at the root is the root, the way a chroot's is.
+        done.pop();
+        continue;
+      }
+      // The form that does not follow its last component, which is the one that unlinks a link or
+      // renames it, names the link itself.
+      if (queue.length === 0 && !follow) {
+        done.push(name);
+        break;
+      }
+      const at = `/${[...done, name].join("/")}`;
+      let st;
+      try {
+        st = fs.lstatSync(path.join(this.rootfs, at));
+      } catch (e) {
+        // A component that is not there is the caller's to report, and the last one is a file that
+        // an open with O_CREAT is about to make.
+        if (queue.length) return -ENOENT;
+        done.push(name);
+        break;
+      }
+      if (!st.isSymbolicLink()) {
+        done.push(name);
+        continue;
+      }
+      if (++links > 40) return -ELOOP;
+      let target;
+      try {
+        target = fs.readlinkSync(path.join(this.rootfs, at));
+      } catch (e) {
+        return -EINVAL;
+      }
+      if (target.startsWith("/")) done.length = 0;
+      queue.unshift(...target.split("/").filter((p) => p !== "" && p !== "."));
+    }
+    const host = path.join(this.rootfs, `/${done.join("/")}`);
     if (host !== this.rootfs && !host.startsWith(this.rootfs + path.sep)) return -EACCES;
     return host;
+  }
+
+  /// The guest path a host path inside the tree stands for.
+  guestOf(host) {
+    const rel = path.relative(this.rootfs, host).split(path.sep).join("/");
+    return rel ? `/${rel}` : "/";
   }
 
   /// A `*at` call's path: an absolute one is the guest's root, a relative one is the directory
   /// descriptor it was given, which is either the process's own directory or an open one.
-  resolveAt(name, dirfd) {
+  resolveAt(name, dirfd, follow = true) {
     // A descriptor is a 32-bit int in the ABI, and AT_FDCWD arrives as -100 in whichever width the
     // caller used for it.
     const fd = Number(BigInt.asIntN(32, BigInt(dirfd)));
-    if (name.startsWith("/") || fd === AT_FDCWD) return this.resolve(name);
-    const entry = this.map.get(fd);
-    if (!entry) return -EBADF;
-    if (entry.kind !== "dir") return -ENOTDIR;
-    const clean = path.posix.normalize(name);
-    if (clean === ".." || clean.startsWith("../")) return -EACCES;
-    const host = path.join(entry.host, clean);
-    if (host !== entry.host && !host.startsWith(entry.host + path.sep)) return -EACCES;
-    if (host !== this.rootfs && !host.startsWith(this.rootfs + path.sep)) return -EACCES;
-    return host;
+    let base = this.cwd;
+    if (!name.startsWith("/") && fd !== AT_FDCWD) {
+      const entry = this.map.get(fd);
+      if (!entry) return -EBADF;
+      if (entry.kind !== "dir") return -ENOTDIR;
+      base = this.guestOf(entry.host);
+    }
+    return this.resolve(name.startsWith("/") ? name : `${base}/${name}`, follow);
   }
 
   /// The contents of a file this kernel provides rather than the tree, or null.
@@ -475,7 +523,7 @@ export class Files {
   statPath(guestPath, dirfd = AT_FDCWD) {
     const virtual = this.virtualStat(guestPath);
     if (virtual) return virtual;
-    const host = this.resolveAt(guestPath, dirfd);
+    const host = this.resolveAt(guestPath, dirfd, false);
     if (host < 0) return host;
     try {
       return fs.lstatSync(host, { bigint: true });
@@ -532,7 +580,7 @@ export class Files {
   }
 
   readlink(guestPath, dirfd = AT_FDCWD) {
-    const host = this.resolveAt(guestPath, dirfd);
+    const host = this.resolveAt(guestPath, dirfd, false);
     if (host < 0) return host;
     try {
       return fs.readlinkSync(host);
@@ -549,7 +597,7 @@ export class Files {
   }
 
   mkdir(name, dirfd, mode) {
-    const host = this.resolveAt(name, dirfd);
+    const host = this.resolveAt(name, dirfd, false);
     if (host < 0) return host;
     try {
       fs.mkdirSync(host, { mode: this.mask(mode) | 0o700 });
@@ -560,7 +608,7 @@ export class Files {
   }
 
   rmdir(name, dirfd) {
-    const host = this.resolveAt(name, dirfd);
+    const host = this.resolveAt(name, dirfd, false);
     if (host < 0) return host;
     try {
       fs.rmdirSync(host);
@@ -571,7 +619,7 @@ export class Files {
   }
 
   unlink(name, dirfd) {
-    const host = this.resolveAt(name, dirfd);
+    const host = this.resolveAt(name, dirfd, false);
     if (host < 0) return host;
     try {
       fs.unlinkSync(host);
@@ -582,9 +630,9 @@ export class Files {
   }
 
   rename(from, fromDir, to, toDir) {
-    const a = this.resolveAt(from, fromDir);
+    const a = this.resolveAt(from, fromDir, false);
     if (a < 0) return a;
-    const b = this.resolveAt(to, toDir);
+    const b = this.resolveAt(to, toDir, false);
     if (b < 0) return b;
     try {
       fs.renameSync(a, b);
@@ -595,7 +643,7 @@ export class Files {
   }
 
   symlink(target, name, dirfd) {
-    const host = this.resolveAt(name, dirfd);
+    const host = this.resolveAt(name, dirfd, false);
     if (host < 0) return host;
     try {
       fs.symlinkSync(target, host);
@@ -606,9 +654,9 @@ export class Files {
   }
 
   link(from, fromDir, to, toDir) {
-    const a = this.resolveAt(from, fromDir);
+    const a = this.resolveAt(from, fromDir, false);
     if (a < 0) return a;
-    const b = this.resolveAt(to, toDir);
+    const b = this.resolveAt(to, toDir, false);
     if (b < 0) return b;
     try {
       fs.linkSync(a, b);
@@ -619,7 +667,7 @@ export class Files {
   }
 
   chmod(name, dirfd, mode, follow) {
-    const host = this.resolveAt(name, dirfd);
+    const host = this.resolveAt(name, dirfd, follow);
     if (host < 0) return host;
     try {
       // Linux has no way to set a symbolic link's own mode, so the form that refuses to follow one
@@ -651,7 +699,7 @@ export class Files {
   }
 
   utimens(name, dirfd, times, follow) {
-    const host = this.resolveAt(name, dirfd);
+    const host = this.resolveAt(name, dirfd, follow);
     if (host < 0) return host;
     return this.utimensHost(host, times, follow);
   }
@@ -722,8 +770,7 @@ export class Files {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     if (entry.kind !== "dir") return -ENOTDIR;
-    const rel = path.relative(this.rootfs, entry.host);
-    this.cwd = "/" + rel.split(path.sep).join("/");
+    this.cwd = this.guestOf(entry.host);
     return 0;
   }
 }
