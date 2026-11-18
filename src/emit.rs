@@ -552,8 +552,10 @@ pub fn translate(
         if region.blocks.is_empty() {
             continue;
         }
-        region_index.insert(start, regions.len());
-        regions.push(region);
+        for chunk in split_region(region) {
+            region_index.insert(chunk.blocks[0].addr, regions.len());
+            regions.push(chunk);
+        }
     }
     if !region_index.contains_key(&entry) {
         return Err(format!("entry point 0x{entry:x} did not decode"));
@@ -716,6 +718,31 @@ struct Ids {
     bswap32: u32,
     rbit64: u32,
     ty_region: u32,
+}
+
+/// How many guest blocks one emitted function may hold. The body of a region nests one wasm block
+/// per guest block for its jump table, and the engine's bookkeeping for a function grows with the
+/// square of that: `cc1` has a region of 48 thousand blocks whose wasm function V8 refuses to
+/// compile at all. A chunk of a few hundred blocks is emitted as a region of its own, and the
+/// dispatcher hands over at the boundary like it does at any other.
+const REGION_BLOCKS_MAX: usize = 512;
+
+/// One discovered region, as the pieces it is emitted from: a piece that begins at a block start is
+/// a region, because that is what the dispatcher can be given.
+fn split_region(region: Region) -> Vec<Region> {
+    if region.blocks.len() <= REGION_BLOCKS_MAX {
+        return vec![region];
+    }
+    let mut chunks = Vec::new();
+    let mut blocks = region.blocks;
+    while !blocks.is_empty() {
+        let take = REGION_BLOCKS_MAX.min(blocks.len());
+        let rest = blocks.split_off(take);
+        let index_of = blocks.iter().enumerate().map(|(i, b)| (b.addr, i)).collect();
+        chunks.push(Region { blocks, index_of });
+        blocks = rest;
+    }
+    chunks
 }
 
 fn discover_region(entry: u64, insns: &BTreeMap<u64, Insn>, entries: &BTreeSet<u64>) -> Region {
@@ -5666,7 +5693,7 @@ pub fn translate_page(
         if region.blocks.is_empty() {
             continue;
         }
-        regions.push(region);
+        regions.extend(split_region(region));
     }
     if regions.len() >= TABLE_SLOTS_MAX as usize {
         return Err(format!("{} regions in one page exceeds the table", regions.len()));
