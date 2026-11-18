@@ -2317,6 +2317,44 @@ impl<'a> RegionEmitter<'a> {
     }
 
     /// The scalar in lane 0 of an FP register, as the wasm value of its own width.
+    /// What a comparison of two FP scalars leaves in the flags: unordered is C and V set, greater
+    /// is C, and equal is Z and C, packed the way the integer flags are.
+    fn fp_compare_flags(&mut self, rn: u32, rm: u32, zero: bool, double: bool) {
+        // An unordered comparison is the one outcome no ordinary comparison reports, and it has its
+        // own NZCV: C and V set, which is what everything downstream tests.
+        self.fp_is_nan(rn, double);
+        if zero {
+            self.f.i32c(0);
+        } else {
+            self.fp_is_nan(rm, double);
+        }
+        self.f.op(I32_OR);
+        self.f.op(IF);
+        self.f.body.push(I32);
+        self.f.i32c(3);
+        self.f.op(ELSE);
+        self.fp_get(rn, double);
+        self.fp_other(rm, zero, double);
+        self.f.op(if double { F64_GT } else { F32_GT });
+        self.f.op(IF);
+        self.f.body.push(I32);
+        self.f.i32c(2);
+        self.f.op(ELSE);
+        self.fp_get(rn, double);
+        self.fp_other(rm, zero, double);
+        self.f.op(if double { F64_EQ } else { F32_EQ });
+        self.f.op(IF);
+        self.f.body.push(I32);
+        self.f.i32c(6);
+        self.f.op(ELSE);
+        self.f.i32c(8);
+        self.f.end();
+        self.f.end();
+        self.f.end();
+        self.f.op(I64_EXTEND_I32_U);
+        self.f.ls(32);
+    }
+
     fn fp_get(&mut self, r: u32, double: bool) {
         self.getv(r);
         self.f.simd_lane(if double { simd::F64X2_EXTRACT_LANE } else { simd::F32X4_EXTRACT_LANE }, 0);
@@ -4857,40 +4895,56 @@ impl<'a> RegionEmitter<'a> {
                 if size > 1 {
                     return self.refuse(format!("half precision floating point at 0x{addr:x}"));
                 }
-                let double = size == 1;
-                // An unordered comparison is the one outcome no ordinary comparison reports, and
-                // it has its own NZCV: C and V set, which is what everything downstream tests.
-                self.fp_is_nan(rn, double);
-                if zero {
-                    self.f.i32c(0);
-                } else {
-                    self.fp_is_nan(rm, double);
+                self.fp_compare_flags(rn, rm, zero, size == 1);
+            }
+            Insn::FpCondCompare { size, cond, nzcv, rn, rm } => {
+                // The flags come from the comparison when the condition holds and from the
+                // instruction otherwise, which is how a chain of comparisons short-circuits.
+                if size > 1 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
                 }
-                self.f.op(I32_OR);
-                self.f.op(IF);
-                self.f.body.push(I32);
-                self.f.i32c(3);
+                self.push_cond(cond);
+                self.open_if();
+                self.fp_compare_flags(rn, rm, false, size == 1);
                 self.f.op(ELSE);
-                self.fp_get(rn, double);
-                self.fp_other(rm, zero, double);
-                self.f.op(if double { F64_GT } else { F32_GT });
-                self.f.op(IF);
-                self.f.body.push(I32);
-                self.f.i32c(2);
-                self.f.op(ELSE);
-                self.fp_get(rn, double);
-                self.fp_other(rm, zero, double);
-                self.f.op(if double { F64_EQ } else { F32_EQ });
-                self.f.op(IF);
-                self.f.body.push(I32);
-                self.f.i32c(6);
-                self.f.op(ELSE);
-                self.f.i32c(8);
-                self.f.end();
-                self.f.end();
-                self.f.end();
-                self.f.op(I64_EXTEND_I32_U);
+                self.f.i64c(nzcv as i64);
                 self.f.ls(32);
+                self.close_if();
+            }
+            Insn::ScalarThree { u, size, op, rn, rm, rd } => {
+                // One 64-bit lane and the rest of the register left as it was: `add d0, d1, d2` is
+                // the 64-bit integer add a program's own number code reaches for.
+                if size != 3 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
+                }
+                let want = match (u, op) {
+                    (false, 0b10000) => I64_ADD,
+                    (true, 0b10000) => I64_SUB,
+                    _ => {
+                        return self.refuse(format!(
+                            "unsupported scalar three same u={u} op={op:05b} at 0x{addr:x}"
+                        ))
+                    }
+                };
+                self.getv(rd);
+                self.getv(rn);
+                self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
+                self.getv(rm);
+                self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
+                self.f.op(want);
+                self.f.simd_lane(simd::I64X2_REPLACE_LANE, 0);
+                self.setv(rd);
+            }
+            Insn::VecHighToGpr { rn, rd } => {
+                self.getv(rn);
+                self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 1);
+                self.f.ls(rd);
+            }
+            Insn::GprToVecHigh { rn, rd } => {
+                self.getv(rd);
+                self.f.lg(rn);
+                self.f.simd_lane(simd::I64X2_REPLACE_LANE, 1);
+                self.setv(rd);
             }
             Insn::FpCondSelect { size, cond, rn, rm, rd } => {
                 if size > 1 {

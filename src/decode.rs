@@ -149,6 +149,15 @@ pub enum Insn {
     FpCondSelect { size: u32, cond: u32, rn: u32, rm: u32, rd: u32 },
     /// Scalar FP with an immediate: `fmov s0, #1.0`.
     FpImm { size: u32, imm8: u32, rd: u32 },
+    /// The scalar three-same group: a vector operation on the one 64-bit lane a `d` register names.
+    ScalarThree { u: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
+    /// `fmov x0, v0.d[1]`: the high half of a vector register into a general one.
+    VecHighToGpr { rn: u32, rd: u32 },
+    /// `fmov v0.d[1], x0`: a general register into the high half of a vector one.
+    GprToVecHigh { rn: u32, rd: u32 },
+    /// `fccmp`: a comparison that defers to a condition, taking its flags from `nzcv` when the
+    /// condition does not hold.
+    FpCondCompare { size: u32, cond: u32, nzcv: u32, rn: u32, rm: u32 },
     /// `scvtf d0, d0`: the integer in a scalar FP register, converted to a floating point value of
     /// the same width.
     FpFromInt { double: bool, unsigned: bool, rn: u32, rd: u32 },
@@ -903,6 +912,14 @@ fn decode_scalar_fp(w: u32) -> Insn {
                 _ => round::ZERO,
             },
         };
+        // The two that move the high half of a `d` register, which only the 64-bit forms have.
+        if sf {
+            match code {
+                14 => return Insn::VecHighToGpr { rn, rd },
+                15 => return Insn::GprToVecHigh { rn, rd },
+                _ => {}
+            }
+        }
         return match code {
             6 => Insn::FpToGpr { sf, signed: false, size, round: round::ZERO, fmov: true, rn, rd },
             7 | 2..=3 => Insn::GprToFp { sf, signed: code != 7 && code == 2, size, rmode, opcode: code, rn, rd },
@@ -1025,12 +1042,36 @@ fn decode_scalar_fp(w: u32) -> Insn {
             0b00 if (w >> 10) & 0x1f == 0b10000 => {
                 Insn::FpOneSource { size, opcode: (w >> 15) & 0x3f, rn, rd }
             }
+            // fccmp: the comparison the condition defers to, with bits 15:12 the condition and
+            // bits 3:0 the flags to take instead. Bit 4 is the signaling form, which differs only
+            // in what it does about a quiet NaN and which this kernel does not raise.
+            0b01 => Insn::FpCondCompare {
+                size,
+                cond: (w >> 12) & 0xf,
+                nzcv: w & 0xf,
+                rn,
+                rm,
+            },
             // fcsel: `cond` sits where the two-source opcode would be.
             0b11 => {
                 Insn::FpCondSelect { size, cond: (w >> 12) & 0xf, rn, rm, rd }
             }
             0b10 => Insn::FpTwoSource { size, opcode: (w >> 12) & 0xf, rn, rm, rd },
             _ => Insn::Undefined,
+        };
+    }
+
+    // The scalar three-same group shares this space with the scalar two-register one, and its
+    // integer forms are the vector operations on the single 64-bit lane a `d` register names: `add
+    // d0, d1, d2` is the 64-bit add that perl's own number code reaches for.
+    if w & 0xffe0fc00 == 0x5ee08400 || w & 0xffe0fc00 == 0x7ee08400 {
+        return Insn::ScalarThree {
+            u: (w >> 29) & 1 != 0,
+            size: 3,
+            op: 0b10000,
+            rn,
+            rm,
+            rd,
         };
     }
 
