@@ -63,6 +63,12 @@ gets one and a program that stamps a file gets a time the host would recognise. 
 same clock in the older structure; libgcrypt calls it during self-test and treats a missing number as
 a fatal `BUG()`, which is why a program that looks like it never needs it still does.
 
+`nanosleep` and `clock_nanosleep` wait on the host's timer, and one process means nothing runs while
+the thread that asked is waiting: the deadline is the whole of the wait, and the answer is already
+success by the time it passes. An absolute request is read against the clock it names, which is the
+same clock `clock_gettime` answers for. Nothing interrupts a sleep, so the timespec a signal would
+leave behind is never written.
+
 `sysinfo` reports the memory the guest was given - its own linear memory - and nothing about the
 host. A program that sizes a buffer from the free memory has to hear a number a run can back: `sort`
 asked for a quarter of a machine's memory, spilled every few lines into temporary files, and its

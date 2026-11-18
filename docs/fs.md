@@ -27,7 +27,9 @@ it back: `apt` does that with the lists it downloads, and a kernel that reopens 
 ## What the tree answers
 
 `newfstatat` fills the 128-byte `struct stat` the ABI lays out, with one user - root - as the owner
-of everything. `statx` fills its own 256-byte structure with the fields reordered and a mask saying
+of everything. `fstat` of an open directory answers for the directory it names rather than for an
+inode of its own: a program that opens a directory compares the two, and `shutil.rmtree` reads a
+directory whose name and descriptor disagree as a symbolic link and refuses to remove it. `statx` fills its own 256-byte structure with the fields reordered and a mask saying
 which were filled; coreutils asks for one before it falls back and prints the `ENOSYS` as an error
 on every file it is given.
 
