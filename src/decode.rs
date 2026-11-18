@@ -103,6 +103,9 @@ pub enum Insn {
     VecLoadStorePair { width: u32, is_load: bool, mode: PairMode, offset: i64, rn: u32, rt: u32, rt2: u32 },
     /// `ld1`/`st1` of one to four whole registers, contiguous, with an optional post-index.
     VecLd1 { is_load: bool, count: u32, q: bool, post: Option<PostIndex>, rn: u32, rt: u32 },
+    /// `ld2`/`st2`, `ld3`/`st3`, `ld4`/`st4`: the registers interleaved in memory one element at a
+    /// time. `e` is an element in bytes, `lanes` the elements each register holds.
+    VecStruct { is_load: bool, count: u32, e: u32, lanes: u32, q: bool, post: Option<PostIndex>, rn: u32, rt: u32 },
     /// `ld1r`: load one element and replicate it across the register.
     VecLd1r { q: bool, size: u32, post: Option<PostIndex>, rn: u32, rt: u32 },
     /// One lane of one to four registers: `ld1 {v0.b}[3], [x1]` and the stores and multi-structure
@@ -120,6 +123,12 @@ pub enum Insn {
     VecShiftImm { q: bool, u: bool, immh: u32, immb: u32, op: u32, rn: u32, rd: u32 },
     /// `dup`, `ins`, `umov`, `smov`: moves between the vector file and the general registers.
     VecCopy { q: bool, op: bool, imm5: u32, imm4: u32, rn: u32, rd: u32 },
+    /// The scalar `dup Sd, Vn.T[index]`, which `mov d1, v0.d[1]` is: one lane of the source, and
+    /// the rest of the register zero.
+    FpDupElement { size: u32, index: u32, rn: u32, rd: u32 },
+    /// A shift of the single 64-bit lane: `ushr d1, d0, #8` and the forms that accumulate or
+    /// insert into the destination. `imm` is the encoded 64-based count.
+    ScalarShift { u: bool, op: u32, imm: u32, rn: u32, rd: u32 },
     /// `movi` and `mvni`, whose result is a constant the translator can build.
     VecModImm { q: bool, op: bool, cmode: u32, imm8: u32, rd: u32 },
     /// `zip1/2`, `uzp1/2`, `trn1/2`.
@@ -791,26 +800,36 @@ fn decode_simd_multi(w: u32) -> Insn {
     }
 
     // `ld1`/`st1` of whole registers: opcode 0111 is one register, 1010 two, 0110 three, 0010 four.
+    // `ld2`/`st2`, `ld3`/`st3` and `ld4`/`st4` are the same shape with their own opcodes, and they
+    // interleave the registers in memory one element at a time.
+    let bytes = if q { 16 } else { 8 };
     let count = match opcode {
         0b0111 => 1,
         0b1010 => 2,
         0b0110 => 3,
         0b0010 => 4,
-        _ => return Insn::Undefined, // interleaved and single-lane forms are not translated
+        0b1000 => 2,
+        0b0100 => 3,
+        0b0000 => 4,
+        _ => return Insn::Undefined, // the single-lane and replicating forms are a group of their own
     };
-    let bytes = count as i64 * if q { 16 } else { 8 };
-    Insn::VecLd1 {
-        is_load,
-        count,
-        q,
-        post: if post_index {
-            Some(if rm == 31 { PostIndex::Imm(bytes) } else { PostIndex::Reg(rm) })
+    let post = if post_index {
+        Some(if rm == 31 {
+            PostIndex::Imm(count as i64 * bytes as i64)
         } else {
-            None
-        },
-        rn,
-        rt,
+            PostIndex::Reg(rm)
+        })
+    } else {
+        None
+    };
+    if matches!(opcode, 0b1000 | 0b0100 | 0b0000) {
+        let e = 1u32 << size;
+        if e > bytes {
+            return Insn::Undefined;
+        }
+        return Insn::VecStruct { is_load, count, e, lanes: bytes / e, q, post, rn, rt };
     }
+    Insn::VecLd1 { is_load, count, q, post, rn, rt }
 }
 
 /// How a conversion to an integer rounds, which the two-bit field of the instruction names, except
@@ -887,6 +906,32 @@ fn decode_simd_dp(w: u32) -> Insn {
 /// Scalar floating point: the one- and two-source arithmetic, comparisons, selects, conversions and
 /// the immediate form.
 fn decode_scalar_fp(w: u32) -> Insn {
+    // The scalar shift by immediate, which shares the vector shifts' encoding with bit 28 set. The
+    // opcode is bits 15:10 and the count is seven bits at 22:16, counted from twice the lane width
+    // for a right shift and from the width itself for a left one. `sha512` writes a length into a
+    // register one byte at a time with these.
+    if (w & 0xff800000) == 0x5f000000 || (w & 0xff800000) == 0x7f000000 {
+        let immh = (w >> 19) & 0xf;
+        if immh < 0b1000 {
+            return Insn::Undefined; // the narrow scalar forms travel with the vector ones
+        }
+        return Insn::ScalarShift {
+            u: (w >> 29) & 1 != 0,
+            op: (w >> 10) & 0x3f,
+            imm: (immh << 3) | ((w >> 16) & 7),
+            rn: (w >> 5) & 31,
+            rd: w & 31,
+        };
+    }
+
+    // The scalar copy: one element of a register duplicated into the lowest lane, with the rest of
+    // the register zero. `mov d1, v0.d[1]` is how a compiler moves a 128-bit register's high half.
+    if (w & 0xffe0fc00) == 0x5e000400 {
+        let imm5 = (w >> 16) & 0x1f;
+        let size = imm5.trailing_zeros();
+        return Insn::FpDupElement { size, index: imm5 >> (size + 1), rn: (w >> 5) & 31, rd: w & 31 };
+    }
+
     let sf = (w >> 31) & 1 != 0;
     let size = (w >> 22) & 3;
     let rn = (w >> 5) & 31;

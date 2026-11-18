@@ -142,7 +142,7 @@ static void setup(void) {
 /* Live across every case: q0 and q3 are the first input pattern's two vectors, q1 and q4 the
  * second's, and x9 points at the scratch area, so a body can do its own loads, stores and
  * post-index without needing another operand. */
-#define VCLOB "v0", "v1", "v2", "v3", "v4", "x9", "x10", "memory"
+#define VCLOB "v0", "v1", "v2", "v3", "v4", "v5", "x9", "x10", "memory"
 
 #define DEF_U(fn, body)                                                       \
     __attribute__((noinline)) static void fn(void) {                          \
@@ -197,7 +197,74 @@ static void setup(void) {
     X(ld1_st1_pst, "ld1/st1 16b post-index",                                                     \
       "st1 {v0.16b}, [x9], #16\n st1 {v1.16b}, [x9], #16\n sub x9, x9, #32\n"                    \
       " ld1 {v2.16b}, [x9], #16\n ld1 {v3.16b}, [x9], #16\n str q3, [%2, #16]")                  \
-    X(ld1_st1_16b, "ld1/st1 16b", "ld1 {v2.16b}, [%0]\n st1 {v2.16b}, [x9]\n ldr q2, [x9]")
+    X(ld1_st1_16b, "ld1/st1 16b", "ld1 {v2.16b}, [%0]\n st1 {v2.16b}, [x9]\n ldr q2, [x9]")     \
+    /* The interleaved structures: two, three and four registers, in an element width each. */   \
+    X(st2_16b, "st2 16b",                                                                        \
+      "st2 {v0.16b, v1.16b}, [x9]\n ldr q2, [x9]\n str q2, [%2]\n ldr q2, [x9, #16]\n"          \
+      " str q2, [%2, #16]")                                                                      \
+    X(ld2_16b, "ld2 16b",                                                                        \
+      "str q0, [x9]\n str q1, [x9, #16]\n ld2 {v2.16b, v3.16b}, [x9]\n str q2, [%2]\n"          \
+      " str q3, [%2, #16]")                                                                      \
+    X(st2_8h, "st2 8h",                                                                          \
+      "st2 {v0.8h, v1.8h}, [x9]\n ldr q2, [x9]\n str q2, [%2]\n ldr q2, [x9, #16]\n"           \
+      " str q2, [%2, #16]")                                                                      \
+    X(ld2_8h, "ld2 8h",                                                                          \
+      "str q0, [x9]\n str q1, [x9, #16]\n ld2 {v2.8h, v3.8h}, [x9]\n str q2, [%2]\n"           \
+      " str q3, [%2, #16]")                                                                      \
+    X(st2_2d, "st2 2d",                                                                          \
+      "st2 {v0.2d, v1.2d}, [x9]\n ldr q2, [x9]\n str q2, [%2]\n ldr q2, [x9, #16]\n"           \
+      " str q2, [%2, #16]")                                                                      \
+    X(ld2_2d, "ld2 2d",                                                                          \
+      "str q0, [x9]\n str q1, [x9, #16]\n ld2 {v2.2d, v3.2d}, [x9]\n str q2, [%2]\n"           \
+      " str q3, [%2, #16]")                                                                      \
+    X(ld2_pst_16b, "ld2 16b post-index",                                                         \
+      "str q0, [x9]\n str q1, [x9, #16]\n mov x10, x9\n ld2 {v2.16b, v3.16b}, [x9], #32\n"     \
+      " sub x9, x9, x10\n str x9, [%2]\n str q2, [%2, #8]")                                     \
+    X(st3_8b, "st3 8b",                                                                          \
+      "ldr q2, [%0]\n ldr q3, [%0, #16]\n ldr q4, [%1]\n st3 {v2.8b, v3.8b, v4.8b}, [x9]\n"    \
+      " ldr q2, [x9]\n str q2, [%2]\n ldr d2, [x9, #16]\n str d2, [%2, #16]")                  \
+    X(ld3_8b, "ld3 8b",                                                                          \
+      "str q0, [x9]\n str q1, [x9, #16]\n ld3 {v2.8b, v3.8b, v4.8b}, [x9]\n str d2, [%2]\n"    \
+      " str d3, [%2, #8]\n str d4, [%2, #16]")                                                  \
+    X(st3_4h, "st3 4h",                                                                          \
+      "ldr q2, [%0]\n ldr q3, [%0, #16]\n ldr q4, [%1]\n st3 {v2.4h, v3.4h, v4.4h}, [x9]\n"    \
+      " ldr q2, [x9]\n str q2, [%2]\n ldr d2, [x9, #16]\n str d2, [%2, #16]")                  \
+    X(ld3_4h, "ld3 4h",                                                                          \
+      "str q0, [x9]\n str q1, [x9, #16]\n ld3 {v2.4h, v3.4h, v4.4h}, [x9]\n str d2, [%2]\n"    \
+      " str d3, [%2, #8]\n str d4, [%2, #16]")                                                  \
+    X(st4_8b, "st4 8b",                                                                          \
+      "ldr q2, [%0]\n ldr q3, [%0, #16]\n ldr q4, [%1]\n ldr q5, [%1, #16]\n"                  \
+      " st4 {v2.8b, v3.8b, v4.8b, v5.8b}, [x9]\n ldr q2, [x9]\n str q2, [%2]\n"                 \
+      " ldr q2, [x9, #16]\n str q2, [%2, #16]")                                                 \
+    X(ld4_8b, "ld4 8b",                                                                          \
+      "str q0, [x9]\n str q1, [x9, #16]\n ld4 {v2.8b, v3.8b, v4.8b, v5.8b}, [x9]\n"            \
+      " str d2, [%2]\n str d3, [%2, #8]\n str d4, [%2, #16]\n str d5, [%2, #24]")              \
+    X(st4_4h, "st4 4h",                                                                          \
+      "ldr q2, [%0]\n ldr q3, [%0, #16]\n ldr q4, [%1]\n ldr q5, [%1, #16]\n"                  \
+      " st4 {v2.4h, v3.4h, v4.4h, v5.4h}, [x9]\n ldr q2, [x9]\n str q2, [%2]\n"                 \
+      " ldr q2, [x9, #16]\n str q2, [%2, #16]")                                                 \
+    X(ld4_4h, "ld4 4h",                                                                          \
+      "str q0, [x9]\n str q1, [x9, #16]\n ld4 {v2.4h, v3.4h, v4.4h, v5.4h}, [x9]\n"            \
+      " str d2, [%2]\n str d3, [%2, #8]\n str d4, [%2, #16]\n str d5, [%2, #24]")              \
+    /* The scalar `dup`: one lane of a register, and everything above it zero. */                 \
+    X(mov_d_d1, "mov d2, v0.d[1]", "mov d2, v0.d[1]")                                            \
+    X(mov_s_s3, "mov s2, v0.s[3]", "mov s2, v0.s[3]")                                            \
+    X(mov_h_h7, "mov h2, v0.h[7]", "mov h2, v0.h[7]")                                            \
+    X(mov_b_b13, "mov b2, v0.b[13]", "mov b2, v0.b[13]")                                         \
+    /* The scalar shifts, which is how a compiler writes a 64-bit value into a vector one byte at
+     * a time, and the lane insert it then uses. A digest's length field is written exactly so. */ \
+    X(ushr_d_8, "ushr d #8", "ushr d2, d0, #8")                                                  \
+    X(ushr_d_56, "ushr d #56", "ushr d2, d0, #56")                                               \
+    X(ushr_d_1, "ushr d #1", "ushr d2, d0, #1")                                                  \
+    X(sshr_d_8, "sshr d #8", "sshr d2, d0, #8")                                                  \
+    X(shl_d_4, "shl d #4", "shl d2, d0, #4")                                                     \
+    X(ins_b14, "ins v2.b[14], v1.b[0]", "mov v2.16b, v0.16b\n mov v2.b[14], v1.b[0]")         \
+    X(ins_b15, "ins v2.b[15], v1.b[0]", "mov v2.16b, v0.16b\n mov v2.b[15], v1.b[0]")         \
+    X(ins_b0, "ins v2.b[0], v1.b[0]", "mov v2.16b, v0.16b\n mov v2.b[0], v1.b[0]")            \
+    X(ins_h7, "ins v2.h[7], v1.h[1]", "mov v2.16b, v0.16b\n mov v2.h[7], v1.h[1]")            \
+    X(ushr_d_then_ins, "ushr d #8 then ins",                                                     \
+      "ushr d2, d0, #8\n mov v3.16b, v0.16b\n mov v3.b[14], v2.b[0]\n mov v2.16b, v3.16b")  \
+    X(dup_d0, "dup d2, v0.d[0]", "dup d2, v0.d[0]")
 
 #define U_CASES(X)                                                                              \
     /* three-same integer */                                                                    \

@@ -191,6 +191,7 @@ fn is_terminator(i: &Insn) -> bool {
 fn narrows_to_low_half(i: &Insn) -> bool {
     match *i {
         Insn::VecLd1 { q, .. }
+        | Insn::VecStruct { q, .. }
         | Insn::VecLd1r { q, .. }
         | Insn::VecThreeSame { q, .. }
         | Insn::VecTwoMisc { q, .. }
@@ -205,6 +206,7 @@ fn narrows_to_low_half(i: &Insn) -> bool {
             !q && !matches!(op, 0b00010 | 0b00110) && op & 0b10011 != 0b10000
         }
         Insn::VecShiftImm { q, op, .. } => !q && op != 0b10100,
+        Insn::FpDupElement { .. } | Insn::ScalarShift { .. } => true,
         _ => false,
     }
 }
@@ -1542,6 +1544,47 @@ fn pair_masks(size: u32) -> ([u8; 16], [u8; 16]) {
     (even, odd)
 }
 
+/// Where the bytes of one register of an interleaved access come from: register `i` of `count` holds
+/// the elements at `j*count + i`, so its bytes are spread over every register of the structure. The
+/// mask takes the ones that live in the pair `pair`, and `keep` is the byte mask that zeroes the
+/// lanes the pair does not fill: every byte of a shuffle index has to name a lane.
+fn struct_load_mask(count: u32, lanes: u32, e: u32, i: u32, pair: u32, bytes: u32) -> ([u8; 16], [u8; 16]) {
+    let mut mask = [0u8; 16];
+    let mut keep = [0u8; 16];
+    for k in 0..bytes {
+        let m = (k / e) * count + i;
+        let (s, l) = (m / lanes, m % lanes);
+        if s == pair * 2 {
+            mask[k as usize] = (l * e + k % e) as u8;
+            keep[k as usize] = 0xff;
+        } else if s == pair * 2 + 1 {
+            mask[k as usize] = (16 + l * e + k % e) as u8;
+            keep[k as usize] = 0xff;
+        }
+    }
+    (mask, keep)
+}
+
+/// The other direction: the bytes of word `p` of the interleaved stream, which the store writes out,
+/// taken from the registers of the structure.
+fn struct_store_mask(count: u32, e: u32, p: u32, pair: u32, bytes: u32) -> ([u8; 16], [u8; 16]) {
+    let mut mask = [0u8; 16];
+    let mut keep = [0u8; 16];
+    for k in 0..bytes {
+        let at = p * bytes + k;
+        let m = at / e;
+        let (s, l) = (m % count, m / count);
+        if s == pair * 2 {
+            mask[k as usize] = (l * e + at % e) as u8;
+            keep[k as usize] = 0xff;
+        } else if s == pair * 2 + 1 {
+            mask[k as usize] = (16 + l * e + at % e) as u8;
+            keep[k as usize] = 0xff;
+        }
+    }
+    (mask, keep)
+}
+
 /// Move lanes `width..2*width` down onto `0..width`, for one step of a reduction.
 fn halve_mask(size: u32, width: u32) -> [u8; 16] {
     let lane = 1u32 << size;
@@ -2543,6 +2586,12 @@ impl<'a> RegionEmitter<'a> {
     }
 
     fn vload(&mut self, width: u32, addr: u32, rt: u32) {
+        self.vload_local(width, addr, NVEC0 + rt);
+    }
+
+    /// The same load into a scratch local, for a form whose destination registers are still the
+    /// source of the next step.
+    fn vload_local(&mut self, width: u32, addr: u32, local: u32) {
         self.check_byte(addr, width as u64);
         match width {
             16 | 8 | 4 => {
@@ -2567,33 +2616,37 @@ impl<'a> RegionEmitter<'a> {
                 self.f.simd_lane(simd::I32X4_REPLACE_LANE, 0);
             }
         }
-        self.setv(rt);
+        self.f.ls(local);
     }
 
     fn vstore(&mut self, width: u32, addr: u32, rt: u32) {
+        self.vstore_local(width, addr, NVEC0 + rt);
+    }
+
+    fn vstore_local(&mut self, width: u32, addr: u32, local: u32) {
         self.check_byte(addr, width as u64);
         self.f.lg(addr);
         self.f.wrap_i64();
         match width {
             16 => {
-                self.getv(rt);
+                self.f.lg(local);
                 self.f.simd_mem(simd::V128_STORE, 4, 0);
             }
             8 => {
-                self.getv(rt);
+                self.f.lg(local);
                 self.f.simd_mem_lane(simd::V128_STORE64_LANE, 3, 0, 0);
             }
             4 => {
-                self.getv(rt);
+                self.f.lg(local);
                 self.f.simd_mem_lane(simd::V128_STORE32_LANE, 2, 0, 0);
             }
             2 => {
-                self.getv(rt);
+                self.f.lg(local);
                 self.f.simd_lane(simd::I16X8_EXTRACT_LANE_U, 0);
                 self.f.mem(I32_STORE16, 1, 0);
             }
             _ => {
-                self.getv(rt);
+                self.f.lg(local);
                 self.f.simd_lane(simd::I8X16_EXTRACT_LANE_U, 0);
                 self.f.mem(I32_STORE8, 0, 0);
             }
@@ -2649,6 +2702,7 @@ impl<'a> RegionEmitter<'a> {
         self.f.simd(simd::I8X16_SHUFFLE);
         self.f.body.extend_from_slice(&mask);
     }
+
 
     /// A pairwise operation across adjacent lanes: `pairs(a)` in the low half, `pairs(b)` in the high.
     fn vec_pairwise(&mut self, size: u32, op: u32, rn: u32, rm: u32, rd: u32) {
@@ -3816,6 +3870,89 @@ impl<'a> RegionEmitter<'a> {
                     }
                 }
             }
+            Insn::VecStruct { is_load, count, e, lanes, q, post, rn, rt } => {
+                let bytes = if q { 16 } else { 8 };
+                self.addr_base_off(rn, 0);
+                self.f.lg(L_T1);
+                self.f.ls(L_T2);
+                if is_load {
+                    // The host's bytes are interleaved, so each register is gathered out of every
+                    // one of them. They are read into the scratch locals first: the registers they
+                    // belong to are the destination of the gather.
+                    for s in 0..count {
+                        if s > 0 {
+                            self.f.lg(L_T1);
+                            self.f.i64c(bytes as i64);
+                            self.f.op(I64_ADD);
+                            self.f.ls(L_T1);
+                        }
+                        self.vload_local(bytes, L_T1, L_V0 + s);
+                    }
+                    for i in 0..count {
+                        for pair in 0..count.div_ceil(2) {
+                            let (mask, keep) = struct_load_mask(count, lanes, e, i, pair, bytes);
+                            let a = L_V0 + pair * 2;
+                            let b = if pair * 2 + 1 < count { L_V0 + pair * 2 + 1 } else { a };
+                            self.shuffle(a, b, mask);
+                            if keep.iter().any(|&k| k == 0) {
+                                self.f.v128c(keep);
+                                self.f.simd(simd::V128_AND);
+                            }
+                            // Straight into the register, not through `setv`: that is where the
+                            // 64-bit forms zero the top half, and its temporary is one of the
+                            // scratch locals the structure is still being gathered out of. The
+                            // masks leave the lanes above the register's own bytes zero anyway.
+                            if pair == 0 {
+                                self.f.ls(NVEC0 + (rt + i) % 32);
+                            } else {
+                                self.getv((rt + i) % 32);
+                                self.f.simd(simd::V128_OR);
+                                self.f.ls(NVEC0 + (rt + i) % 32);
+                            }
+                        }
+                    }
+                } else {
+                    self.f.lg(L_T1);
+                    self.f.ls(L_T3);
+                    for p in 0..count {
+                        for pair in 0..count.div_ceil(2) {
+                            let (mask, keep) = struct_store_mask(count, e, p, pair, bytes);
+                            let a = NVEC0 + (rt + pair * 2) % 32;
+                            let b = NVEC0 + (rt + pair * 2 + 1) % 32;
+                            self.shuffle(a, b, mask);
+                            if keep.iter().any(|&k| k == 0) {
+                                self.f.v128c(keep);
+                                self.f.simd(simd::V128_AND);
+                            }
+                            if pair == 0 {
+                                self.f.ls(L_V0);
+                            } else {
+                                self.f.lg(L_V0);
+                                self.f.simd(simd::V128_OR);
+                                self.f.ls(L_V0);
+                            }
+                        }
+                        self.vstore_local(bytes, L_T3, L_V0);
+                        if p + 1 < count {
+                            self.f.lg(L_T3);
+                            self.f.i64c(bytes as i64);
+                            self.f.op(I64_ADD);
+                            self.f.ls(L_T3);
+                        }
+                    }
+                }
+                if let Some(index) = post {
+                    match index {
+                        PostIndex::Imm(imm) => self.writeback(rn, L_T2, imm),
+                        PostIndex::Reg(r) => {
+                            self.f.lg(L_T2);
+                            self.get(r, true);
+                            self.f.op(I64_ADD);
+                            self.f.ls(rn);
+                        }
+                    }
+                }
+            }
             Insn::VecLane { is_load, nregs, size, index, post, rn, rt } => {
                 let ebytes = 1u32 << size;
                 let index = index as u8;
@@ -4478,6 +4615,89 @@ impl<'a> RegionEmitter<'a> {
                     }
                     _ => return self.refuse(format!("unsupported shift-immediate op {op:05b} at 0x{addr:x}")),
                 }
+            }
+            Insn::ScalarShift { u, op, imm, rn, rd } => {
+                let right = 128u32.wrapping_sub(imm);
+                let left = imm.wrapping_sub(64);
+                let shr = if u { simd::I64X2_SHR_U } else { simd::I64X2_SHR_S };
+                // The shifted source, rounded first when the form asks for it: the bias is half a
+                // unit in the last place of the result.
+                let mut shift_in = |this: &mut Self, round: bool| {
+                    this.getv(rn);
+                    if round {
+                        this.f.v128c(round_mask(64, 1u64 << (right - 1)));
+                        this.f.simd(simd::I64X2_ADD);
+                    }
+                    this.f.i32c(right as i32);
+                    this.f.simd(shr);
+                };
+                match op {
+                    0b000001 => {
+                        shift_in(self, false);
+                        self.setv(rd);
+                    }
+                    0b001001 => {
+                        shift_in(self, true);
+                        self.setv(rd);
+                    }
+                    0b000101 | 0b001101 => {
+                        let round = op == 0b001101;
+                        shift_in(self, round);
+                        self.f.ls(L_V0);
+                        self.getv(rd);
+                        self.f.lg(L_V0);
+                        self.f.simd(simd::I64X2_ADD);
+                        self.setv(rd);
+                    }
+                    0b010001 => {
+                        // sri: the shifted source fills the low bits and the destination keeps the
+                        // top ones, which are as many as the shift.
+                        shift_in(self, false);
+                        self.f.ls(L_V0);
+                        self.getv(rd);
+                        self.f.v128c(high_bits_mask(64, right));
+                        self.f.simd(simd::V128_AND);
+                        self.f.lg(L_V0);
+                        self.f.simd(simd::V128_OR);
+                        self.setv(rd);
+                    }
+                    0b010101 => {
+                        self.getv(rn);
+                        self.f.i32c(left as i32);
+                        self.f.simd(simd::I64X2_SHL);
+                        if u {
+                            // sli: the destination keeps its low bits, and the source's shifted
+                            // bits are the top ones.
+                            self.f.ls(L_V0);
+                            self.getv(rd);
+                            self.f.v128c(low_bits_mask(64, left));
+                            self.f.simd(simd::V128_AND);
+                            self.f.lg(L_V0);
+                            self.f.simd(simd::V128_OR);
+                        }
+                        self.setv(rd);
+                    }
+                    _ => return self.refuse(format!("unsupported scalar shift op {op:06b} at 0x{addr:x}")),
+                }
+            }
+            Insn::FpDupElement { size, index, rn, rd } => {
+                self.f.v128c([0; 16]);
+                self.getv(rn);
+                let extract = match size {
+                    0 => simd::I8X16_EXTRACT_LANE_U,
+                    1 => simd::I16X8_EXTRACT_LANE_U,
+                    2 => simd::I32X4_EXTRACT_LANE,
+                    _ => simd::I64X2_EXTRACT_LANE,
+                };
+                self.f.simd_lane(extract, index as u8);
+                let insert = match size {
+                    0 => simd::I8X16_REPLACE_LANE,
+                    1 => simd::I16X8_REPLACE_LANE,
+                    2 => simd::I32X4_REPLACE_LANE,
+                    _ => simd::I64X2_REPLACE_LANE,
+                };
+                self.f.simd_lane(insert, 0);
+                self.setv(rd);
             }
             Insn::VecCopy { q, op, imm5, imm4, rn, rd } => {
                 let size = imm5.trailing_zeros();
