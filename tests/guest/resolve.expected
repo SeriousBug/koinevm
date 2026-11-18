@@ -1,0 +1,5 @@
+ok   getaddrinfo(localhost) answers
+ok   every address a socket can take
+ok   the port it was given is the port it reports
+ok   a name that does not exist is EAI_NONAME
+resolve: all checks passed

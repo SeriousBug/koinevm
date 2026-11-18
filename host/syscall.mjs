@@ -38,7 +38,7 @@ export class Kernel {
     this.pid = options.pid ?? 1;
     this.ppid = options.ppid ?? 0;
     this.space = new AddressSpace(memory, meta);
-    this.files = options.files ?? new Files(options.rootfs);
+    this.files = options.files ?? new Files(options.rootfs, { virtual: options.resolver?.files(options.rootfs) });
     this.exited = null;
     /// `exit` ends one thread and `exit_group` ends them all, so the host has to know which.
     this.exitedGroup = false;
@@ -494,7 +494,7 @@ export class Kernel {
       if (bytes === null) return k.fail(EFAULT);
       const entry = k.files.get(Number(fd));
       if (entry && entry.kind === "socket") {
-        return k.ask({ kind: "send", fd: Number(fd), data: Buffer.from(bytes), to: null });
+        return [BigInt(entry.desc.send(Buffer.from(bytes), null)), 0];
       }
       const wrote = k.files.write(Number(fd), Buffer.from(bytes));
       if (wrote > 0) k.wake();
@@ -619,9 +619,17 @@ export class Kernel {
     });
 
     this.on(29, (k, fd, request, arg) => {
+      const req = Number(request);
+      // FIONREAD: the bytes a receive would take now, which is how a resolver sizes the buffer it
+      // reads an answer into. Without it the size is zero and the answer is read into nothing.
+      if (req === 0x541b) {
+        const entry = k.files.get(Number(fd));
+        const waiting = entry?.kind === "socket" ? entry.desc.pending() : entry?.kind === "pipe" && entry.desc.data.length;
+        if (!k.put32(arg, waiting || 0)) return k.fail(EFAULT);
+        return [0n, 0];
+      }
       // There is no console, so the streams are pipes and `isatty` has to say so: a program that
       // believes it has a terminal formats for one, and its output stops matching a real run.
-      const req = Number(request);
       if (req === 0x5401) return k.fail(ENOTTY); // TCGETS
       if (req === 0x5413) return k.fail(ENOTTY); // TIOCGWINSZ
       return [0n, 0];
@@ -696,6 +704,114 @@ export class Kernel {
     if (!this.put(buf, got.data)) return -EFAULT;
     if (this.addr(addr) !== 0 && got.from && !this.putAddr(addr, lenp, got.from)) return -EFAULT;
     return (Number(flags) & 0x20) !== 0 ? got.full : got.data.length;
+  }
+
+  /// The iovecs of a guest `struct msghdr`: where the bytes are, and how many.
+  iovecs(msg) {
+    const count = Number(this.u64(msg + 24));
+    if (count < 0 || count > 1024) return null;
+    const base = Number(this.u64(msg + 16));
+    const list = [];
+    for (let i = 0; i < count; i++) {
+      list.push({ at: Number(this.u64(base + i * 16)), len: Number(this.u64(base + i * 16 + 8)) });
+    }
+    return list;
+  }
+
+  /// `struct msghdr` on this ABI: the address the guest names, the iovecs, the control buffer and
+  /// the flags a receive answers with.
+  static MSGHDR = 56;
+
+  /// sendmsg: the bytes the iovecs name, to the address the header names or to the socket's peer.
+  sendMsgInto(fd, msg, flags) {
+    const desc = this.socketDesc(fd);
+    if (typeof desc === "number") return desc;
+    if (!this.inBounds(msg, Kernel.MSGHDR)) return -EFAULT;
+    const name = Number(this.u64(msg));
+    const namelen = new DataView(this.memory.buffer).getUint32(msg + 8, true);
+    const to = this.guestAddr(name, namelen);
+    if (to === undefined) return -EFAULT;
+    const iovs = this.iovecs(msg);
+    if (!iovs) return -EINVAL;
+    const parts = [];
+    for (const iov of iovs) {
+      const bytes = this.read(iov.at, iov.len);
+      if (bytes === null) return -EFAULT;
+      parts.push(Buffer.from(bytes));
+    }
+    return desc.send(Buffer.concat(parts), to);
+  }
+
+  /// recvmsg: what is queued, scattered across the iovecs, or a thread parked until there is
+  /// something. The host calls it again when the thread wakes, so it takes guest addresses.
+  recvMsgInto(fd, msg, flags) {
+    const desc = this.socketDesc(fd);
+    if (typeof desc === "number") return desc;
+    if (!this.inBounds(msg, Kernel.MSGHDR)) return -EFAULT;
+    const iovs = this.iovecs(msg);
+    if (!iovs) return -EINVAL;
+    const total = iovs.reduce((n, iov) => n + iov.len, 0);
+    const got = desc.recv(Math.min(total, 0x7ffff000), (Number(flags) & 2) !== 0);
+    if (got === WOULD_BLOCK) {
+      if (desc.nonblock || (Number(flags) & 0x40) !== 0) return -EAGAIN;
+      return this.ask({ kind: "recvmsg", fd, msg, flags: Number(flags), deadline: desc.timeout ? Date.now() + desc.timeout : 0 });
+    }
+    if (got.errno) return got.errno;
+    let done = 0;
+    for (const iov of iovs) {
+      if (done >= got.data.length) break;
+      const take = got.data.subarray(done, done + Math.min(iov.len, got.data.length - done));
+      if (!this.put(iov.at, take)) return -EFAULT;
+      done += take.length;
+    }
+    const name = Number(this.u64(msg));
+    if (name !== 0) {
+      if (got.from) this.putAddr(name, msg + 8, got.from);
+      else this.put32(msg + 8, 0);
+    }
+    // No control data is passed either way yet, and msg_flags says the datagram was cut short.
+    this.put32(msg + 48, (Number(flags) & 0x20) !== 0 ? 0x20 : 0);
+    this.put64(msg + 40, 0n);
+    return (Number(flags) & 0x20) !== 0 ? got.full : got.data.length;
+  }
+
+  /// `struct mmsghdr` is the header and the length the call wrote.
+  static MMSGHDR = 64;
+
+  sendMMsgInto(fd, vec, vlen, flags) {
+    if (vlen < 0 || vlen > 1024) return -EINVAL;
+    if (!this.inBounds(vec, vlen * Kernel.MMSGHDR)) return -EFAULT;
+    let sent = 0;
+    for (let i = 0; i < vlen; i++) {
+      const answer = this.sendMsgInto(fd, vec + i * Kernel.MMSGHDR, flags);
+      if (answer < 0) return sent > 0 ? sent : answer;
+      this.put32(vec + i * Kernel.MMSGHDR + Kernel.MSGHDR, answer);
+      sent++;
+    }
+    return sent;
+  }
+
+  /// recvmmsg: only the first message waits, which is what MSG_WAITFORONE means; the rest are taken
+  /// as far as they are there.
+  recvMMsgInto(fd, vec, vlen, flags, deadline) {
+    const desc = this.socketDesc(fd);
+    if (typeof desc === "number") return desc;
+    if (vlen < 0 || vlen > 1024) return -EINVAL;
+    if (!this.inBounds(vec, vlen * Kernel.MMSGHDR)) return -EFAULT;
+    let got = 0;
+    for (let i = 0; i < vlen; i++) {
+      const msg = vec + i * Kernel.MMSGHDR;
+      const answer = this.recvMsgInto(fd, msg, flags);
+      if (typeof answer !== "number") return i === 0 ? answer : got;
+      if (answer === -EAGAIN) break;
+      if (answer < 0) return got > 0 ? got : answer;
+      this.put32(msg + Kernel.MSGHDR, answer);
+      got++;
+    }
+    if (got === 0 && vlen > 0 && !desc.nonblock) {
+      return this.ask({ kind: "recvmmsg", fd, vec, vlen, flags, deadline });
+    }
+    return got;
   }
 
   /// Milliseconds from a `struct timespec` a call may time out on: -1 means wait for ever, which
@@ -821,6 +937,11 @@ export class Kernel {
     this.on(204, (k, fd, addr, lenp) => {
       const desc = k.socketDesc(Number(fd));
       if (typeof desc === "number") return [BigInt(desc), 0];
+      // A socket that has sent but not been bound gets its port from the host a moment after the
+      // send, so the answer waits for it rather than reporting a port of zero.
+      if (desc.addressPending?.()) {
+        return k.ask({ kind: "address", fd: Number(fd), addr: k.addr(addr), lenp: k.addr(lenp) });
+      }
       if (!k.putAddr(addr, lenp, desc.address())) return k.fail(EFAULT);
       return [0n, 0];
     });
@@ -840,7 +961,24 @@ export class Kernel {
       if (to === undefined) return k.fail(EFAULT);
       const bytes = k.read(buf, Math.min(Number(len), 0x7ffff000));
       if (bytes === null) return k.fail(EFAULT);
-      return k.ask({ kind: "send", fd: Number(fd), data: Buffer.from(bytes), to });
+      return [BigInt(desc.send(Buffer.from(bytes), to)), 0];
+    });
+
+    this.on(211, (k, fd, msg, flags) => k.done(k.sendMsgInto(Number(fd), k.addr(msg), Number(flags))));
+
+    this.on(212, (k, fd, msg, flags) => k.done(k.recvMsgInto(Number(fd), k.addr(msg), Number(flags))));
+
+    // sendmmsg and recvmmsg: the same two calls over an array of headers. glibc's resolver sends
+    // the A and AAAA questions in one sendmmsg, and reads the answers in one recvmmsg, so a guest
+    // that resolves a name needs both.
+    this.on(269, (k, fd, vec, vlen, flags) => k.done(k.sendMMsgInto(Number(fd), k.addr(vec), Number(vlen), Number(flags))));
+
+    this.on(243, (k, fd, vec, vlen, flags, tmo) => {
+      const deadline = k.timespecMs(k.addr(tmo));
+      if (deadline === null) return k.fail(EINVAL);
+      return k.done(
+        k.recvMMsgInto(Number(fd), k.addr(vec), Number(vlen), Number(flags), deadline < 0 ? 0 : Date.now() + deadline),
+      );
     });
 
     this.on(207, (k, fd, buf, len, flags, addr, lenp) =>
@@ -874,6 +1012,9 @@ export class Kernel {
       const timeout = k.timespecMs(tmo);
       if (timeout === null) return k.fail(EINVAL);
       const ready = k.pollOnce(at, n);
+      if (process.env.ARMJIT_TRACE_SOCKETS) {
+        console.error(`sockets: poll n=${n} timeout=${timeout} ready=${ready}`);
+      }
       if (ready > 0) return [BigInt(ready), 0];
       if (timeout === 0) return [0n, 0];
       return k.ask({ kind: "poll", fds: at, nfds: n, deadline: timeout < 0 ? 0 : Date.now() + timeout });

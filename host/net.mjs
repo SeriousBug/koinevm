@@ -180,9 +180,11 @@ function trace(text) {
 /// The sockets of one session: a fork shares this, because a socket description is shared between
 /// the processes that hold a descriptor on it, the same way an open file is.
 export class Net {
-  constructor({ wake = () => {}, network = nodeNetwork } = {}) {
+  constructor({ wake = () => {}, network = nodeNetwork, resolver = null } = {}) {
     this.wake = wake;
     this.network = network;
+    /// The host's name service, for the queries sent to the address it answers.
+    this.resolver = resolver;
     this.waiters = [];
   }
 
@@ -250,6 +252,7 @@ class Datagram {
     this.handle = null;
     this.binding = false;
     this.closed = false;
+    this.sent = false;
   }
 
   host() {
@@ -303,10 +306,31 @@ class Datagram {
     return Promise.resolve(0);
   }
 
+  /// The bytes queued for sending, or a negative errno. Sending does not wait for the host: a
+  /// datagram send answers the count on Linux, and a failure the network reports later is the one a
+  /// receive or `SO_ERROR` answers with.
   send(bytes, addr) {
     const to = addr ?? this.peer;
-    if (!to) return Promise.resolve(-EDESTADDRREQ);
+    if (!to) return -EDESTADDRREQ;
+    // A query for the address the guest's resolver file names is answered by the host's own
+    // resolver instead of reaching a network: the answer arrives on this socket, from that address,
+    // which is what a resolver waiting for one expects.
+    const resolver = this.net.resolver;
+    if (resolver && to.port === 53 && resolver.handles(to.ip)) {
+      trace(`${this.id} -> dns ${bytes.length} for ${to.ip}`);
+      resolver
+        .answer(bytes)
+        .then((reply) => {
+          trace(`${this.id} dns answered ${reply ? reply.length : "nothing"}`);
+          if (!reply || this.closed) return;
+          this.queue.push({ data: reply, from: { family: this.domain, ip: to.ip, port: to.port } });
+          this.net.notify();
+        })
+        .catch((e) => trace(`${this.id} dns failed: ${e.message}`));
+      return bytes.length;
+    }
     trace(`${this.id} -> ${bytes.length} to ${to.ip}:${to.port}`);
+    this.sent = true;
     return this.host().send(bytes, to.ip, to.port);
   }
 
@@ -327,6 +351,27 @@ class Datagram {
 
   status() {
     return { read: this.queue.length > 0 || this.error !== 0, write: true, err: this.error !== 0, hup: false };
+  }
+
+  /// The size of the datagram a receive would take now, which is what FIONREAD answers and what a
+  /// resolver sizes its buffer from.
+  pending() {
+    return this.queue.length ? this.queue[0].data.length : 0;
+  }
+
+  /// Whether the address is one the host has yet to choose: a socket that has sent without being
+  /// bound gets its port a moment after the send.
+  addressPending() {
+    return this.sent && this.bound === null;
+  }
+
+  /// The address once the host has chosen one, for a guest that asks in the same breath as the
+  /// send that bound the socket.
+  async ready() {
+    if (!this.addressPending() || !this.handle) return this.address();
+    const got = await this.handle.ready();
+    if (got && !this.bound) this.bound = { family: this.domain, ...got };
+    return this.address();
   }
 
   option(level, name, value) {
@@ -416,10 +461,10 @@ class PairEnd {
   }
 
   send(bytes) {
-    if (!this.other || this.otherClosed) return Promise.resolve(-EPIPE);
+    if (!this.other || this.otherClosed) return -EPIPE;
     this.other.queue.push(Buffer.from(bytes));
     this.net.notify();
-    return Promise.resolve(bytes.length);
+    return bytes.length;
   }
 
   recv(max, peek = false) {
@@ -435,6 +480,14 @@ class PairEnd {
 
   status() {
     return { read: this.queue.length > 0 || this.peerClosed, write: !this.peerClosed, err: false, hup: this.peerClosed };
+  }
+
+  pending() {
+    return this.queue.reduce((n, chunk) => n + chunk.length, 0);
+  }
+
+  ready() {
+    return Promise.resolve(this.address());
   }
 
   option(level, name, value) {
@@ -472,19 +525,38 @@ export const nodeNetwork = {
     const sock = dgram.createSocket({ type: ipv6 ? "udp6" : "udp4" });
     sock.on("message", (data, rinfo) => onMessage(data, { ip: rinfo.address, port: rinfo.port }));
     sock.on("error", (e) => onError(errnoOf(e)));
+    // A socket is bound either by `bind` or by the host's own choice on the first send, and both
+    // end with the same event.
     let bound = false;
+    let announce;
+    const listeningOnce = new Promise((resolve) => {
+      announce = resolve;
+    });
+    sock.on("listening", () => {
+      bound = true;
+      announce();
+    });
+    // A socket that has sent is bound to a port without ever having been asked to be, and
+    // `getsockname` has to report the one the host chose.
+    const address = () => {
+      try {
+        const got = sock.address();
+        return { ip: got.address, port: got.port };
+      } catch {
+        return null;
+      }
+    };
     return {
       bind(ip, port) {
         return new Promise((resolve) => {
           const settle = (errno) => {
-            sock.off("listening", listening);
+            sock.off("listening", onListening);
             sock.off("error", failed);
-            bound = errno === 0;
             resolve(errno);
           };
-          const listening = () => settle(0);
+          const onListening = () => settle(0);
           const failed = (e) => settle(errnoOf(e));
-          sock.on("listening", listening);
+          sock.on("listening", onListening);
           sock.on("error", failed);
           try {
             sock.bind({ address: ip, port });
@@ -494,9 +566,16 @@ export const nodeNetwork = {
         });
       },
       send(bytes, ip, port) {
-        return new Promise((resolve) => {
-          sock.send(bytes, port, ip, (e) => resolve(e ? errnoOf(e) : bytes.length));
-        });
+        // The callback is where the network reports a failure it found on the way out; the answer
+        // is the count, which is what a sender gets.
+        try {
+          sock.send(bytes, port, ip, (e) => {
+            if (e) onError(errnoOf(e));
+          });
+        } catch (e) {
+          return -errnoOf(e);
+        }
+        return bytes.length;
       },
       membership(group, iface, join) {
         try {
@@ -507,15 +586,11 @@ export const nodeNetwork = {
           return errnoOf(e);
         }
       },
-      // A socket that has sent is bound to a port without ever having been asked to be, and
-      // `getsockname` has to report the one the host chose.
-      address() {
-        try {
-          const got = sock.address();
-          return { ip: got.address, port: got.port };
-        } catch {
-          return null;
-        }
+      address,
+      /// The address, waiting for the host to choose it when it has not yet.
+      ready() {
+        const now = address();
+        return now ? Promise.resolve(now) : listeningOnce.then(address);
       },
       close() {
         try {

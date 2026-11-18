@@ -12,9 +12,10 @@
 // the child can run, and a deadlock is reported as one instead of hanging.
 
 import fs from "node:fs";
-import { Kernel, ECHILD } from "./syscall.mjs";
+import { Kernel, ECHILD, EBADF, EFAULT } from "./syscall.mjs";
 import { WOULD_BLOCK, ENOENT, EACCES } from "./files.mjs";
 import { Net } from "./net.mjs";
+import { Resolver } from "./dns.mjs";
 import { Mach } from "./pages.mjs";
 
 const SHADOW = 0x0;
@@ -42,9 +43,12 @@ export class Session {
     this.processes = [];
     this.nextPid = 1;
     this.root = null;
+    /// The host's name service, behind the address the guest's own resolver file names.
+    /// `ARMJIT_DNS=raw` leaves the guest's file and the guest's servers alone.
+    this.resolver = process.env.ARMJIT_DNS === "raw" ? null : new Resolver();
     /// The sockets of the session, shared by every process in it: a fork's descriptors point at
     /// the same descriptions, and the host object behind one is the one the fork shares too.
-    this.net = new Net({ wake: () => this.poll() });
+    this.net = new Net({ wake: () => this.poll(), resolver: this.resolver });
   }
 
   /// A process running an image from its entry point. Its first thread has the process's own id,
@@ -124,6 +128,7 @@ export class Session {
       ppid: proc.ppid,
       files,
       net: this.net,
+      resolver: this.resolver,
       wake: () => this.poll(),
       futexWake: (addr, n) => this.futexWake(proc, addr, n),
     });
@@ -257,12 +262,16 @@ export class Session {
         return this.read(proc, thread, request);
       case "recv":
         return this.recv(proc, thread, request);
-      case "send":
-        return this.send(proc, thread, request);
+      case "recvmsg":
+        return this.recvMsg(proc, thread, request);
+      case "recvmmsg":
+        return this.recvMMsg(proc, thread, request);
       case "bind":
         return this.bind(proc, thread, request);
       case "connect":
         return this.connect(proc, thread, request);
+      case "address":
+        return this.address(proc, thread, request);
       case "poll":
         return this.pollWait(proc, thread, request);
       case "select":
@@ -396,10 +405,23 @@ export class Session {
     return this.resume(proc, thread, answer);
   }
 
-  async send(proc, thread, request) {
-    const desc = proc.kernel.socketDesc(request.fd);
-    if (typeof desc === "number") return this.resume(proc, thread, desc);
-    const answer = await desc.send(request.data, request.to);
+  /// A receive into a message header there was nothing for.
+  recvMsg(proc, thread, request) {
+    const answer = proc.kernel.recvMsgInto(request.fd, request.msg, request.flags);
+    if (answer && answer.host) {
+      this.park(thread, request, request.deadline);
+      return 0;
+    }
+    return this.resume(proc, thread, answer);
+  }
+
+  /// The same, for the array of headers a resolver reads its answers into.
+  recvMMsg(proc, thread, request) {
+    const answer = proc.kernel.recvMMsgInto(request.fd, request.vec, request.vlen, request.flags, request.deadline);
+    if (answer && answer.host) {
+      this.park(thread, request, request.deadline);
+      return 0;
+    }
     return this.resume(proc, thread, answer);
   }
 
@@ -415,6 +437,15 @@ export class Session {
     if (typeof desc === "number") return this.resume(proc, thread, desc);
     const answer = await desc.connect(request.addr);
     return this.resume(proc, thread, answer);
+  }
+
+  /// `getsockname` for a socket whose address the host has not chosen yet.
+  async address(proc, thread, request) {
+    const entry = proc.kernel.files.get(request.fd);
+    if (!entry) return this.resume(proc, thread, -EBADF);
+    const at = await entry.desc.ready();
+    if (!proc.kernel.putAddr(request.addr, request.lenp, at)) return this.resume(proc, thread, -EFAULT);
+    return this.resume(proc, thread, 0);
   }
 
   /// A `poll` that found nothing ready: ready now, out of time, or wait for the host.

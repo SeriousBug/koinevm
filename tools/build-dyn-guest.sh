@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-GUESTS=${GUESTS:-"fmt"}
+GUESTS=${GUESTS:-"fmt resolve"}
 
 for g in $GUESTS; do
     # A C++ fixture needs the other compiler and library, and its own source suffix.

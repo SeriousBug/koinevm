@@ -8,7 +8,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-GUESTS=${GUESTS:-"fmt procs str vops argv cxx neon threads"}
+GUESTS=${GUESTS:-"fmt procs str vops argv cxx neon threads resolve"}
 MODES=${MODES:-"check trust"}
 rootfs=rootfs/debian
 

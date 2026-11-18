@@ -24,6 +24,7 @@ export const EPERM = 1;
 export const ENOTEMPTY = 39;
 export const EXDEV = 18;
 export const ENOSYS = 38;
+export const EROFS = 30;
 
 /// What a read of a pipe with writers but no data answers: the process has to wait for one.
 export const WOULD_BLOCK = Symbol("would block");
@@ -53,8 +54,11 @@ const O_DIRECTORY = 0x4000;
 const O_CLOEXEC = 0x80000;
 
 export class Files {
-  constructor(rootfs) {
+  constructor(rootfs, options = {}) {
     this.rootfs = rootfs ? path.resolve(rootfs) : null;
+    /// Files this kernel has that the tree does not. A rootfs unpacked by `apt` has an empty
+    /// `/etc/resolv.conf`, and a program that resolves a name still needs one to read.
+    this.virtual = options.virtual ?? new Map();
     this.map = new Map();
     this.next = 3;
     this.seed = 1;
@@ -97,6 +101,18 @@ export class Files {
     if (host !== entry.host && !host.startsWith(entry.host + path.sep)) return -EACCES;
     if (host !== this.rootfs && !host.startsWith(this.rootfs + path.sep)) return -EACCES;
     return host;
+  }
+
+  /// The contents of a file this kernel provides rather than the tree, or null.
+  virtualFile(guestPath) {
+    return this.virtual.get(this.guestPath(guestPath)) ?? null;
+  }
+
+  /// The metadata of one, and the shape a program that `stat`s a config file expects.
+  virtualStat(guestPath) {
+    const bytes = this.virtualFile(guestPath);
+    if (!bytes) return null;
+    return { mode: 0o100644n, nlink: 1n, size: BigInt(bytes.length), ino: 3n, dev: 0n, rdev: 0n, blksize: 4096n };
   }
 
   add(entry) {
@@ -192,6 +208,18 @@ export class Files {
   }
 
   open(guestPath, flags, mode, dirfd = AT_FDCWD) {
+    const virtual = this.virtualFile(guestPath);
+    if (virtual) {
+      if ((flags & O_ACCMODE) !== 0 || (flags & O_TRUNC)) return -EROFS;
+      return this.add({
+        kind: "file",
+        host: null,
+        virtual,
+        size: virtual.length,
+        desc: { pos: 0, readable: true, writable: false },
+        cloexec: (flags & O_CLOEXEC) !== 0,
+      });
+    }
     const device = DEVICES.get(this.guestPath(guestPath));
     if (device) return this.add({ ...device, desc: { pos: 0 }, cloexec: (flags & O_CLOEXEC) !== 0 });
     const host = this.resolveAt(guestPath, dirfd);
@@ -246,6 +274,7 @@ export class Files {
   }
 
   bytes(entry, off, len) {
+    if (entry.virtual) return entry.virtual.subarray(off, off + len);
     const buf = Buffer.alloc(len);
     const fd = fs.openSync(entry.host, "r");
     try {
@@ -406,6 +435,8 @@ export class Files {
   }
 
   statPath(guestPath, dirfd = AT_FDCWD) {
+    const virtual = this.virtualStat(guestPath);
+    if (virtual) return virtual;
     const host = this.resolveAt(guestPath, dirfd);
     if (host < 0) return host;
     try {
@@ -416,6 +447,8 @@ export class Files {
   }
 
   statFile(guestPath, dirfd = AT_FDCWD) {
+    const virtual = this.virtualStat(guestPath);
+    if (virtual) return virtual;
     const host = this.resolveAt(guestPath, dirfd);
     if (host < 0) return host;
     try {
@@ -443,6 +476,9 @@ export class Files {
     }
     if (entry.kind === "dir") {
       return { mode: 0o040755n, nlink: 2n, size: BigInt(entry.size ?? 0), ino: BigInt(fd + 1), dev: 0n, rdev: 0n };
+    }
+    if (entry.virtual) {
+      return { mode: 0o100644n, nlink: 1n, size: BigInt(entry.virtual.length), ino: BigInt(fd + 1), dev: 0n, rdev: 0n };
     }
     try {
       return fs.statSync(entry.host, { bigint: true });

@@ -21,14 +21,17 @@ waiting on the network.
 | `connect` (203) | a datagram socket records the peer and sends nothing, as Linux does |
 | `getsockname`, `getpeername` (204, 205) | including the implicit bind a first send performs |
 | `sendto`, `recvfrom` (206, 207) | `MSG_PEEK`, `MSG_DONTWAIT`, `MSG_TRUNC` |
+| `sendmsg`, `recvmsg` (211, 212) | the iovecs gathered or scattered; no control data yet |
+| `sendmmsg`, `recvmmsg` (269, 243) | glibc's resolver sends the A and AAAA questions in one and reads the answers in one |
 | `setsockopt`, `getsockopt` (208, 209) | `IP_ADD_MEMBERSHIP`/`IP_DROP_MEMBERSHIP`, `SO_RCVTIMEO`, `SO_TYPE`, `SO_ERROR`, `SO_DOMAIN`, `SO_PROTOCOL`; buffer sizes are accepted and ignored, as hints |
 | `read`, `write` (63, 64) | a receive and a send on a connected socket |
 | `ppoll` (73), `pselect6` (72) | sockets, pipes and files; a timeout is a deadline the scheduler honours with no traffic at all |
 | `fcntl` `F_GETFL`/`F_SETFL` | `O_NONBLOCK`, which is what `recvfrom` answers `EAGAIN` for |
+| `ioctl` `FIONREAD` (29) | the size of the datagram a receive would take, which is what a resolver sizes its buffer from |
 
 Not there yet: TCP (`EPROTONOSUPPORT`), names for `AF_UNIX` sockets (`EAFNOSUPPORT`, so a
-`socket(AF_UNIX, ...)` fails while `socketpair` works), `sendmsg`/`recvmsg`, `shutdown`, `epoll`,
-and `SO_RCVTIMEO` on a pair.
+`socket(AF_UNIX, ...)` fails while `socketpair` works), control data (`SCM_RIGHTS`), `shutdown`,
+`epoll`, and `SO_RCVTIMEO` on a pair.
 
 ## The interface a host implements
 
@@ -60,6 +63,24 @@ waits. `bind` is the only call that has to wait for the host before the guest ca
 The default is `nodeNetwork` in `host/net.mjs`, over `node:dgram`. A host that cannot do UDP at
 all implements `bind` and `send` with `-EACCES`, and every guest call gets a real errno, which is
 what a program that reports "network unreachable" expects.
+
+## Names
+
+A guest that resolves a name writes a DNS query to whatever its `/etc/resolv.conf` names. The file
+this kernel gives a guest whose root filesystem names no server of its own names `192.0.2.1`, an
+address reserved for documentation that no network routes: a query sent there is a query for this
+kernel, and it is answered from the host's own resolver. Names the machine can resolve resolve the
+same way here, because the question asked is the one the machine would ask, which is what makes
+`.local` (mDNS), a VPN's split DNS and `.home.arpa` work at all.
+
+The policy is per nameserver, not per query. Any other address in the file is a real UDP flow, so a
+guest that points at its own server - a corporate resolver, a Pi-hole, `dig @8.8.8.8` - gets that
+server, and a rootfs that already names one keeps it. `ARMJIT_DNS=raw` leaves the file and the
+servers alone entirely.
+
+`A` and `AAAA` answers are built from what the host's resolver says. Everything else - `PTR`, `TXT`,
+`SRV`, `MX` - is the guest's own query forwarded to the machine's servers, because the machine's
+resolver is the only thing that knows what those mean.
 
 ## The limits of this shape
 
