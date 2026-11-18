@@ -55,6 +55,19 @@ because only x86-64 packs it. A descriptor that is closed stops being watched, w
 closed, and a descriptor that is not an epoll answers `EINVAL` where a number that names nothing
 answers `EBADF`.
 
+## The clock and the machine
+
+`clock_gettime` reads the host's clock: `CLOCK_REALTIME` is the wall clock and moves when the machine's
+does, while the monotonic clocks count from a fixed origin, so a program that measures an interval
+gets one and a program that stamps a file gets a time the host would recognise. `gettimeofday` is the
+same clock in the older structure; libgcrypt calls it during self-test and treats a missing number as
+a fatal `BUG()`, which is why a program that looks like it never needs it still does.
+
+`sysinfo` reports the memory the guest was given - its own linear memory - and nothing about the
+host. A program that sizes a buffer from the free memory has to hear a number a run can back: `sort`
+asked for a quarter of a machine's memory, spilled every few lines into temporary files, and its
+names for them collided.
+
 ## What is not modelled
 
 Process groups and sessions (a `kill` with a negative pid reaches every process but the caller), job

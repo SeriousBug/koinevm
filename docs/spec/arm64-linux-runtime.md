@@ -51,6 +51,7 @@ Numbers verified against the generic table [S5], structures against [S6] [S7], e
 | 215 | munmap | (addr, len) | 0 | EINVAL |
 | 226 | mprotect | (addr, len, prot) | 0 | EINVAL, ENOMEM, EACCES |
 | 214 | brk | (addr) | the resulting break | none reaches the guest |
+| 216 | mremap | (addr, oldlen, newlen, flags, newaddr) | address | EINVAL, ENOMEM |
 | 80 | fstat | (fd, buf) | 0 | EBADF, EFAULT |
 | 79 | newfstatat | (dirfd, path, buf, flags) | 0 | EBADF, ENOENT, EFAULT, ENOTDIR |
 | 278 | getrandom | (buf, len, flags) | bytes written | EAGAIN, EINVAL, EFAULT |
@@ -68,6 +69,7 @@ Non-obvious semantics:
 - `mmap`'s `offset` is in **bytes** on AArch64 (not pages, as 32-bit `mmap2` takes it), `len` rounds up to a page, and `addr` is a hint unless `MAP_FIXED` (0x10): `MAP_PRIVATE` 0x02, `MAP_ANONYMOUS` 0x20, `MAP_FIXED_NOREPLACE` 0x100000. `len` 0 is `EINVAL`. The kernel returns the address; libc turns `-errno` into `MAP_FAILED`.
 - `munmap` rounds `len` up, requires a page-aligned `addr`, and succeeds on an unmapped range. Partial unmap is legal.
 - `mprotect` requires a page-aligned `addr` and fails with `ENOMEM` if any page in the range is unmapped. `PROT_NONE` is 0.
+- `mremap` grows a mapping in place when the pages after it are free, and otherwise moves it: `MREMAP_MAYMOVE` 1 and `MREMAP_FIXED` 2, with 4 the flag that asks for the move. `oldlen` and `newlen` round up to pages, the answered address is the mapping's own, and the bytes the old range held are the bytes the new one holds.
 - `brk` returns the break the kernel now holds, not a status, and on failure returns the unchanged break, so the caller compares the answer with the request. It never reports an error, and the reservation behind it is page-granular, so the value need not match the pages it covers [S9].
 - `fstat` fills 128 bytes: dev 0, ino 8, mode 16 (u32), nlink 20, uid 24, gid 28, rdev 32, pad 40, size 48, blksize 56 (u32), pad 60, blocks 64, atime 72, atime_nsec 80, mtime 88, mtime_nsec 96, ctime 104, ctime_nsec 112, unused 120 and 124 [S6]. There is no `stat` number on AArch64: libc builds `stat` from `newfstatat`.
 - `getrandom` writes at most 32 MiB per call; flags are `GRND_NONBLOCK` 1, `GRND_RANDOM` 2, `GRND_INSECURE` 4.

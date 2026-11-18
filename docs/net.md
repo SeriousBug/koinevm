@@ -40,6 +40,29 @@ peer reads stays in the host's buffer. Bytes arriving for a guest that is not re
 the host instead, once a quarter of a megabyte has queued, which is the direction that can deadlock
 a guest and so the direction that is bounded.
 
+## Addresses
+
+An address is held as the family the *socket* speaks, not as the family the address was written in.
+A socket is the host's UDP or TCP socket underneath, so an `AF_INET6` socket has to see a `v4`
+address as a `v6` one, which is the `::ffff:a.b.c.d` form Linux calls a mapped address; anything
+else a guest tries to put on such a socket is `EAFNOSUPPORT` from `connect` and `EINVAL` from
+`bind`. Resolution and the socket tables therefore agree: `getaddrinfo` sorts its answers so the
+one whose family the socket has comes first, and a peer's address reported back from a receive is
+in the shape the socket takes.
+
+A `sockaddr` is decoded by its family, and the 28-byte `sockaddr_in6` is accepted at its own length
+as well as the 16-byte `sockaddr_in`; family 0 is a valid "no address yet", which is what a
+`connect` to a datagram socket that has not sent anything reports.
+
+A datagram `connect` waits for the host to answer, because on a connected socket the peer's address
+is one the host reports back, and until it has answered there is nothing to report. Connecting a
+second time replaces the host's socket rather than disconnecting it, since the host's own
+`disconnect` would leave the guest holding a socket it cannot send from.
+
+`fcntl`'s `F_GETFL` reports the access mode as well as `O_NONBLOCK`: `fdopen` builds its `FILE` from
+the mode the call answers, and a read-only descriptor that reports no mode at all makes glibc's own
+stdio handle checks abort the program that asked.
+
 ## The interface a host implements
 
 Everything above is the Linux side. The host side is one object, and replacing it is how a host
