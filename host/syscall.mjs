@@ -31,6 +31,8 @@ export const EBADF = 9;
 export const ENOTTY = 25;
 export const ECHILD = 10;
 export const ENOEXEC = 8;
+const ENODATA = 61;
+const ENOTSUP = 95;
 
 const MAP_ANONYMOUS = 0x20;
 /// `struct epoll_event` here is the mask, four bytes of padding, and the guest's own eight-byte value:
@@ -105,7 +107,9 @@ export class Kernel {
   read(x, len) {
     const a = this.addr(x);
     if (!this.inBounds(a, len)) return null;
-    return new Uint8Array(this.memory.buffer, a, len).slice();
+    // A copy, because the guest may move the memory out from under it, and a Buffer because callers
+    // read numbers out of one: a `setsockopt`'s value is an int in the guest's own byte order.
+    return Buffer.from(new Uint8Array(this.memory.buffer, a, len));
   }
 
   put(x, bytes) {
@@ -377,6 +381,27 @@ export class Kernel {
 
     this.on(172, (k) => [BigInt(k.pid), 0]); // getpid
     this.on(173, (k) => [BigInt(k.ppid), 0]); // getppid
+    this.on(179, (k, buf) => {
+      // What `sysconf(_SC_PHYS_PAGES)` and a progress bar read. The guest's memory is the wasm
+      // memory it was given, so that is the whole of it, and a program that sizes a buffer by
+      // the free part has to hear something a run can back.
+      const at = BigInt(k.addr(buf));
+      if (!k.inBounds(Number(at), 112)) return k.fail(EFAULT);
+      const total = BigInt(k.memory.buffer.byteLength);
+      k.put64(at, 1n); // uptime, in seconds
+      for (let i = 0; i < 3; i++) k.put64(at + BigInt(8 + i * 8), 0n);
+      k.put64(at + 32n, total);
+      k.put64(at + 40n, total / 2n); // freeram
+      k.put64(at + 48n, 0n);
+      k.put64(at + 56n, 0n);
+      k.put64(at + 64n, 0n);
+      k.put64(at + 72n, 0n);
+      k.put32(at + 80n, 1); // procs, and the padding beside it
+      k.put64(at + 88n, 0n);
+      k.put64(at + 96n, 0n);
+      k.put32(at + 104n, 1); // mem_unit
+      return [0n, 0];
+    });
     this.on(178, (k) => [BigInt(k.pid), 0]); // gettid
     this.on(96, (k, uaddr) => {
       k.tidAddress = k.addr(uaddr);
@@ -602,6 +627,50 @@ export class Kernel {
       k.fillStat(buf, st);
       return [0n, 0];
     });
+
+    this.on(291, (k, dirfd, path, flags, mask, buf) => {
+      // `statx` is the extended stat: the caller names the fields it wants, and the answer names
+      // the ones it got. Coreutils asks one before it falls back, and reports the failure.
+      const name = k.str(path);
+      const at = Number(flags);
+      let st;
+      if (name === "" && at & 0x1000) st = k.files.statFd(Number(dirfd)); // AT_EMPTY_PATH
+      else if (at & 0x100) st = k.files.statPath(name, Number(dirfd)); // AT_SYMLINK_NOFOLLOW
+      else st = k.files.statFile(name, Number(dirfd));
+      if (typeof st === "number") return [BigInt(st), 0];
+      k.fillStatx(buf, st, Number(mask));
+      return [0n, 0];
+    });
+
+    // ---- extended attributes. The tree is a directory of this machine, whose own attributes mean
+    // nothing to the guest, so a file has none: a read answers ENODATA and a listing is empty,
+    // which is what every program that asks for one is ready for. ENOSYS would read as a failure
+    // and `ls` prints it.
+    const xattrFile = (k, path, follow) => {
+      const st = follow ? k.files.statFile(k.str(path)) : k.files.statPath(k.str(path));
+      return typeof st === "number" ? st : 0;
+    };
+    const xattrFd = (k, fd) => (typeof k.files.statFd(Number(fd)) === "number" ? -EBADF : 0);
+
+    for (const [nr, follow] of [[8, true], [9, false]]) {
+      this.on(nr, (k, path, name, value, size) => [BigInt(xattrFile(k, path, follow) || -ENODATA), 0]);
+    }
+    this.on(10, (k, fd) => [BigInt(xattrFd(k, fd) || -ENODATA), 0]);
+    for (const [nr, follow] of [[11, true], [12, false]]) {
+      this.on(nr, (k, path, list, size) => [BigInt(xattrFile(k, path, follow)), 0]);
+    }
+    this.on(13, (k, fd) => [BigInt(xattrFd(k, fd)), 0]);
+    for (const [nr, follow] of [[14, true], [15, false]]) {
+      this.on(nr, (k, path, name) => [BigInt(xattrFile(k, path, follow) || -ENODATA), 0]);
+    }
+    this.on(16, (k, fd) => [BigInt(xattrFd(k, fd) || -ENODATA), 0]);
+    for (const [nr, follow] of [[5, true], [6, false]]) {
+      this.on(nr, (k, path, name, value, size, flags) => [
+        BigInt(xattrFile(k, path, follow) || -ENOTSUP),
+        0,
+      ]);
+    }
+    this.on(7, (k, fd) => [BigInt(xattrFd(k, fd) || -ENOTSUP), 0]);
 
     this.on(78, (k, dirfd, path, buf, size) => {
       const target = k.files.readlink(k.str(path), Number(dirfd));
@@ -1315,6 +1384,46 @@ export class Kernel {
     this.put64(addr + 104n, time(st.ctimeMs));
     this.put64(addr + 112n, 0n);
     this.put64(addr + 120n, 0n);
+  }
+
+  /// The 256 bytes `statx` fills. It is not a widened `struct stat`: the fields are in another
+  /// order, and the mask says which of them the caller was given.
+  fillStatx(addr, st, mask) {
+    const sec = (t) => (t ? BigInt(Math.floor(Number(t) / 1000)) : 0n);
+    const nsec = (t) => (t ? Number((Number(t) % 1000) * 1000000) : 0);
+    const timestamp = (at, t) => {
+      this.put64(at, sec(t));
+      this.put32(at + 8n, nsec(t));
+      this.put32(at + 12n, 0);
+    };
+    // A device number is one number in the kernel's own split, and the field carries the two halves.
+    const parts = (dev) => [Number(dev >> 8n & 0xfffn), Number(dev & 0xffn | (dev >> 12n & 0xfff00n))];
+    const [devMajor, devMinor] = parts(st.dev ?? 0n);
+    const [rdevMajor, rdevMinor] = parts(st.rdev ?? 0n);
+    // The basic set the tree can answer for: everything but the birth time, which no file here has.
+    this.put32(addr, mask & 0x7ff);
+    this.put32(addr + 4n, Number(st.blksize ?? 4096n));
+    this.put64(addr + 8n, 0n);
+    this.put32(addr + 16n, Number(st.nlink ?? 0n));
+    this.put32(addr + 20n, 0);
+    this.put32(addr + 24n, 0);
+    this.put32(addr + 28n, Number(st.mode ?? 0n) & 0xffff);
+    this.put64(addr + 32n, st.ino ?? 0n);
+    this.put64(addr + 40n, st.size ?? 0n);
+    this.put64(addr + 48n, st.blocks ?? 0n);
+    this.put64(addr + 56n, 0n);
+    timestamp(addr + 64n, st.atimeMs);
+    timestamp(addr + 80n, null);
+    timestamp(addr + 96n, st.ctimeMs);
+    timestamp(addr + 112n, st.mtimeMs);
+    this.put32(addr + 128n, rdevMajor);
+    this.put32(addr + 132n, rdevMinor);
+    this.put32(addr + 136n, devMajor);
+    this.put32(addr + 140n, devMinor);
+    this.put64(addr + 144n, 0n);
+    this.put32(addr + 152n, 0);
+    this.put32(addr + 156n, 0);
+    for (let i = 160n; i < 256n; i += 8n) this.put64(addr + i, 0n);
   }
 
   // ---- process start-up
