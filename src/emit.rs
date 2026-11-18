@@ -3119,23 +3119,24 @@ impl<'a> RegionEmitter<'a> {
                 if lsb >= w {
                     return Err(format!("invalid extr at 0x{addr:x}"));
                 }
-                if rn == rm {
+                // The low half of `rn:rm` shifted right: the bits that leave `rm` come back at the
+                // top of `rn`, which is why the same register twice is a rotate by immediate. Both
+                // operands are narrowed to the instruction's width first, because a 32-bit value
+                // shifted up into the high half of the register would lose exactly the bits the
+                // rotate is supposed to bring back.
+                self.f.lg(rm);
+                if !sf {
+                    self.f.i64c(0xffff_ffff);
+                    self.f.op(I64_AND);
+                }
+                if lsb != 0 {
+                    self.f.i64c(lsb as i64);
+                    self.f.op(I64_SHR_U);
                     self.f.lg(rn);
                     if !sf {
                         self.f.i64c(0xffff_ffff);
                         self.f.op(I64_AND);
                     }
-                    if lsb != 0 {
-                        self.f.i64c(lsb as i64);
-                        self.f.op(I64_ROTR);
-                    }
-                } else if lsb == 0 {
-                    self.f.lg(rn);
-                } else {
-                    self.f.lg(rn);
-                    self.f.i64c(lsb as i64);
-                    self.f.op(I64_SHR_U);
-                    self.f.lg(rm);
                     self.f.i64c((w - lsb) as i64);
                     self.f.op(I64_SHL);
                     self.f.op(I64_OR);

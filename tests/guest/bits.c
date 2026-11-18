@@ -86,7 +86,20 @@ static const unsigned long pat[] = {
     X(sbfx_w_3_7, "sbfx w #3 #7", "sbfx %w0, %w1, #3, #7")                                    \
     X(ubfx_w_0_8, "ubfx w #0 #8", "ubfx %w0, %w1, #0, #8")                                    \
     X(sbfiz_w_5_6, "sbfiz w #5 #6", "sbfiz %w0, %w1, #5, #6")                                 \
-    X(bfi_w_8_4, "bfi w #8 #4", "mov %w0, %w1\n bfi %w0, %w1, #8, #4")
+    X(bfi_w_8_4, "bfi w #8 #4", "mov %w0, %w1\n bfi %w0, %w1, #8, #4")                           \
+    /* A rotate by immediate is `extr` with the same register twice, and the 32-bit form is where
+     * the bits that leave one end have to come back at the other end of 32 bits rather than of 64:
+     * every 32-bit rotate in a hash, a CRC or a PRNG is this instruction. */                     \
+    X(ror_w_7, "ror w #7", "ror %w0, %w1, #7")                                                 \
+    X(ror_w_1, "ror w #1", "ror %w0, %w1, #1")                                                 \
+    X(ror_w_31, "ror w #31", "ror %w0, %w1, #31")                                              \
+    X(ror_x_13, "ror x #13", "ror %0, %1, #13")                                                \
+    X(ror_x_63, "ror x #63", "ror %0, %1, #63")                                                \
+    X(extr_w_5, "extr w #5 of two", "lsl %w0, %w1, #3\n extr %w0, %w1, %w0, #5")           \
+    X(extr_x_9, "extr x #9 of two", "lsl %0, %1, #3\n extr %0, %1, %0, #9")                \
+    /* The high half of a product, which bignum code is built from: `mul` alone answers the low. */ \
+    X(umulh_self, "umulh x", "umulh %0, %1, %1")                                                \
+    X(smulh_self, "smulh x", "smulh %0, %1, %1")
 
 #define DEF(name, tag, body)                                                                  \
     __attribute__((noinline)) static unsigned long b_##name(unsigned long v) {                \
