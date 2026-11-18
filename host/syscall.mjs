@@ -6,7 +6,7 @@
 
 import fs from "node:fs";
 import { AddressSpace, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
-import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK } from "./files.mjs";
+import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK, O_WRONLY, O_RDWR } from "./files.mjs";
 import {
   Net,
   decodeSockaddr,
@@ -487,12 +487,12 @@ export class Kernel {
           entry.cloexec = (Number(arg) & 1) !== 0;
           return [0n, 0];
         case 3: // F_GETFL
-          return [
-            BigInt((entry.kind === "socket" ? 0x2 : entry.desc?.append ? 0x400 : 0) | (entry.desc?.nonblock ? 0x800 : 0)),
-            0,
-          ];
+          return [BigInt(k.statusFlags(entry)), 0];
         case 4: // F_SETFL
-          if (entry.desc) entry.desc.nonblock = (Number(arg) & 0x800) !== 0;
+          if (entry.desc) {
+            entry.desc.nonblock = (Number(arg) & 0x800) !== 0;
+            if (entry.desc.append !== undefined) entry.desc.append = (Number(arg) & 0x400) !== 0;
+          }
           return [0n, 0];
         // One process holds every lock it asks for, so a lock request succeeds and a query finds
         // nothing in the way. A query has to say so: `l_type` is `F_UNLCK`, or the caller reads
@@ -835,6 +835,23 @@ export class Kernel {
     const want = this.guestAddr(addr, len);
     if (want === null || typeof want === "number") return want;
     return sockaddrFor(desc.domain, want, bind);
+  }
+
+  /// F_GETFL: the access mode the descriptor was opened with and the status flags on top. libc
+  /// reads the access mode when it wraps a descriptor in `fdopen`, and a stream it believes cannot
+  /// write fails the first `fwrite` rather than reaching the file.
+  statusFlags(entry) {
+    let flags;
+    if (entry.kind === "socket") flags = O_RDWR;
+    else if (entry.kind === "pipe") flags = entry.end === "read" ? 0 : O_WRONLY;
+    else if (entry.kind === "stdin") flags = 0;
+    else if (entry.kind === "stdout" || entry.kind === "stderr") flags = O_WRONLY;
+    else if (entry.desc && entry.desc.writable !== undefined) {
+      flags = entry.desc.readable && entry.desc.writable ? O_RDWR : entry.desc.writable ? O_WRONLY : 0;
+    } else flags = O_RDWR;
+    if (entry.desc?.append) flags |= 0x400;
+    if (entry.desc?.nonblock) flags |= 0x800;
+    return flags;
   }
 
   /// Write an address back, and the length it really is: the caller's own limit bounds the copy,

@@ -45,8 +45,8 @@ const DEVICES = new Map([
 ]);
 
 const O_ACCMODE = 3;
-const O_WRONLY = 1;
-const O_RDWR = 2;
+export const O_WRONLY = 1;
+export const O_RDWR = 2;
 const O_CREAT = 0x40;
 const O_EXCL = 0x80;
 const O_TRUNC = 0x200;
