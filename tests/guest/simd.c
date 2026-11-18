@@ -382,8 +382,9 @@ static void setup(void) {
     X(tbl_2reg, "tbl 16b, 2 tables", "tbl v2.16b, {v0.16b, v1.16b}, v4.16b")                    \
     X(tbx_1reg, "tbx 16b, 1 table", "mov v2.16b, v3.16b\n tbx v2.16b, {v0.16b}, v1.16b")
 
-/* Scalar floating point: moves between the GPR and FP register files, and the integer
- * conversions. Arithmetic (fadd, fcmp, fcsel, fcvt) is not translated yet, so it is not here. */
+/* Scalar floating point: moves between the GPR and FP register files, the integer conversions, and
+ * the forms that work on the bit patterns rather than on the values. Arithmetic on the values
+ * (fadd, fcvt, ...) is not translated yet, so it is not here. */
 #define FP_CASES(X)                                                                        \
     X(fmov_w_s, "fmov %w0, s0", "fmov %w0, s0")                                            \
     X(fmov_x_d, "fmov %0, d0", "fmov %0, d0")                                              \
@@ -396,7 +397,17 @@ static void setup(void) {
     X(fcvtzs_w_s, "fcvtzs w, s", "fcvtzs w9, s0\n mov %0, x9")                             \
     X(fcvtzu_w_s, "fcvtzu w, s", "fcvtzu w9, s0\n mov %0, x9")                             \
     X(fcvtzs_x_d, "fcvtzs x, d", "fcvtzs %0, d0")                                          \
-    X(fcvtzu_x_d, "fcvtzu x, d", "fcvtzu %0, d0")
+    X(fcvtzu_x_d, "fcvtzu x, d", "fcvtzu %0, d0")                                          \
+    /* The scalar three-same group, which is the vector operation on the one lane a `d` register
+     * names: integer add and subtract of the bit patterns, high half left alone. */             \
+    X(add_d_d, "add d, d, d", "add d2, d0, d1\n" D2X)                                        \
+    X(sub_d_d, "sub d, d, d", "sub d2, d0, d1\n" D2X)                                        \
+    /* The high half of a vector register, which is where a 128-bit value's second word goes. */ \
+    X(fmov_x_d1, "fmov %0, v2.d[1]", "fmov d2, %3\n fmov v2.d[1], %4\n fmov %0, v2.d[1]")     \
+    X(fmov_d1_keeps_low, "fmov v2.d[1], x keeps d2", "fmov d2, %3\n fmov v2.d[1], %4\n fmov %0, d2") \
+    /* fccmp compares only when its condition holds, and takes the flags it was given otherwise. */ \
+    X(fccmp_taken, "fccmp, condition holds", "fcmp d0, d1\n fccmp d0, d1, #0x0, eq\n cset %0, ne") \
+    X(fccmp_skipped, "fccmp, condition does not hold", "fcmp d0, d1\n fccmp d1, d0, #0x6, eq\n cset %0, ne")
 
 struct vcase {
     void (*fn)(void);
