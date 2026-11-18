@@ -16,6 +16,11 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 fail=0
+# A fixture whose code under test lives in a library loads it from /tmp, which is a path in the
+# guest: the library is built beside the fixture and put where the tree holds it.
+for g in $GUESTS; do
+    if [ -f "tests/guest/lib$g.so" ]; then cp "tests/guest/lib$g.so" "$rootfs/tmp/"; fi
+done
 for g in $GUESTS; do
     for mode in $MODES; do
         wasm="$work/$g.$mode.wasm"

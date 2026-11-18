@@ -27,8 +27,8 @@ for g in $GUESTS; do
     lib=""
     link=""
     if [ -f "tests/guest/$g.lib.c" ]; then
-        lib="gcc -O2 -fPIC -shared -o /tmp/lib$g.so tests/guest/$g.lib.c &&
-            cp /tmp/lib$g.so rootfs/debian/tmp/ &&"
+        lib="gcc -O2 -fPIC -shared -o tests/guest/lib$g.so tests/guest/$g.lib.c &&
+            cp tests/guest/lib$g.so /tmp/ &&"
         link="-L/tmp -l$g -Wl,-rpath,/tmp"
     fi
 

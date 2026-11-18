@@ -77,8 +77,8 @@ pub const ENGINE_HI: u64 = 0x1000;
 //
 //   0x00000000  control block: register shadow, trace ring
 //   0x00001000  soft page table, one byte per 4 KiB page (1 MiB, covers 4 GiB)
-//   0x00101000  dispatch table arena (sized to the region count)
-//   0x00400000  images: non-PIE ET_EXEC link here, PIE and shared objects are placed here
+//   0x00101000  dispatch table arena (8 MiB: twice what the largest image may need)
+//   0x01000000  images: non-PIE ET_EXEC link here, PIE and shared objects are placed here
 //   ...         heap grows up from the end of the images, mmap areas grow down from the stack
 //   mem_size - stack reserve - 4 KiB   stack, growing down
 /// One PTE byte per 4 KiB page.
@@ -88,12 +88,12 @@ pub const TABLE_BASE: u64 = PTE_BASE + PTE_PAGES;
 /// A dispatch slot is `[u32 payload][u32 tag]`: payload 0 is empty, else `block << 16 | region + 1`,
 /// tag is `pc >> 2` plus one so it is never zero.
 pub const TABLE_SLOT: u64 = 8;
-pub const TABLE_MAX_SLOTS: u64 = 1 << 18;
+pub const TABLE_MAX_SLOTS: u64 = 1 << 20;
 /// Region slots in the wasm table: a dispatch word holds `slot + 1` in 16 bits.
 pub const TABLE_SLOTS_MAX: u32 = 0xffff;
 /// PoC simplification against a real kernel's randomized layout: images start at fixed addresses.
 /// The program at 4 MiB, its dynamic loader well above the heap, `mmap` in between.
-pub const IMAGE_BASE: u64 = 0x400000;
+pub const IMAGE_BASE: u64 = 0x100_0000;
 pub const INTERP_BASE: u64 = 0x1000_0000;
 pub const MMAP_BASE: u64 = 0x4000_0000;
 
