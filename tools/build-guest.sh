@@ -65,6 +65,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
     -c tests/guest/net.c -o tests/guest/net.o
 python3 tools/minilink.py tests/guest/net.o tests/guest/net.elf _start
 
+echo "== guest: epoll (pipes, a datagram and a watch that goes away) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+    -c tests/guest/epoll.c -o tests/guest/epoll.o
+python3 tools/minilink.py tests/guest/epoll.o tests/guest/epoll.elf _start
+
 echo "== guest: signals (kill, a disposition of its own, and the wait status it leaves) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
     -c tests/guest/signals.c -o tests/guest/signals.o

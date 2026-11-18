@@ -280,6 +280,8 @@ export class Session {
         return this.address(proc, thread, request);
       case "accept":
         return this.accept(proc, thread, request);
+      case "epoll":
+        return this.epollWait(proc, thread, request);
       case "poll":
         return this.pollWait(proc, thread, request);
       case "select":
@@ -521,6 +523,18 @@ export class Session {
     return this.resume(proc, thread, 0);
   }
 
+  /// An `epoll_pwait` that found nothing ready, asked again: what arrived since, a timeout that has
+  /// passed, or another wait. A wake with nothing to report is not an answer, so a wait with no
+  /// deadline goes back to waiting.
+  epollWait(proc, thread, request) {
+    const ready = proc.kernel.epollReady(request.epfd, request.maxevents);
+    if (ready === null) return this.resume(proc, thread, proc.kernel.files.get(request.epfd) ? -EINVAL : -EBADF);
+    if (ready.length > 0) return this.resume(proc, thread, proc.kernel.epollDeliver(ready, request.events));
+    if (this.expired(request)) return this.resume(proc, thread, 0);
+    this.park(thread, request, request.deadline);
+    return 0;
+  }
+
   /// A `poll` that found nothing ready: ready now, out of time, or wait for the host.
   pollWait(proc, thread, request) {
     const ready = proc.kernel.pollOnce(request.fds, request.nfds);
@@ -674,6 +688,7 @@ export class Session {
   reason(thread) {
     if (thread.waitingFor === "pipe") return `a pipe (fd ${thread.pending?.fd ?? "?"})`;
     if (thread.waitingFor === "futex") return `futex 0x${thread.blockedOn.toString(16)}`;
+    if (thread.waitingFor === "epoll") return `an epoll (fd ${thread.blockedOn})`;
     if (thread.waitingFor === "socket") {
       const kind = thread.pending?.kind;
       if (kind === "poll" || kind === "select") return `a socket (${kind})`;
@@ -702,7 +717,7 @@ export class Session {
     for (const proc of this.processes) {
       for (const thread of proc.threads) {
         if (thread.state !== "blocked") continue;
-        if (thread.waitingFor === "socket") thread.state = "runnable";
+        if (thread.waitingFor === "socket" || thread.waitingFor === "epoll") thread.state = "runnable";
         else if (thread.waitingFor === "pipe" && proc.kernel.files.readReady(thread.pending.fd)) {
           thread.state = "runnable";
         }

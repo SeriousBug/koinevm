@@ -264,6 +264,9 @@ export class Files {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     this.map.delete(fd);
+    // Whoever holds something about a descriptor - an epoll's registration - hears that it is gone,
+    // whichever path closed it: a close, a dup3 that replaced it, or an exec that dropped it.
+    this.onClose?.(fd);
     if (entry.kind === "socket") entry.desc.release();
     if (entry.kind === "pipe") {
       if (entry.end === "read") entry.desc.readers--;
@@ -477,6 +480,10 @@ export class Files {
     }
     if (entry.kind === "socket") {
       return { mode: 0o140777n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
+    }
+    if (entry.kind === "epoll") {
+      // An anon inode: a regular file to `fstat`, which is all a program reads it for.
+      return { mode: 0o100600n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
     }
     if (entry.kind === "dir") {
       return { mode: 0o040755n, nlink: 2n, size: BigInt(entry.size ?? 0), ino: BigInt(fd + 1), dev: 0n, rdev: 0n };

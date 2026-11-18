@@ -41,6 +41,20 @@ one is already pending is coalesced. A `SIGPIPE` is not raised when a guest writ
 reads: the write answers `EPIPE` instead, which is what a program that had ignored `SIGPIPE` would
 see.
 
+## Waiting for descriptors
+
+`ppoll`, `pselect6` and `epoll_pwait` ask the same question - is this descriptor ready - and the
+answer comes from one place, so a pipe, a file, a socket and an epoll descriptor all report
+themselves the same way. `epoll` is level-triggered and reports `EPOLLERR` and `EPOLLHUP` whatever
+the registration asked for; `EPOLLONESHOT` goes quiet after it has been reported, and an
+edge-triggered registration is reported whenever it is ready, which is more often than the flag
+promises and never less.
+
+`struct epoll_event` here is sixteen bytes - the mask, four bytes of padding, the guest's own value -
+because only x86-64 packs it. A descriptor that is closed stops being watched, whichever way it was
+closed, and a descriptor that is not an epoll answers `EINVAL` where a number that names nothing
+answers `EBADF`.
+
 ## What is not modelled
 
 Process groups and sessions (a `kill` with a negative pid reaches every process but the caller), job

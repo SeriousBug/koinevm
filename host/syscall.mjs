@@ -28,6 +28,15 @@ export const ECHILD = 10;
 export const ENOEXEC = 8;
 
 const MAP_ANONYMOUS = 0x20;
+/// `struct epoll_event` here is the mask, four bytes of padding, and the guest's own eight-byte value:
+/// only x86-64 packs it, so this ABI does not.
+const EPOLL_EVENT = 16;
+const EPOLLIN = 0x001;
+const EPOLLOUT = 0x004;
+const EPOLLERR = 0x008;
+const EPOLLHUP = 0x010;
+const EPOLLONESHOT = 0x40000000;
+const EEXIST = 17;
 const CLONE_VM = 0x100;
 const CLONE_VFORK = 0x4000;
 const CLONE_THREAD = 0x10000;
@@ -62,6 +71,9 @@ export class Kernel {
     /// Called to deliver a signal to a process or a thread of the session, which is the host's job
     /// because the target may not be this process. Answers 0 or a negative errno.
     this.signal = options.signal ?? (() => -ESRCH);
+    /// One map per epoll descriptor: the descriptors it watches, what each asked for, and the value
+    /// it wants back with the event. The host's readiness is the same question `poll` asks.
+    this.epolls = new Map();
     /// The sockets of the session. A fork shares them, because a socket description is shared by
     /// every descriptor on it, the same way an open file is.
     this.net = options.net ?? new Net({ wake: this.wake });
@@ -239,8 +251,11 @@ export class Kernel {
 
     this.on(214, (k, addr) => [BigInt(k.space.setBrk(k.addr(addr))), 0]);
 
+    // A descriptor that is closed stops being watched, whichever way it was closed.
+    this.files.onClose = (fd) => this.forgetFd(fd);
     this.registerFiles();
     this.registerSockets();
+    this.registerEpoll();
     this.registerStartup();
     this.registerProcess();
   }
@@ -261,6 +276,9 @@ export class Kernel {
       random: this.random,
       ids: { ...this.ids, groups: [...this.ids.groups] },
       signals: new Map(this.signals),
+      epolls: new Map(
+        [...this.epolls].map(([fd, interests]) => [fd, new Map([...interests].map(([f, i]) => [f, { ...i }]))]),
+      ),
     };
   }
 
@@ -274,6 +292,7 @@ export class Kernel {
     this.random = state.random;
     this.ids = state.ids;
     this.signals = state.signals;
+    this.epolls = state.epolls;
   }
 
   registerProcess() {
@@ -659,6 +678,109 @@ export class Kernel {
   // reach the host, a receive with nothing queued) goes back through `ask`, and the host answers it
   // by calling the same helper again.
 
+  // ---- epoll
+
+  /// Drop every trace of a descriptor, from the epolls it was watching and from the epolls it was.
+  forgetFd(fd) {
+    this.epolls.delete(fd);
+    for (const interests of this.epolls.values()) interests.delete(fd);
+  }
+
+  /// The registrations of an epoll that have something to report now, in the order they were added.
+  /// A one-shot registration goes quiet after it has been reported, which is its whole point.
+  epollReady(epfd, maxevents) {
+    const interests = this.epolls.get(epfd);
+    if (!interests) return null; // not an epoll descriptor, which the callers answer EINVAL for
+    const out = [];
+    for (const [fd, interest] of interests) {
+      if (!interest.live) continue;
+      const entry = this.files.get(fd);
+      if (!entry) {
+        interests.delete(fd);
+        continue;
+      }
+      const state = this.pollState(entry, fd);
+      let events = 0;
+      if (state.read && (interest.events & EPOLLIN)) events |= EPOLLIN;
+      if (state.write && (interest.events & EPOLLOUT)) events |= EPOLLOUT;
+      // The two that are always reported, whatever the registration asked for.
+      if (state.err) events |= EPOLLERR;
+      if (state.hup) events |= EPOLLHUP;
+      if (events === 0) continue;
+      out.push({ fd, events, data: interest.data });
+      if (interest.events & EPOLLONESHOT) interest.live = false;
+      if (out.length >= maxevents) break;
+    }
+    return out;
+  }
+
+  /// The 12 bytes of an event, or null when the pointer is not readable.
+  epollEvent(addr) {
+    const at = this.addr(addr);
+    if (!this.inBounds(at, EPOLL_EVENT)) return null;
+    const view = new DataView(this.memory.buffer);
+    return { events: view.getUint32(at, true), data: view.getBigUint64(at + 8, true) };
+  }
+
+  /// The events a caller asked for, written where it asked for them.
+  epollDeliver(ready, at) {
+    const view = new DataView(this.memory.buffer);
+    ready.forEach((event, i) => {
+      view.setUint32(at + i * EPOLL_EVENT, event.events, true);
+      view.setBigUint64(at + i * EPOLL_EVENT + 8, event.data, true);
+    });
+    return ready.length;
+  }
+
+  /// epoll_pwait: what is ready, or a thread parked until something is.
+  epollWait(epfd, at, maxevents, ms) {
+    const ready = this.epollReady(epfd, maxevents);
+    if (ready === null) return this.files.get(epfd) ? -EINVAL : -EBADF;
+    if (ready.length > 0) return this.epollDeliver(ready, at);
+    if (ms === 0) return 0;
+    return this.ask({ kind: "epoll", epfd, events: at, maxevents, deadline: ms < 0 ? 0 : Date.now() + ms });
+  }
+
+  registerEpoll() {
+    this.on(20, (k, flags) => {
+      const fd = k.files.add({ kind: "epoll", cloexec: (Number(flags) & 0x80000) !== 0 });
+      k.epolls.set(fd, new Map());
+      return [BigInt(fd), 0];
+    });
+
+    this.on(21, (k, epfd, op, fd, event) => {
+      const ep = Number(epfd);
+      const target = Number(fd);
+      const interests = k.epolls.get(ep);
+      if (!interests) return k.fail(k.files.get(ep) ? EINVAL : EBADF);
+      const how = Number(op);
+      if (how === 2) {
+        // EPOLL_CTL_DEL, which does not read the event the caller passed.
+        if (!interests.has(target)) return k.fail(ENOENT);
+        interests.delete(target);
+        return [0n, 0];
+      }
+      if (how !== 1 && how !== 3) return k.fail(EINVAL);
+      if (target === ep) return k.fail(EINVAL);
+      if (how === 1 && interests.has(target)) return k.fail(EEXIST);
+      if (how === 3 && !interests.has(target)) return k.fail(ENOENT);
+      if (!k.files.get(target)) return k.fail(EBADF);
+      const want = k.epollEvent(event);
+      if (want === null) return k.fail(EFAULT);
+      interests.set(target, { events: want.events, data: want.data, live: true });
+      return [0n, 0];
+    });
+
+    this.on(22, (k, epfd, events, maxevents, timeout) => {
+      const n = Number(maxevents);
+      if (n <= 0) return k.fail(EINVAL);
+      const at = k.addr(events);
+      if (!k.inBounds(at, n * EPOLL_EVENT)) return k.fail(EFAULT);
+      const ms = Number(BigInt.asIntN(32, BigInt.asUintN(64, timeout)));
+      return k.done(k.epollWait(Number(epfd), at, n, ms));
+    });
+  }
+
   /// A signal from this process to another, or to one of its own threads. A signal of zero asks
   /// whether the target is there and does nothing else.
   kill(pid, sig, tid = 0) {
@@ -875,8 +997,13 @@ export class Kernel {
   }
 
   /// Whether a descriptor would answer `poll` now, per direction.
-  pollState(entry) {
+  pollState(entry, fd) {
     if (entry.kind === "socket") return entry.desc.status();
+    if (entry.kind === "epoll") {
+      // An epoll descriptor is readable when one of the descriptors it watches is, which is how one
+      // epoll can be waited on inside another.
+      return { read: (this.epollReady(fd, 1) ?? []).length > 0, write: false, err: false, hup: false };
+    }
     if (entry.kind === "pipe") {
       const read = entry.end === "read" && (entry.desc.data.length > 0 || entry.desc.writers === 0);
       return { read, write: entry.end === "write", err: false, hup: read && entry.desc.writers === 0 };
@@ -901,7 +1028,7 @@ export class Kernel {
       const entry = this.files.get(fd);
       if (!entry) revents = 0x20; // POLLNVAL
       else {
-        const state = this.pollState(entry);
+        const state = this.pollState(entry, fd);
         if (state.read && (events & 0x41)) revents |= events & 0x41;
         if (state.write && (events & 0x04)) revents |= 0x04;
         if (state.err) revents |= 0x08;
@@ -927,7 +1054,7 @@ export class Kernel {
       for (const set of sets) {
         if (!set.in || !(set.in[fd >> 3] & (1 << (fd & 7)))) continue;
         const entry = this.files.get(fd);
-        const state = entry ? this.pollState(entry) : null;
+        const state = entry ? this.pollState(entry, fd) : null;
         const on = !state ? true : set.kind === "read" ? state.read : set.kind === "write" ? state.write : state.err;
         if (!on) continue;
         set.out[fd >> 3] |= 1 << (fd & 7);

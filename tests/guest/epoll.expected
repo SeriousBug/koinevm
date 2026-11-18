@@ -1,0 +1,36 @@
+ok   epoll_create1 returns a descriptor
+ok   a pipe to watch
+ok   add the reading end for EPOLLIN
+ok   adding it twice is EEXIST
+ok   nothing is ready before anything is written
+ok   write into the pipe
+ok   one descriptor is ready
+ok   it says it is readable
+ok   and carries back what the registration named
+ok   a level-triggered watch reports it again
+ok   the byte is read
+ok   and then there is nothing to report
+ok   add the writing end for EPOLLOUT
+ok   a pipe with room is writable
+ok   remove it
+ok   and it is not watched any more
+ok   removing it twice is ENOENT
+ok   changing what is gone is too
+ok   a wait with nothing to report times out
+ok   a datagram socket to watch
+ok   it has a port
+ok   watch it for reading
+ok   send to itself
+ok   the datagram makes the socket ready
+ok   and it is read
+ok   stop watching the socket
+ok   close it
+ok   write into the pipe again
+ok   the pipe is still watched
+ok   close the watched end
+ok   a closed descriptor is not reported
+ok   a descriptor that is not an epoll is EINVAL
+ok   an operation that is not one is EINVAL
+ok   close the writing end
+ok   close the epoll
+epoll: all checks passed
