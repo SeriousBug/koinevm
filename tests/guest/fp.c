@@ -87,6 +87,61 @@ static unsigned int u_of_f(float f) {
     return w;
 }
 
+/* The conversion that leaves an integer in the register it came from, which is the form a cast
+ * that stays in the vector file takes. The last section has no heading of its own: the host's clang
+ * lays this fixture's mergeable literals out one byte short, so the values are printed without
+ * one and the numbers are what the section is about. */
+static void fcvt_same_register(void) {
+    double d = d_of(0xc00e000000000000); // -3.75
+    __asm__ volatile("fcvtzu %d0, %d0" : "+w"(d));
+    put_bits(u_of_d(d));
+
+    d = d_of(0xc00e000000000000);
+    __asm__ volatile("fcvtzs %d0, %d0" : "+w"(d));
+    put_bits(u_of_d(d));
+
+    d = d_of(0x43f0000000000000); // 2^64, past the end of the unsigned range
+    __asm__ volatile("fcvtzu %d0, %d0" : "+w"(d));
+    put_bits(u_of_d(d));
+
+    d = d_of(0x43e0000000000000); // 2^63, past the end of the signed one
+    __asm__ volatile("fcvtzs %d0, %d0" : "+w"(d));
+    put_bits(u_of_d(d));
+
+    d = d_of(0x7ff8000000000000); // a quiet NaN
+    __asm__ volatile("fcvtzu %d0, %d0" : "+w"(d));
+    put_bits(u_of_d(d));
+
+    float f = f_of(0x40f00000); // 7.5
+    __asm__ volatile("fcvtzu %s0, %s0" : "+w"(f));
+    put_bits32(u_of_f(f));
+
+    f = f_of(0xc0f00000); // -7.5
+    __asm__ volatile("fcvtzs %s0, %s0" : "+w"(f));
+    put_bits32(u_of_f(f));
+
+    f = f_of(0x7fc00000); // a quiet NaN
+    __asm__ volatile("fcvtzs %s0, %s0" : "+w"(f));
+    put_bits32(u_of_f(f));
+
+    // The 32-bit form writes the low half and nothing else, so the register's upper bytes say what
+    // the write did to them.
+    unsigned char buf[16];
+    static const char digits[] = "0123456789abcdef";
+    __asm__ volatile("movi v0.16b, #0xff\n"
+                     "fmov s1, #4.0\n"
+                     "fcvtzu s0, s1\n"
+                     "str q0, [%0]"
+                     :
+                     : "r"(buf)
+                     : "v0", "v1", "memory");
+    for (int i = 0; i < 16; i++) {
+        put(digits[buf[i] >> 4]);
+        put(digits[buf[i] & 0xf]);
+    }
+    put('\n');
+}
+
 #define TWO_DOUBLE(name, insn)                                                                \
     static double name(double a, double b) {                                                  \
         double r;                                                                             \
@@ -510,6 +565,8 @@ __attribute__((used)) void GUEST_ENTRY(void) {
 
     put_name("upper lanes");
     upper_lanes();
+
+    fcvt_same_register();
 
     GUEST_WRITE(1, out, out_n);
     GUEST_EXIT(0);

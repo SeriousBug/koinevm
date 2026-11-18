@@ -152,6 +152,9 @@ pub enum Insn {
     /// `scvtf d0, d0`: the integer in a scalar FP register, converted to a floating point value of
     /// the same width.
     FpFromInt { double: bool, unsigned: bool, rn: u32, rd: u32 },
+    /// `fcvtzu d0, d0`: the scalar in an FP register converted to an integer of its own width, left
+    /// in the same register, which is the form a cast that stays in the vector file takes.
+    FpToInt { double: bool, unsigned: bool, rn: u32, rd: u32 },
     /// Ordered and exclusive loads and stores. One thread, so an exclusive always succeeds.
     Atomic { is_load: bool, exclusive: bool, size: u32, rn: u32, rt: u32, rs: u32 },
     /// Compare and swap (`cas`/`casa`/`casl`): the loaded value goes back into Rs either way.
@@ -944,6 +947,18 @@ fn decode_scalar_fp(w: u32) -> Insn {
                 rd,
             };
         }
+    }
+
+    // The same group the other way round: an FP scalar converted to an integer of its own width, in
+    // the register it came from. Bit 23 is what tells this group from `*cvtf`, whose result is a
+    // float; the type, the rounding and the sign are the fields that vary.
+    if (w & 0xdfbffc00) == 0x5ea1b800 {
+        return Insn::FpToInt {
+            double: (w >> 22) & 1 == 1,
+            unsigned: (w >> 29) & 1 == 1,
+            rn,
+            rd,
+        };
     }
 
     // An integer in a scalar FP register converted to floating point. Bits 15:10 are 110110, where

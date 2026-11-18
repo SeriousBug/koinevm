@@ -1,5 +1,10 @@
 #!/bin/bash
 # Build the guest aarch64 Linux ELF and the native macOS oracle for it.
+#
+# The host's clang lays the mergeable string literals of a cross-compiled object out one byte short
+# now and then: a literal can lose its last character and take the previous one's terminator with
+# it. A fixture's expected output comes from the same source built for macOS, which does not have
+# the bug, so a new heading string is worth checking in the object before the diff is blamed.
 # OPT selects the optimisation level for both, so tests/run.sh can sweep them.
 set -euo pipefail
 cd "$(dirname "$0")/.."

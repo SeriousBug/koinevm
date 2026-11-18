@@ -4975,6 +4975,26 @@ impl<'a> RegionEmitter<'a> {
                 }
                 self.fp_put(rd, double);
             }
+            Insn::FpToInt { double, unsigned, rn, rd } => {
+                // The scalar becomes an integer in the same register, saturating at the ends of the
+                // range for a value out of it, which is what the instruction does with those and
+                // with a NaN.
+                self.fp_base();
+                self.fp_get(rn, double);
+                self.f.sat(if double {
+                    if unsigned {
+                        sat::I64_TRUNC_SAT_F64_U
+                    } else {
+                        sat::I64_TRUNC_SAT_F64_S
+                    }
+                } else if unsigned {
+                    sat::I32_TRUNC_SAT_F32_U
+                } else {
+                    sat::I32_TRUNC_SAT_F32_S
+                });
+                self.f.op(if double { F64_REINTERPRET_I64 } else { F32_REINTERPRET_I32 });
+                self.fp_put(rd, double);
+            }
             Insn::FpImm { size, imm8, rd } => {
                 if size > 1 {
                     return self.refuse(format!("half precision floating point at 0x{addr:x}"));
