@@ -14,6 +14,7 @@
 import fs from "node:fs";
 import { Kernel, ECHILD } from "./syscall.mjs";
 import { WOULD_BLOCK, ENOENT, EACCES } from "./files.mjs";
+import { Net } from "./net.mjs";
 import { Mach } from "./pages.mjs";
 
 const SHADOW = 0x0;
@@ -41,6 +42,9 @@ export class Session {
     this.processes = [];
     this.nextPid = 1;
     this.root = null;
+    /// The sockets of the session, shared by every process in it: a fork's descriptors point at
+    /// the same descriptions, and the host object behind one is the one the fork shares too.
+    this.net = new Net({ wake: () => this.poll() });
   }
 
   /// A process running an image from its entry point. Its first thread has the process's own id,
@@ -119,6 +123,7 @@ export class Session {
       pid: proc.pid,
       ppid: proc.ppid,
       files,
+      net: this.net,
       wake: () => this.poll(),
       futexWake: (addr, n) => this.futexWake(proc, addr, n),
     });
@@ -141,11 +146,25 @@ export class Session {
     for (;;) {
       if (this.root.state === "exited") return this.root.code;
       const pick = this.pick();
-      if (!pick) return this.stuck();
+      if (!pick) {
+        // Nothing can run, but a packet still can arrive: the host's event loop only turns while
+        // this waits, and a guest blocked on a socket would otherwise never be woken.
+        if (this.socketsWaiting()) {
+          await this.net.next();
+          this.poll();
+          continue;
+        }
+        return this.stuck();
+      }
       if (after && Date.now() - startedAt > after) return 4;
       const verdict = await this.step(pick.proc, pick.thread);
       if (verdict !== 0) return verdict;
     }
+  }
+
+  /// Whether any thread is parked on the network.
+  socketsWaiting() {
+    return this.processes.some((p) => p.threads.some((t) => t.state === "blocked" && t.waitingFor === "socket"));
   }
 
   /// The next thread to run, and the process it belongs to. Threads are what a scheduler picks:
@@ -236,6 +255,18 @@ export class Session {
         return this.wait(proc, thread, request);
       case "read":
         return this.read(proc, thread, request);
+      case "recv":
+        return this.recv(proc, thread, request);
+      case "send":
+        return this.send(proc, thread, request);
+      case "bind":
+        return this.bind(proc, thread, request);
+      case "connect":
+        return this.connect(proc, thread, request);
+      case "poll":
+        return this.pollWait(proc, thread, request);
+      case "select":
+        return this.selectWait(proc, thread, request);
       case "futex":
         return this.futex(proc, thread, request);
       default:
@@ -340,6 +371,71 @@ export class Session {
       );
     }
     return this.resume(proc, thread, tid);
+  }
+
+  /// A thread waiting for the host: it does not run again until something wakes it, and a request
+  /// with a deadline is looked at again then even if nothing arrived. The timer keeps the deadline
+  /// from depending on traffic: a `poll` on a socket nobody sends to still has to time out.
+  park(thread, request, deadline) {
+    this.block(thread, request.fd ?? 0, "socket");
+    thread.pending = request;
+    if (!deadline) return;
+    const timer = setTimeout(() => {
+      if (thread.pending === request) thread.state = "runnable";
+    }, Math.max(0, deadline - Date.now()));
+    timer.unref?.();
+  }
+
+  /// A receive there was nothing for: answer it from what has arrived since, or keep waiting.
+  recv(proc, thread, request) {
+    const answer = proc.kernel.recvInto(request.fd, request.buf, request.len, request.flags, request.addr, request.lenp);
+    if (answer && answer.host) {
+      this.park(thread, request, request.deadline);
+      return 0;
+    }
+    return this.resume(proc, thread, answer);
+  }
+
+  async send(proc, thread, request) {
+    const desc = proc.kernel.socketDesc(request.fd);
+    if (typeof desc === "number") return this.resume(proc, thread, desc);
+    const answer = await desc.send(request.data, request.to);
+    return this.resume(proc, thread, answer);
+  }
+
+  async bind(proc, thread, request) {
+    const desc = proc.kernel.socketDesc(request.fd);
+    if (typeof desc === "number") return this.resume(proc, thread, desc);
+    const answer = await desc.bind(request.addr);
+    return this.resume(proc, thread, answer);
+  }
+
+  async connect(proc, thread, request) {
+    const desc = proc.kernel.socketDesc(request.fd);
+    if (typeof desc === "number") return this.resume(proc, thread, desc);
+    const answer = await desc.connect(request.addr);
+    return this.resume(proc, thread, answer);
+  }
+
+  /// A `poll` that found nothing ready: ready now, out of time, or wait for the host.
+  pollWait(proc, thread, request) {
+    const ready = proc.kernel.pollOnce(request.fds, request.nfds);
+    if (ready > 0) return this.resume(proc, thread, ready);
+    if (request.deadline && Date.now() >= request.deadline) return this.resume(proc, thread, 0);
+    this.park(thread, request, request.deadline);
+    return 0;
+  }
+
+  selectWait(proc, thread, request) {
+    const k = proc.kernel;
+    const got = k.selectOnce(request.nfds, request.read, request.write, request.except);
+    if (got.ready > 0) {
+      k.putSelect(got.sets);
+      return this.resume(proc, thread, got.ready);
+    }
+    if (request.deadline && Date.now() >= request.deadline) return this.resume(proc, thread, 0);
+    this.park(thread, request, request.deadline);
+    return 0;
   }
 
   /// FUTEX_WAIT and FUTEX_WAKE, which is how one thread of a process waits for another.
@@ -458,10 +554,21 @@ export class Session {
     thread.blockedOn = on;
     thread.waitingFor = waitingFor;
     if (process.env.ARMJIT_TRACE_PROCESSES) {
-      const what =
-        waitingFor === "pipe" ? "a pipe" : waitingFor === "futex" ? `futex 0x${on.toString(16)}` : on <= 0 ? "any child" : on;
+      const what = this.reason(thread);
       console.error(`block: thread ${thread.tid} waits for ${what}`);
     }
+  }
+
+  /// What a blocked thread is waiting for, in words a report can print.
+  reason(thread) {
+    if (thread.waitingFor === "pipe") return "a pipe";
+    if (thread.waitingFor === "futex") return `futex 0x${thread.blockedOn.toString(16)}`;
+    if (thread.waitingFor === "socket") {
+      const kind = thread.pending?.kind;
+      if (kind === "poll" || kind === "select") return `a socket (${kind})`;
+      return `socket ${thread.pending?.fd ?? thread.blockedOn}`;
+    }
+    return thread.blockedOn <= 0 ? "any child" : thread.blockedOn;
   }
 
   /// A pipe read that had nothing in it: answer it now, or keep waiting.
@@ -477,12 +584,17 @@ export class Session {
     return this.resume(proc, thread, got.length);
   }
 
-  /// Something a thread may be waiting for happened, or a pipe has data in it.
+  /// Something a thread may be waiting for happened, or a pipe has data in it. A socket waiter is
+  /// woken by any event rather than the one it wants, because which of its descriptors is ready is
+  /// the answer's business: it looks again, and parks again if the answer is still "nothing".
   poll() {
     for (const proc of this.processes) {
       for (const thread of proc.threads) {
-        if (thread.state !== "blocked" || thread.waitingFor !== "pipe") continue;
-        if (proc.kernel.files.readReady(thread.pending.fd)) thread.state = "runnable";
+        if (thread.state !== "blocked") continue;
+        if (thread.waitingFor === "socket") thread.state = "runnable";
+        else if (thread.waitingFor === "pipe" && proc.kernel.files.readReady(thread.pending.fd)) {
+          thread.state = "runnable";
+        }
       }
     }
   }
@@ -567,9 +679,7 @@ export class Session {
     );
     console.error(`armjit: nothing left to run but ${blocked.length} blocked thread(s)`);
     for (const { p, t } of blocked) {
-      const what =
-        t.waitingFor === "pipe" ? "a pipe" : t.waitingFor === "futex" ? `futex 0x${t.blockedOn.toString(16)}` : t.blockedOn <= 0 ? "any child" : t.blockedOn;
-      console.error(`  pid ${p.pid} thread ${t.tid} waits for ${what}`);
+      console.error(`  pid ${p.pid} thread ${t.tid} waits for ${this.reason(t)}`);
     }
     return 1;
   }

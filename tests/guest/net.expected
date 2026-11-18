@@ -1,0 +1,32 @@
+ok   socket(AF_INET, SOCK_DGRAM) returns a descriptor
+ok   getsockopt(SO_TYPE) says SOCK_DGRAM
+ok   getsockname of an unbound socket succeeds
+ok   an unbound socket has no port and no address
+ok   bind to 127.0.0.1:0 succeeds
+ok   getsockname reports the port the host chose
+ok   getsockname reports the address it was bound to
+ok   a second socket has a descriptor of its own
+ok   sendto reaches the bound socket
+ok   a socket that has sent is bound to a port
+ok   recvfrom answers what was sent
+ok   recvfrom says which port it came from
+ok   recvfrom says which address it came from
+ok   F_SETFL sets O_NONBLOCK
+ok   F_GETFL reports O_NONBLOCK
+ok   a non-blocking recvfrom with nothing queued says EAGAIN
+ok   the echo server's port is the guest's argument
+ok   sendto reaches the host
+ok   a receive the host answers waits for it
+ok   ppoll times out with nothing ready
+ok   sendto before polling
+ok   ppoll reports a queued datagram
+ok   the datagram ppoll reported is the one recvfrom returns
+ok   socketpair(AF_UNIX, SOCK_STREAM) succeeds
+ok   the pair has two descriptors
+ok   a pair end is an unnamed AF_UNIX address
+ok   write on one end
+ok   read on the other end
+ok   a pair with nothing left has nothing to report
+ok   close of a socket
+ok   a closed socket is not a descriptor
+net: all checks passed

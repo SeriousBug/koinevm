@@ -7,6 +7,17 @@
 import fs from "node:fs";
 import { AddressSpace, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
 import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK } from "./files.mjs";
+import {
+  Net,
+  decodeSockaddr,
+  encodeSockaddr,
+  EAGAIN,
+  ENOTSOCK,
+  ENOTCONN,
+  EPROTONOSUPPORT,
+  EAFNOSUPPORT,
+  EDESTADDRREQ,
+} from "./net.mjs";
 
 export const ENOSYS = 38;
 export const EBADF = 9;
@@ -39,6 +50,9 @@ export class Kernel {
     this.pending = null;
     /// Called when something a process may be waiting for has happened.
     this.wake = options.wake ?? (() => {});
+    /// The sockets of the session. A fork shares them, because a socket description is shared by
+    /// every descriptor on it, the same way an open file is.
+    this.net = options.net ?? new Net({ wake: this.wake });
     /// Called to wake the threads asleep on a futex word; answers how many woke.
     this.futexWake = options.futexWake ?? (() => 0);
     this.register();
@@ -214,6 +228,7 @@ export class Kernel {
     this.on(214, (k, addr) => [BigInt(k.space.setBrk(k.addr(addr))), 0]);
 
     this.registerFiles();
+    this.registerSockets();
     this.registerStartup();
     this.registerProcess();
   }
@@ -423,7 +438,13 @@ export class Kernel {
           entry.cloexec = (Number(arg) & 1) !== 0;
           return [0n, 0];
         case 3: // F_GETFL
-          return [BigInt(entry.desc?.append ? 0x400 : 0), 0];
+          return [
+            BigInt((entry.kind === "socket" ? 0x2 : entry.desc?.append ? 0x400 : 0) | (entry.desc?.nonblock ? 0x800 : 0)),
+            0,
+          ];
+        case 4: // F_SETFL
+          if (entry.desc) entry.desc.nonblock = (Number(arg) & 0x800) !== 0;
+          return [0n, 0];
         // One process holds every lock it asks for, so a lock request succeeds and a query finds
         // nothing in the way. A query has to say so: `l_type` is `F_UNLCK`, or the caller reads
         // whatever it put there and reports that someone else holds the database.
@@ -442,6 +463,10 @@ export class Kernel {
     this.on(32, (k, fd) => (k.files.get(Number(fd)) ? [0n, 0] : k.fail(EBADF)));
 
     this.on(63, (k, fd, buf, count) => {
+      const entry = k.files.get(Number(fd));
+      if (entry && entry.kind === "socket") {
+        return k.done(k.recvInto(Number(fd), k.addr(buf), Number(count), 0, 0, 0));
+      }
       const n = Math.min(Number(count), 0x7ffff000);
       if (process.env.ARMJIT_TRACE_SYSCALLS)
         console.error(`  read fd=${Number(fd)} at 0x${BigInt.asUintN(64, buf).toString(16)} n=${n}`);
@@ -467,6 +492,10 @@ export class Kernel {
     this.on(64, (k, fd, buf, count) => {
       const bytes = k.read(buf, Math.min(Number(count), 0x7ffff000));
       if (bytes === null) return k.fail(EFAULT);
+      const entry = k.files.get(Number(fd));
+      if (entry && entry.kind === "socket") {
+        return k.ask({ kind: "send", fd: Number(fd), data: Buffer.from(bytes), to: null });
+      }
       const wrote = k.files.write(Number(fd), Buffer.from(bytes));
       if (wrote > 0) k.wake();
       return [BigInt(wrote), 0];
@@ -596,6 +625,274 @@ export class Kernel {
       if (req === 0x5401) return k.fail(ENOTTY); // TCGETS
       if (req === 0x5413) return k.fail(ENOTTY); // TIOCGWINSZ
       return [0n, 0];
+    });
+  }
+
+  // ---- sockets
+  //
+  // A socket is a descriptor in the file table, so everything that walks descriptors already sees
+  // it, and the operations are the ones the ABI names. What cannot finish here (a bind that has to
+  // reach the host, a receive with nothing queued) goes back through `ask`, and the host answers it
+  // by calling the same helper again.
+
+  /// The description behind a socket descriptor, or the negative errno the syscall answers with.
+  socketDesc(fd) {
+    const entry = this.files.get(fd);
+    if (!entry) return -EBADF;
+    if (entry.kind !== "socket") return -ENOTSOCK;
+    return entry.desc;
+  }
+
+  /// A helper's number is the syscall's answer; an ask is the host's, and goes back untouched.
+  done(value) {
+    return typeof value === "number" ? [BigInt(value), 0] : value;
+  }
+
+  /// A `struct sockaddr` the guest passed: `null` for an empty pointer, `undefined` for one that is
+  /// not readable, which the caller answers as EFAULT.
+  guestAddr(addr, len) {
+    if (this.addr(addr) === 0) return null;
+    const bytes = this.read(addr, Math.min(Math.max(Number(len), 0), 128));
+    if (bytes === null) return undefined;
+    return decodeSockaddr(bytes) ?? undefined;
+  }
+
+  /// Write an address back, and the length it really is: the caller's own limit bounds the copy,
+  /// and a buffer that is too small still learns how much there was.
+  putAddr(addr, lenp, value) {
+    const bytes = encodeSockaddr(value);
+    const at = this.addr(addr);
+    if (at !== 0) {
+      const limit =
+        this.addr(lenp) === 0 ? bytes.length : new DataView(this.memory.buffer).getInt32(this.addr(lenp), true);
+      if (limit < 0) return false;
+      if (!this.put(at, bytes.subarray(0, Math.min(limit, bytes.length)))) return false;
+    }
+    if (this.addr(lenp) !== 0) new DataView(this.memory.buffer).setInt32(this.addr(lenp), bytes.length, true);
+    return true;
+  }
+
+  /// A receive, and what `read` on a socket is: what is queued, or a thread parked until there is
+  /// something. The host calls it again when the thread wakes, so it takes guest addresses rather
+  /// than pointers into the buffer.
+  recvInto(fd, buf, len, flags, addr, lenp) {
+    const desc = this.socketDesc(fd);
+    if (typeof desc === "number") return desc;
+    const got = desc.recv(Math.min(Number(len), 0x7ffff000), (Number(flags) & 2) !== 0);
+    if (got === WOULD_BLOCK) {
+      if (desc.nonblock || (Number(flags) & 0x40) !== 0) return -EAGAIN;
+      return this.ask({
+        kind: "recv",
+        fd,
+        buf,
+        len: Number(len),
+        flags: Number(flags),
+        addr,
+        lenp,
+        deadline: desc.timeout ? Date.now() + desc.timeout : 0,
+      });
+    }
+    if (got.errno) return got.errno;
+    if (!this.put(buf, got.data)) return -EFAULT;
+    if (this.addr(addr) !== 0 && got.from && !this.putAddr(addr, lenp, got.from)) return -EFAULT;
+    return (Number(flags) & 0x20) !== 0 ? got.full : got.data.length;
+  }
+
+  /// Milliseconds from a `struct timespec` a call may time out on: -1 means wait for ever, which
+  /// is what a null pointer says, and null is a pointer that is not readable.
+  timespecMs(addr) {
+    if (this.addr(addr) === 0) return -1;
+    const at = this.addr(addr);
+    if (!this.inBounds(at, 16)) return null;
+    const view = new DataView(this.memory.buffer);
+    const sec = Number(view.getBigInt64(at, true));
+    const nsec = Number(view.getBigInt64(at + 8, true));
+    return Math.max(0, Math.ceil(sec * 1000 + nsec / 1e6));
+  }
+
+  /// Whether a descriptor would answer `poll` now, per direction.
+  pollState(entry) {
+    if (entry.kind === "socket") return entry.desc.status();
+    if (entry.kind === "pipe") {
+      const read = entry.end === "read" && (entry.desc.data.length > 0 || entry.desc.writers === 0);
+      return { read, write: entry.end === "write", err: false, hup: read && entry.desc.writers === 0 };
+    }
+    // A file, a device or a directory: the host never makes one wait.
+    return { read: true, write: entry.kind !== "dir" && entry.desc?.writable !== false, err: false, hup: false };
+  }
+
+  /// One non-blocking pass of `poll` over the guest's own array of `struct pollfd`.
+  pollOnce(fds, nfds) {
+    const view = new DataView(this.memory.buffer);
+    let ready = 0;
+    for (let i = 0; i < nfds; i++) {
+      const at = fds + i * 8;
+      const fd = view.getInt32(at, true);
+      const events = view.getUint16(at + 4, true);
+      let revents = 0;
+      if (fd < 0) {
+        view.setUint16(at + 6, 0, true);
+        continue;
+      }
+      const entry = this.files.get(fd);
+      if (!entry) revents = 0x20; // POLLNVAL
+      else {
+        const state = this.pollState(entry);
+        if (state.read && (events & 0x41)) revents |= events & 0x41;
+        if (state.write && (events & 0x04)) revents |= 0x04;
+        if (state.err) revents |= 0x08;
+        if (state.hup) revents |= 0x10;
+      }
+      view.setUint16(at + 6, revents, true);
+      if (revents) ready++;
+    }
+    return ready;
+  }
+
+  /// One non-blocking pass of `select`, from the three bitmaps the guest passed: the sets are read
+  /// as they are, so a pass that finds nothing leaves the call's arguments untouched.
+  selectOnce(nfds, readp, writep, exceptp) {
+    const size = Math.ceil(nfds / 8);
+    const sets = [
+      { kind: "read", at: readp, in: readp ? this.read(readp, size) : null },
+      { kind: "write", at: writep, in: writep ? this.read(writep, size) : null },
+      { kind: "except", at: exceptp, in: exceptp ? this.read(exceptp, size) : null },
+    ].map((set) => ({ ...set, out: set.at ? Buffer.alloc(size) : null }));
+    let ready = 0;
+    for (let fd = 0; fd < nfds; fd++) {
+      for (const set of sets) {
+        if (!set.in || !(set.in[fd >> 3] & (1 << (fd & 7)))) continue;
+        const entry = this.files.get(fd);
+        const state = entry ? this.pollState(entry) : null;
+        const on = !state ? true : set.kind === "read" ? state.read : set.kind === "write" ? state.write : state.err;
+        if (!on) continue;
+        set.out[fd >> 3] |= 1 << (fd & 7);
+        ready++;
+      }
+    }
+    return { ready, sets };
+  }
+
+  putSelect(sets) {
+    for (const set of sets) if (set.at) this.put(set.at, set.out);
+  }
+
+  registerSockets() {
+    this.on(198, (k, domain, type, protocol) => {
+      const desc = k.net.create(Number(domain), Number(type) & 0xf, Number(protocol));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      // SOCK_NONBLOCK and SOCK_CLOEXEC share their bits with O_NONBLOCK and O_CLOEXEC.
+      desc.nonblock = (Number(type) & 0x800) !== 0;
+      const entry = { kind: "socket", desc, cloexec: (Number(type) & 0x80000) !== 0 };
+      return [BigInt(k.files.add(entry)), 0];
+    });
+
+    this.on(199, (k, domain, type, protocol, sv) => {
+      const pair = k.net.pair(Number(domain), Number(type) & 0xf);
+      if (typeof pair === "number") return [BigInt(pair), 0];
+      const nonblock = (Number(type) & 0x800) !== 0;
+      const cloexec = (Number(type) & 0x80000) !== 0;
+      const fds = pair.map((desc) => {
+        desc.nonblock = nonblock;
+        return k.files.add({ kind: "socket", desc, cloexec });
+      });
+      if (!k.put32(sv, fds[0]) || !k.put32(k.addr(sv) + 4, fds[1])) return k.fail(EFAULT);
+      return [0n, 0];
+    });
+
+    this.on(200, (k, fd, addr, len) => {
+      const desc = k.socketDesc(Number(fd));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      const want = k.guestAddr(addr, len);
+      if (want === undefined) return k.fail(EFAULT);
+      if (want === null) return k.fail(EINVAL);
+      return k.ask({ kind: "bind", fd: Number(fd), addr: want });
+    });
+
+    this.on(203, (k, fd, addr, len) => {
+      const desc = k.socketDesc(Number(fd));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      const want = k.guestAddr(addr, len);
+      if (want === undefined) return k.fail(EFAULT);
+      if (want === null) return k.fail(EINVAL);
+      return k.ask({ kind: "connect", fd: Number(fd), addr: want });
+    });
+
+    this.on(204, (k, fd, addr, lenp) => {
+      const desc = k.socketDesc(Number(fd));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      if (!k.putAddr(addr, lenp, desc.address())) return k.fail(EFAULT);
+      return [0n, 0];
+    });
+
+    this.on(205, (k, fd, addr, lenp) => {
+      const desc = k.socketDesc(Number(fd));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      if (!desc.peer) return k.fail(ENOTCONN);
+      if (!k.putAddr(addr, lenp, desc.peer)) return k.fail(EFAULT);
+      return [0n, 0];
+    });
+
+    this.on(206, (k, fd, buf, len, flags, addr, addrlen) => {
+      const desc = k.socketDesc(Number(fd));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      const to = k.guestAddr(addr, addrlen);
+      if (to === undefined) return k.fail(EFAULT);
+      const bytes = k.read(buf, Math.min(Number(len), 0x7ffff000));
+      if (bytes === null) return k.fail(EFAULT);
+      return k.ask({ kind: "send", fd: Number(fd), data: Buffer.from(bytes), to });
+    });
+
+    this.on(207, (k, fd, buf, len, flags, addr, lenp) =>
+      k.done(k.recvInto(Number(fd), k.addr(buf), Number(len), Number(flags), k.addr(addr), k.addr(lenp))),
+    );
+
+    this.on(208, (k, fd, level, name, val, len) => {
+      const desc = k.socketDesc(Number(fd));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      const n = Math.min(Number(len), 128);
+      const bytes = n > 0 ? k.read(val, n) : Buffer.alloc(0);
+      if (bytes === null) return k.fail(EFAULT);
+      return [BigInt(desc.option(Number(level), Number(name), bytes)), 0];
+    });
+
+    this.on(209, (k, fd, level, name, val, lenp) => {
+      const desc = k.socketDesc(Number(fd));
+      if (typeof desc === "number") return [BigInt(desc), 0];
+      const answer = desc.get(Number(level), Number(name));
+      if (answer === null) return [0n, 0];
+      if (!k.put32(val, answer)) return k.fail(EFAULT);
+      if (Number(lenp) !== 0) k.put32(lenp, 4);
+      return [0n, 0];
+    });
+
+    // ppoll. aarch64 has no plain `poll`: glibc spells it with this one, timeout and all.
+    this.on(73, (k, fds, nfds, tmo) => {
+      const n = Number(nfds);
+      const at = k.addr(fds);
+      if (n < 0 || n > 4096 || !k.inBounds(at, n * 8)) return k.fail(EINVAL);
+      const timeout = k.timespecMs(tmo);
+      if (timeout === null) return k.fail(EINVAL);
+      const ready = k.pollOnce(at, n);
+      if (ready > 0) return [BigInt(ready), 0];
+      if (timeout === 0) return [0n, 0];
+      return k.ask({ kind: "poll", fds: at, nfds: n, deadline: timeout < 0 ? 0 : Date.now() + timeout });
+    });
+
+    // pselect6, which is what glibc's `select` asks for.
+    this.on(72, (k, nfds, readp, writep, exceptp, tmo) => {
+      const n = Number(nfds);
+      if (n < 0 || n > 4096) return k.fail(EINVAL);
+      const timeout = k.timespecMs(k.addr(tmo));
+      if (timeout === null) return k.fail(EINVAL);
+      const sets = { read: k.addr(readp), write: k.addr(writep), except: k.addr(exceptp) };
+      const got = k.selectOnce(n, sets.read, sets.write, sets.except);
+      if (got.ready > 0) {
+        k.putSelect(got.sets);
+        return [BigInt(got.ready), 0];
+      }
+      if (timeout === 0) return [0n, 0];
+      return k.ask({ kind: "select", ...sets, nfds: n, deadline: timeout < 0 ? 0 : Date.now() + timeout });
     });
   }
 

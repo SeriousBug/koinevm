@@ -133,6 +133,9 @@ export class Files {
       else entry.desc.writers++;
       this.note(`dup ${entry.end} end`, entry.desc);
     }
+    // A socket description is the host socket: the last descriptor on it closes it, and a fork
+    // shares it the way it shares an open file.
+    if (entry.kind === "socket") entry.desc.refs++;
     return copy;
   }
 
@@ -233,6 +236,7 @@ export class Files {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     this.map.delete(fd);
+    if (entry.kind === "socket") entry.desc.release();
     if (entry.kind === "pipe") {
       if (entry.end === "read") entry.desc.readers--;
       else entry.desc.writers--;
@@ -433,6 +437,9 @@ export class Files {
     if (entry.kind === "pipe") {
       // A pipe is a FIFO of no size, and a program that stats one has to see that.
       return { mode: 0o010600n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
+    }
+    if (entry.kind === "socket") {
+      return { mode: 0o140777n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
     }
     if (entry.kind === "dir") {
       return { mode: 0o040755n, nlink: 2n, size: BigInt(entry.size ?? 0), ino: BigInt(fd + 1), dev: 0n, rdev: 0n };

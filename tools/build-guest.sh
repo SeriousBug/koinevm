@@ -55,6 +55,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
     -c tests/guest/mem.c -o tests/guest/mem.o
 python3 tools/minilink.py tests/guest/mem.o tests/guest/mem.elf _start
 
+echo "== guest: net (socket/bind/getsockname/sendto/recvfrom/ppoll/socketpair) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
+    -c tests/guest/net.c -o tests/guest/net.o
+python3 tools/minilink.py tests/guest/net.o tests/guest/net.elf _start
+
 echo "== guest: files (openat/read/pread/stat/readlinkat) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_COMMON -fno-pic -nostdlib \
     -c tests/guest/files.c -o tests/guest/files.o
