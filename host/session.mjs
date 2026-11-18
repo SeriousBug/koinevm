@@ -562,7 +562,11 @@ export class Session {
     files.keepAcrossExec();
     proc.module = new WebAssembly.Module(Buffer.from(answer.wasm, "hex"));
     proc.meta = meta;
+    // The ids are the process's, not the address space's: a program that dropped privileges stays
+    // dropped when it execs.
+    const ids = proc.kernel.ids;
     this.instantiate(proc, files);
+    proc.kernel.ids = ids;
     // An exec leaves one thread behind: the one that called it, with the others gone with the
     // address space they were in.
     proc.threads.forEach((t) => {
@@ -613,7 +617,7 @@ export class Session {
 
   /// What a blocked thread is waiting for, in words a report can print.
   reason(thread) {
-    if (thread.waitingFor === "pipe") return "a pipe";
+    if (thread.waitingFor === "pipe") return `a pipe (fd ${thread.pending?.fd ?? "?"})`;
     if (thread.waitingFor === "futex") return `futex 0x${thread.blockedOn.toString(16)}`;
     if (thread.waitingFor === "socket") {
       const kind = thread.pending?.kind;

@@ -296,7 +296,10 @@ export class Files {
     if (entry.kind === "pipe") {
       if (entry.end !== "read") return -EBADF;
       const desc = entry.desc;
-      if (!desc.data.length) return desc.writers === 0 ? Buffer.alloc(0) : WOULD_BLOCK;
+      if (!desc.data.length) {
+        this.note(`read fd ${fd} on pipe ${desc.id} with nothing (r=${desc.readers} w=${desc.writers})`, desc);
+        return desc.writers === 0 ? Buffer.alloc(0) : WOULD_BLOCK;
+      }
       const out = desc.data.subarray(0, len);
       desc.data = desc.data.subarray(out.length);
       return Buffer.from(out);
@@ -393,6 +396,7 @@ export class Files {
       const desc = entry.desc;
       if (desc.readers === 0) return -EPIPE;
       desc.data = desc.data.length ? Buffer.concat([desc.data, data]) : Buffer.from(data);
+      this.note(`write ${data.length} into pipe ${desc.id} (r=${desc.readers} w=${desc.writers})`, desc);
       if (process.env.ARMJIT_TRACE_PIPES) {
         const head = Buffer.from(data.subarray(0, 16)).toString("latin1");
         console.error(`  pipe ${desc.id}: +${data.length} bytes ${JSON.stringify(head)}`);

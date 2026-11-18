@@ -44,6 +44,10 @@ export class Kernel {
     /// `exit` ends one thread and `exit_group` ends them all, so the host has to know which.
     this.exitedGroup = false;
     this.missing = new Set();
+    /// The ids this process runs as. There is one user in the tree and no permission is checked,
+    /// but a program that drops privileges has to see the drop when it looks, which is what makes
+    /// a package manager's own sandbox work rather than argue with it.
+    this.ids = { uid: 0, euid: 0, gid: 0, egid: 0, groups: [0] };
     this.table = new Map();
     this.random = 0;
     // What a syscall that cannot finish inside the guest's wasm call leaves for the host: the run
@@ -149,7 +153,7 @@ export class Kernel {
       const args = [a0, a1, a2, a3, a4, a5]
         .map((v) => "0x" + BigInt.asUintN(64, v).toString(16))
         .join(", ");
-      console.error(`syscall ${Number(nr)}(${args})`);
+      console.error(`syscall ${Number(nr)}(${args}) pid ${this.pid}`);
     }
     const fn = this.table.get(Number(nr));
     if (!fn) {
@@ -248,6 +252,7 @@ export class Kernel {
       nextFd: this.files.next,
       cwd: this.files.cwd,
       random: this.random,
+      ids: { ...this.ids, groups: [...this.ids.groups] },
     };
   }
 
@@ -259,6 +264,7 @@ export class Kernel {
     this.files.next = state.nextFd;
     this.files.cwd = state.cwd;
     this.random = state.random;
+    this.ids = state.ids;
   }
 
   registerProcess() {
@@ -1124,10 +1130,105 @@ export class Kernel {
     this.on(99, () => [0n, 0]); // set_robust_list
     this.on(172, () => [1n, 0]); // getpid
     this.on(173, () => [0n, 0]); // getppid
-    this.on(174, () => [0n, 0]); // getuid
-    this.on(175, () => [0n, 0]); // geteuid
-    this.on(176, () => [0n, 0]); // getgid
-    this.on(177, () => [0n, 0]); // getegid
+    // One user, and it is root. The setters succeed because there is nobody to change to, which is
+    // what a program that drops privileges before it talks to the network expects to hear; the
+    // getters answer the one id everything in this tree belongs to.
+    // The setters move the process to the ids they are given. Nothing is checked against them, so a
+    // program that drops privileges before it talks to the network gets what it asked for and sees
+    // it in the getters.
+    const id = (v) => (v === -1n || v === 0xffffffffn ? null : Number(v));
+    this.on(146, (k, uid) => { // setuid
+      const u = Number(uid);
+      k.ids = { ...k.ids, uid: u, euid: u };
+      return [0n, 0];
+    });
+    this.on(144, (k, gid) => { // setgid
+      const g = Number(gid);
+      k.ids = { ...k.ids, gid: g, egid: g };
+      return [0n, 0];
+    });
+    this.on(145, (k, ruid, euid) => { // setreuid
+      const ids = { ...k.ids };
+      if (id(ruid) !== null) ids.uid = id(ruid);
+      if (id(euid) !== null) ids.euid = id(euid);
+      k.ids = ids;
+      return [0n, 0];
+    });
+    this.on(143, (k, rgid, egid) => { // setregid
+      const ids = { ...k.ids };
+      if (id(rgid) !== null) ids.gid = id(rgid);
+      if (id(egid) !== null) ids.egid = id(egid);
+      k.ids = ids;
+      return [0n, 0];
+    });
+    this.on(147, (k, ruid, euid, suid) => { // setresuid
+      const ids = { ...k.ids };
+      if (id(ruid) !== null) ids.uid = id(ruid);
+      if (id(euid) !== null) ids.euid = id(euid);
+      if (id(suid) !== null) ids.uid = id(suid);
+      k.ids = ids;
+      return [0n, 0];
+    });
+    this.on(149, (k, rgid, egid, sgid) => { // setresgid
+      const ids = { ...k.ids };
+      if (id(rgid) !== null) ids.gid = id(rgid);
+      if (id(egid) !== null) ids.egid = id(egid);
+      if (id(sgid) !== null) ids.gid = id(sgid);
+      k.ids = ids;
+      return [0n, 0];
+    });
+    this.on(151, (k, uid) => { // setfsuid: the file system id, which is the effective one here
+      k.ids = { ...k.ids, fsuid: Number(uid) };
+      return [0n, 0];
+    });
+    this.on(152, (k, gid) => {
+      k.ids = { ...k.ids, fsgid: Number(gid) };
+      return [0n, 0];
+    });
+    this.on(148, (k, ruid, euid, suid) => {
+      // getresuid: three ids, and a null pointer is a caller that does not want that one.
+      if (Number(ruid) !== 0) k.put32(ruid, k.ids.uid);
+      if (Number(euid) !== 0) k.put32(euid, k.ids.euid);
+      if (Number(suid) !== 0) k.put32(suid, k.ids.uid);
+      return [0n, 0];
+    });
+    this.on(150, (k, rgid, egid, sgid) => {
+      if (Number(rgid) !== 0) k.put32(rgid, k.ids.gid);
+      if (Number(egid) !== 0) k.put32(egid, k.ids.egid);
+      if (Number(sgid) !== 0) k.put32(sgid, k.ids.gid);
+      return [0n, 0];
+    });
+    // getgroups: the groups the process is in, and a zero-sized list is a question about how many.
+    this.on(158, (k, size, list) => {
+      const n = Number(size);
+      if (n === 0) return [BigInt(k.ids.groups.length), 0];
+      if (n < 0) return k.fail(EINVAL);
+      const take = Math.min(n, k.ids.groups.length);
+      const at = k.addr(list);
+      for (let i = 0; i < take; i++) k.put32(at + i * 4, k.ids.groups[i]);
+      return [BigInt(take), 0];
+    });
+    this.on(159, (k, size, list) => { // setgroups
+      const n = Number(size);
+      if (n < 0 || n > 65536) return k.fail(EINVAL);
+      const groups = [];
+      for (let i = 0; i < n; i++) {
+        const gid = new DataView(k.memory.buffer).getUint32(k.addr(list) + i * 4, true);
+        groups.push(gid);
+      }
+      k.ids = { ...k.ids, groups };
+      return [0n, 0];
+    });
+    this.on(154, () => [0n, 0]); // setpgid
+    this.on(155, (k, pid) => [pid === 0n ? BigInt(k.pid) : pid, 0]); // getpgid
+    this.on(156, (k, pid) => [pid === 0n ? BigInt(k.pid) : pid, 0]); // getsid
+    this.on(157, (k) => [BigInt(k.pid), 0]); // setsid: the process is its own session
+    this.on(167, () => [0n, 0]); // prctl: nothing here to control
+
+    this.on(174, (k) => [BigInt(k.ids.uid), 0]); // getuid
+    this.on(175, (k) => [BigInt(k.ids.euid), 0]); // geteuid
+    this.on(176, (k) => [BigInt(k.ids.gid), 0]); // getgid
+    this.on(177, (k) => [BigInt(k.ids.egid), 0]); // getegid
     this.on(178, () => [1n, 0]); // gettid
 
     this.on(160, (k, buf) => {
