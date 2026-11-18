@@ -21,6 +21,7 @@ export const ENOSPC = 28;
 export const EPIPE = 32;
 export const EEXIST = 17;
 export const EPERM = 1;
+export const EAGAIN = 11;
 export const ENOTEMPTY = 39;
 export const EXDEV = 18;
 export const ENOSYS = 38;
@@ -56,6 +57,8 @@ const O_CLOEXEC = 0x80000;
 export class Files {
   constructor(rootfs, options = {}) {
     this.rootfs = rootfs ? path.resolve(rootfs) : null;
+    /// Whose table this is, so a trace of it names the process the descriptor belongs to.
+    this.pid = options.pid ?? 0;
     /// Files this kernel has that the tree does not. A rootfs unpacked by `apt` has an empty
     /// `/etc/resolv.conf`, and a program that resolves a name still needs one to read.
     this.virtual = options.virtual ?? new Map();
@@ -129,7 +132,7 @@ export class Files {
   note(text, desc) {
     if (!process.env.ARMJIT_TRACE_FDS) return;
     const ends = desc && desc.readers !== undefined ? ` r=${desc.readers} w=${desc.writers}` : "";
-    console.error(`fds: ${text}${ends}`);
+    console.error(`fds: ${this.pid}: ${text}${ends}`);
   }
 
   /// A pipe: one description with a byte buffer, and one descriptor on each end.
@@ -301,7 +304,11 @@ export class Files {
       const desc = entry.desc;
       if (!desc.data.length) {
         this.note(`read fd ${fd} on pipe ${desc.id} with nothing (r=${desc.readers} w=${desc.writers})`, desc);
-        return desc.writers === 0 ? Buffer.alloc(0) : WOULD_BLOCK;
+        if (desc.writers === 0) return Buffer.alloc(0);
+        // A non-blocking pipe answers the guest's own question rather than parking its thread:
+        // `apt` sets O_NONBLOCK on the pipes to its methods and then reads them in a loop that
+        // expects EAGAIN.
+        return desc.nonblock ? -EAGAIN : WOULD_BLOCK;
       }
       const out = desc.data.subarray(0, len);
       desc.data = desc.data.subarray(out.length);

@@ -49,7 +49,9 @@ export class Kernel {
     this.pid = options.pid ?? 1;
     this.ppid = options.ppid ?? 0;
     this.space = new AddressSpace(memory, meta);
-    this.files = options.files ?? new Files(options.rootfs, { virtual: options.resolver?.files(options.rootfs) });
+    this.files =
+      options.files ??
+      new Files(options.rootfs, { virtual: options.resolver?.files(options.rootfs), pid: this.pid });
     this.exited = null;
     /// `exit` ends one thread and `exit_group` ends them all, so the host has to know which.
     this.exitedGroup = false;

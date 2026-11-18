@@ -395,6 +395,9 @@ export class Session {
           ` sp=0x${from.getBigUint64(0xf8, true).toString(16)}`,
       );
     }
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(`fork: ${parent.pid} keeps ${this.describeFds(parent)}`);
+    }
     const verdict = this.resume(parent, parentThread, child.pid);
     // vfork suspends the parent until the child execs or exits, and the child runs on the stack the
     // parent is using, so it must not get a turn while it is still inside the fork.
@@ -697,6 +700,18 @@ export class Session {
     return thread.blockedOn <= 0 ? "any child" : thread.blockedOn;
   }
 
+  /// What a process's descriptor table holds, for a report.
+  describeFds(proc) {
+    return [...proc.kernel.files.map]
+      .sort((a, b) => a[0] - b[0])
+      .map(([fd, entry]) => {
+        if (entry.kind === "pipe") return `${fd}=pipe${entry.desc.id}${entry.end === "read" ? "r" : "w"}`;
+        if (entry.kind === "socket") return `${fd}=socket${entry.desc.id ?? ""}`;
+        return `${fd}=${entry.kind}`;
+      })
+      .join(" ");
+  }
+
   /// A pipe read that had nothing in it: answer it now, or keep waiting.
   read(proc, thread, request) {
     const got = proc.kernel.files.read(request.fd, request.len);
@@ -821,14 +836,7 @@ export class Session {
     // whose two ends are not where the program thinks.
     for (const proc of this.processes) {
       if (proc.state === "exited") continue;
-      const fds = [...proc.kernel.files.map]
-        .sort((a, b) => a[0] - b[0])
-        .map(([fd, entry]) => {
-          if (entry.kind === "pipe") return `${fd}=pipe${entry.desc.id}${entry.end === "read" ? "r" : "w"}`;
-          if (entry.kind === "socket") return `${fd}=socket${entry.desc.id ?? ""}`;
-          return `${fd}=${entry.kind}`;
-        });
-      console.error(`  pid ${proc.pid} fds ${fds.join(" ")}`);
+      console.error(`  pid ${proc.pid} fds ${this.describeFds(proc)}`);
     }
     return 1;
   }
