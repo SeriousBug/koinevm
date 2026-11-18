@@ -1868,6 +1868,20 @@ impl<'a> RegionEmitter<'a> {
 
     // ---- value plumbing
 
+    /// One operand of `extr`, as a 64-bit value of the instruction's width: register 31 is the
+    /// zero register, not the stack pointer that a bare local read would give.
+    fn extr_operand(&mut self, r: u32, sf: bool) {
+        if r == 31 {
+            self.f.i64c(0);
+            return;
+        }
+        self.f.lg(r);
+        if !sf {
+            self.f.i64c(0xffff_ffff);
+            self.f.op(I64_AND);
+        }
+    }
+
     fn get(&mut self, r: u32, sf: bool) {
         if r == 31 {
             if sf {
@@ -3242,20 +3256,14 @@ impl<'a> RegionEmitter<'a> {
                 // top of `rn`, which is why the same register twice is a rotate by immediate. Both
                 // operands are narrowed to the instruction's width first, because a 32-bit value
                 // shifted up into the high half of the register would lose exactly the bits the
-                // rotate is supposed to bring back.
-                self.f.lg(rm);
-                if !sf {
-                    self.f.i64c(0xffff_ffff);
-                    self.f.op(I64_AND);
-                }
+                // rotate is supposed to bring back. Register 31 is the zero register here, so it
+                // reads as zero: `extr x, xzr, x, #63` is how OpenSSL's montgomery square brings a
+                // carry bit in.
+                self.extr_operand(rm, sf);
                 if lsb != 0 {
                     self.f.i64c(lsb as i64);
                     self.f.op(I64_SHR_U);
-                    self.f.lg(rn);
-                    if !sf {
-                        self.f.i64c(0xffff_ffff);
-                        self.f.op(I64_AND);
-                    }
+                    self.extr_operand(rn, sf);
                     self.f.i64c((w - lsb) as i64);
                     self.f.op(I64_SHL);
                     self.f.op(I64_OR);

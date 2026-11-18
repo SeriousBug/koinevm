@@ -1564,6 +1564,34 @@ export class Kernel {
       return [0n, 0];
     });
 
+    /// The nanoseconds a clock says it is now, on the epochs the clock handler above reports.
+    const clockNow = (id) =>
+      id === 0 || id === 5 ? BigInt(Date.now()) * 1_000_000n : BigInt(Math.round(performance.now() * 1e6));
+
+    // nanosleep and clock_nanosleep: a program that waits for a device to settle, or retries with a
+    // backoff, sleeps here. There is one runnable thread, so nothing runs while it waits and the
+    // host's timer is the whole of it.
+    const sleep = (k, at, absolute, clock) => {
+      if (k.addr(at) === 0 || !k.inBounds(k.addr(at), 16)) return k.fail(EFAULT);
+      const view = new DataView(k.memory.buffer);
+      const asked = view.getBigInt64(k.addr(at), true) * 1_000_000_000n + view.getBigInt64(k.addr(at) + 8, true);
+      const remaining = absolute ? asked - clockNow(Number(clock) & 7) : asked;
+      if (remaining <= 0n) return [0n, 0];
+      const ms = Number(remaining / 1_000_000n) + (remaining % 1_000_000n > 0n ? 1 : 0);
+      return k.ask({ kind: "sleep", deadline: Date.now() + ms });
+    };
+
+    this.on(101, (k, req, rem) => sleep(k, req, false, 0));
+
+    // clock_nanosleep: the same wait against a clock the guest names, and in the form that takes an
+    // absolute time where the other takes an interval. Nothing interrupts it, so the timespec it
+    // would answer with is never written.
+    this.on(115, (k, clock, flags, req, rem) => {
+      const absolute = Number(flags) === 1; // TIMER_ABSTIME
+      if (!absolute && Number(flags) !== 0) return k.fail(EINVAL);
+      return sleep(k, req, absolute, clock);
+    });
+
     // gettimeofday: what libc's clock falls back to when there is no vdso to call, which is the one
     // libgcrypt checks before it seeds anything, and it stops the program when the answer is an
     // error.

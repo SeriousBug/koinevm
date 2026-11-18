@@ -160,8 +160,8 @@ export class Session {
       if (!pick) {
         // Nothing can run, but a packet still can arrive: the host's event loop only turns while
         // this waits, and a guest blocked on a socket would otherwise never be woken.
-        if (this.socketsWaiting()) {
-          await this.net.next();
+        if (this.waiting()) {
+          await this.net.next(this.idleWait());
           this.poll();
           continue;
         }
@@ -173,9 +173,25 @@ export class Session {
     }
   }
 
-  /// Whether any thread is parked on the network.
-  socketsWaiting() {
-    return this.processes.some((p) => p.threads.some((t) => t.state === "blocked" && t.waitingFor === "socket"));
+  /// Whether any thread is parked on something the host has to wait for: a packet that may arrive,
+  /// or a deadline a timer will pass.
+  waiting() {
+    return this.processes.some((p) =>
+      p.threads.some((t) => t.state === "blocked" && (t.waitingFor === "socket" || t.waitingFor === "sleep")),
+    );
+  }
+
+  /// How long the host may wait with nothing to run: until the nearest deadline a thread is parked
+  /// on, and no longer than a tick, which is what gives traffic a chance to arrive.
+  idleWait() {
+    let wait = 200;
+    for (const proc of this.processes) {
+      for (const thread of proc.threads) {
+        const deadline = thread.state === "blocked" ? thread.pending?.deadline : 0;
+        if (deadline) wait = Math.min(wait, Math.max(0, deadline - Date.now()));
+      }
+    }
+    return wait;
   }
 
   /// The next thread to run, and the process it belongs to. Threads are what a scheduler picks:
@@ -288,6 +304,8 @@ export class Session {
         return this.selectWait(proc, thread, request);
       case "futex":
         return this.futex(proc, thread, request);
+      case "sleep":
+        return this.sleepFor(proc, thread, request);
       default:
         console.error(`armjit: pid ${proc.pid} asked for an unknown host action ${request.kind}`);
         return 1;
@@ -444,8 +462,8 @@ export class Session {
   /// A thread waiting for the host: it does not run again until something wakes it, and a request
   /// with a deadline is looked at again then even if nothing arrived. The timer keeps the deadline
   /// from depending on traffic: a `poll` on a socket nobody sends to still has to time out.
-  park(thread, request, deadline) {
-    this.block(thread, request.fd ?? 0, "socket");
+  park(thread, request, deadline, waitingFor = "socket") {
+    this.block(thread, request.fd ?? 0, waitingFor);
     thread.pending = request;
     if (!deadline) return;
     const timer = setTimeout(() => {
@@ -556,6 +574,14 @@ export class Session {
     }
     if (request.deadline && Date.now() >= request.deadline) return this.resume(proc, thread, 0);
     this.park(thread, request, request.deadline);
+    return 0;
+  }
+
+  /// `nanosleep`: the deadline is the whole of the wait, and success is already the answer by the
+  /// time the timer that parks the thread has fired.
+  sleepFor(proc, thread, request) {
+    if (!request.deadline || Date.now() >= request.deadline) return this.resume(proc, thread, 0);
+    this.park(thread, request, request.deadline, "sleep");
     return 0;
   }
 
@@ -746,6 +772,7 @@ export class Session {
     if (thread.waitingFor === "pipe") return `a pipe (fd ${thread.pending?.fd ?? "?"})`;
     if (thread.waitingFor === "futex") return `futex 0x${thread.blockedOn.toString(16)}`;
     if (thread.waitingFor === "epoll") return `an epoll (fd ${thread.blockedOn})`;
+    if (thread.waitingFor === "sleep") return `a sleep (${thread.pending?.deadline ?? 0})`;
     if (thread.waitingFor === "socket") {
       const kind = thread.pending?.kind;
       if (kind === "poll" || kind === "select") return `a socket (${kind})`;

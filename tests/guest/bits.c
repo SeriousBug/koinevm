@@ -97,6 +97,13 @@ static const unsigned long pat[] = {
     X(ror_x_63, "ror x #63", "ror %0, %1, #63")                                                \
     X(extr_w_5, "extr w #5 of two", "lsl %w0, %w1, #3\n extr %w0, %w1, %w0, #5")           \
     X(extr_x_9, "extr x #9 of two", "lsl %0, %1, #3\n extr %0, %1, %0, #9")                \
+    /* The form OpenSSL's montgomery square uses to shift a carry into the top bit: register 31 is
+     * the zero register on both sides of `extr`. */                                            \
+    X(extr_xzr_right, "extr x #63 into xzr", "extr %0, xzr, %1, #63")                          \
+    X(extr_x_xzr, "extr x #63 from xzr", "extr %0, %1, xzr, #63")                              \
+    X(extr_wzr_right, "extr w #31 into wzr", "extr %w0, wzr, %w1, #31")                         \
+    X(extr_w_wzr, "extr w #31 from wzr", "extr %w0, %w1, wzr, #31")                             \
+    X(extr_x_0, "extr x #0", "extr %0, %1, xzr, #0")                                            \
     /* The high half of a product, which bignum code is built from: `mul` alone answers the low. */ \
     X(umulh_self, "umulh x", "umulh %0, %1, %1")                                                \
     X(smulh_self, "smulh x", "smulh %0, %1, %1")                                                \

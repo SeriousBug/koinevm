@@ -569,7 +569,14 @@ export class Files {
       return { mode: 0o100600n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
     }
     if (entry.kind === "dir") {
-      return { mode: 0o040755n, nlink: 2n, size: BigInt(entry.size ?? 0), ino: BigInt(fd + 1), dev: 0n, rdev: 0n };
+      // A directory answers for itself rather than for an inode of its own making: a program that
+      // opens one compares this stat with the stat of the name it came from, and `shutil.rmtree`
+      // treats a directory whose two disagree as a symbolic link.
+      try {
+        return fs.statSync(entry.host, { bigint: true });
+      } catch (e) {
+        return { mode: 0o040755n, nlink: 2n, size: BigInt(entry.size ?? 0), ino: BigInt(fd + 1), dev: 0n, rdev: 0n };
+      }
     }
     if (entry.virtual) {
       return { mode: 0o100644n, nlink: 1n, size: BigInt(entry.virtual.length), ino: BigInt(fd + 1), dev: 0n, rdev: 0n };
