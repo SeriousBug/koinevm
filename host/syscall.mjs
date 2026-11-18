@@ -1415,10 +1415,31 @@ export class Kernel {
     });
 
     this.on(113, (k, clock, ts) => {
-      // A clock that starts at a fixed point and advances with real time, so runs are comparable.
-      const ns = 1_700_000_000_000_000_000n + BigInt(Math.round(performance.now() * 1e6));
+      // The guest has no vdso, so this is the only clock it has, and it has to be the host's own:
+      // a signature and a certificate are judged against it. The monotonic clocks count from a
+      // fixed point instead, because a program that measures an interval wants an interval.
+      const id = Number(clock) & 7;
+      const ns = id === 0 || id === 5 ? BigInt(Date.now()) * 1_000_000n : BigInt(Math.round(performance.now() * 1e6));
       if (!k.put64(ts, ns / 1_000_000_000n) || !k.put64(ts + 8n, ns % 1_000_000_000n)) {
         return k.fail(EFAULT);
+      }
+      return [0n, 0];
+    });
+
+    // gettimeofday: what libc's clock falls back to when there is no vdso to call, which is the one
+    // libgcrypt checks before it seeds anything, and it stops the program when the answer is an
+    // error.
+    this.on(169, (k, tv, tz) => {
+      const now = Date.now();
+      if (k.addr(tv) !== 0) {
+        if (!k.put64(tv, BigInt(Math.floor(now / 1000))) || !k.put64(tv + 8n, BigInt((now % 1000) * 1000))) {
+          return k.fail(EFAULT);
+        }
+      }
+      if (k.addr(tz) !== 0) {
+        // The zone is in minutes west of UTC followed by a daylight flag, and this kernel keeps no
+        // zone of its own: a guest that reads it sees UTC.
+        if (!k.put(tz, Buffer.alloc(8))) return k.fail(EFAULT);
       }
       return [0n, 0];
     });
