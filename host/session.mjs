@@ -13,7 +13,7 @@
 
 import fs from "node:fs";
 import { Kernel, ECHILD, EBADF, EFAULT, ESRCH } from "./syscall.mjs";
-import { WOULD_BLOCK, ENOENT, EACCES } from "./files.mjs";
+import { WOULD_BLOCK, ENOENT, EACCES, ELOOP } from "./files.mjs";
 import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
 import { Mach } from "./pages.mjs";
@@ -598,30 +598,84 @@ export class Session {
     }
   }
 
+  /// The interpreter a script names on its first line, and the one argument that line may carry.
+  /// Linux stops at the newline, trims the whitespace around the name, and keeps the rest of the
+  /// line whole rather than splitting it.
+  shebang(host) {
+    let head;
+    try {
+      const fd = fs.openSync(host, "r");
+      try {
+        const buf = Buffer.alloc(256);
+        head = buf.subarray(0, fs.readSync(fd, buf, 0, buf.length, 0));
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return null;
+    }
+    if (head.length < 2 || head[0] !== 0x23 || head[1] !== 0x21) return null;
+    const nl = head.indexOf(0x0a);
+    const line = head.subarray(2, nl === -1 ? head.length : nl).toString("latin1");
+    const space = (c) => c === " " || c === "\t";
+    let i = 0;
+    while (i < line.length && space(line[i])) i++;
+    let j = i;
+    while (j < line.length && !space(line[j])) j++;
+    const interp = line.slice(i, j);
+    if (!interp) return null;
+    let a = j;
+    while (a < line.length && space(line[a])) a++;
+    return { interp, arg: a < line.length ? line.slice(a) : null };
+  }
+
   async exec(proc, thread, request) {
     const path = request.path.toString("latin1");
-    const host = proc.kernel.files.resolve(path);
-    if (typeof host === "number") return this.resume(proc, thread, host);
-    let answer;
-    try {
-      const st = fs.statSync(host);
-      // A directory and a file without the execute bit are both EACCES, and a path that is not
-      // there is ENOENT: `execvp` walks PATH on ENOENT and EACCES, and runs the file through a
-      // shell on ENOEXEC, so answering the wrong one turns a missing program into a shell script.
-      if (!st.isFile()) return this.resume(proc, thread, -EACCES);
-      fs.accessSync(host, fs.constants.X_OK);
-    } catch (e) {
-      if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${path}: ${e.code}`);
-      return this.resume(proc, thread, -(e.code === "ENOENT" ? ENOENT : EACCES));
+    let program = path;
+    let argv = request.argv;
+    let host = null;
+    // A script's first line names the interpreter that runs it, so an exec of one runs that
+    // instead, with the script's own path as the interpreter's first argument. `apt` starts
+    // `apt-key` and `dpkg-preconfigure` this way, and they are shell scripts. Linux follows four
+    // of these before it gives up on a loop.
+    for (let depth = 0; host === null; depth++) {
+      const at = proc.kernel.files.resolve(program);
+      if (typeof at === "number") return this.resume(proc, thread, at);
+      try {
+        const st = fs.statSync(at);
+        // A directory and a file without the execute bit are both EACCES, and a path that is not
+        // there is ENOENT: `execvp` walks PATH on ENOENT and EACCES, and runs the file through a
+        // shell on ENOEXEC, so answering the wrong one turns a missing program into a shell script.
+        if (!st.isFile()) return this.resume(proc, thread, -EACCES);
+        fs.accessSync(at, fs.constants.X_OK);
+      } catch (e) {
+        if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${program}: ${e.code}`);
+        return this.resume(proc, thread, -(e.code === "ENOENT" ? ENOENT : EACCES));
+      }
+      const script = this.shebang(at);
+      if (!script) {
+        host = at;
+        break;
+      }
+      if (depth === 4) return this.resume(proc, thread, -ELOOP);
+      argv = [
+        Buffer.from(script.interp),
+        ...(script.arg === null ? [] : [Buffer.from(script.arg)]),
+        Buffer.from(program),
+        ...argv.slice(1),
+      ];
+      program = script.interp;
     }
-    try {
-      answer = await this.translator.image(host, request.argv, request.envp);
-    } catch (e) {
-      if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${path}: ${e.message}`);
-      return this.resume(proc, thread, -ENOEXEC);
-    }
+    const answer = await (async () => {
+      try {
+        return await this.translator.image(host, argv, request.envp);
+      } catch (e) {
+        if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${program}: ${e.message}`);
+        return { ok: false, error: e.message };
+      }
+    })();
     if (!answer.ok) {
-      console.error(`armjit: cannot run ${path}: ${answer.error}`);
+      console.error(`armjit: cannot run ${program}: ${answer.error}`);
       return this.resume(proc, thread, -ENOEXEC);
     }
     const meta = answer.meta;
@@ -651,7 +705,7 @@ export class Session {
     thread.regs.fill(0);
     thread.vecs.fill(0);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
-      console.error(`exec: ${proc.pid} ${path} at 0x${meta.entry.toString(16)}`);
+      console.error(`exec: ${proc.pid} ${argv.map((a) => a.toString()).join(" ")} at 0x${meta.entry.toString(16)}`);
       for (const [fd, entry] of [...files.map].sort((a, b) => a[0] - b[0])) {
         const what = entry.kind === "pipe" ? `pipe ${entry.desc.id} ${entry.end}` : entry.host ?? entry.kind;
         console.error(`  pid ${proc.pid} fd ${fd} -> ${what}`);
