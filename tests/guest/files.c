@@ -19,6 +19,7 @@ static inline long sc6(long nr, long a, long b, long c, long d, long e, long f) 
 #define AT_FDCWD (-100)
 #define O_RDONLY 0
 #define O_WRONLY 1
+#define O_RDWR 2
 #define O_CREAT 0x40
 #define O_TRUNC 0x200
 
@@ -154,6 +155,20 @@ __attribute__((used)) void _start(void) {
 
     // ".." normalizes inside the root instead of escaping it, so a path that climbs out is a miss.
     check(openat_("/../outside", O_RDONLY, 0) == -2, "dotdot stays inside the root", 0);
+
+    // A temporary file is made by unlinking it straight after opening it, and the bytes stay in the
+    // file the descriptor holds: a path can go away, an open file cannot.
+    long temp = openat_("/temp.txt", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    check(temp >= 3, "openat for a temporary file", (unsigned long)temp);
+    check(sc6(35, AT_FDCWD, (long)"/temp.txt", 0, 0, 0, 0) == 0, "unlink a file that is open", 0);
+    check(openat_("/temp.txt", O_RDONLY, 0) == -2, "an unlinked name is gone", 0);
+    check(write_(temp, "gone but here\n", 14) == 14, "write to an unlinked file", 0);
+    check(lseek_(temp, 0, 0) == 0, "lseek an unlinked file", 0);
+    n = read_(temp, buf, sizeof(buf));
+    check(n == 14 && bytes_equal(buf, "gone but here\n", 14), "read back an unlinked file",
+          (unsigned long)n);
+    check(fstat_(temp, statbuf) == 0, "fstat an unlinked file", 0);
+    check(close_(temp) == 0, "close an unlinked file", 0);
 
     put(failures ? "files: FAILURES\n" : "files: all checks passed\n");
     guest_exit(failures ? 1 : 0);

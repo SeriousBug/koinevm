@@ -155,6 +155,7 @@ export class Files {
     // A socket description is the host socket: the last descriptor on it closes it, and a fork
     // shares it the way it shares an open file.
     if (entry.kind === "socket") entry.desc.refs++;
+    if (entry.kind === "file") entry.desc.refs++;
     return copy;
   }
 
@@ -239,6 +240,10 @@ export class Files {
           append: (flags & O_APPEND) !== 0,
           readable: access !== O_WRONLY,
           writable: access !== 0,
+          /// How many descriptors hold this open file description, and the host's own descriptor
+          /// once something has read or written through it.
+          refs: 1,
+          handle: null,
         },
         cloexec: (flags & O_CLOEXEC) !== 0,
       };
@@ -257,6 +262,13 @@ export class Files {
       }
       if ((flags & O_TRUNC) && entry.desc.writable) fs.writeFileSync(host, Buffer.alloc(0));
       entry.size = st.size;
+      // The host's descriptor is opened here rather than on the first read, because the first read
+      // can come after the guest has unlinked the name: that is how a program makes a temporary
+      // file, and the bytes it then writes belong to the file it opened.
+      entry.desc.handle = fs.openSync(
+        host,
+        entry.desc.readable && entry.desc.writable ? O_RDWR : entry.desc.writable ? O_WRONLY : 0,
+      );
       return this.add(entry);
     } catch (e) {
       return fromErrno(e, -ENOENT);
@@ -276,19 +288,35 @@ export class Files {
       else entry.desc.writers--;
       this.note(`close fd ${fd} ${entry.end} end`, entry.desc);
     }
+    if (entry.kind === "file" && entry.desc && --entry.desc.refs <= 0) this.closeHandle(entry.desc);
     return 0;
+  }
+
+  closeHandle(desc) {
+    if (desc.handle === null) return;
+    try {
+      fs.closeSync(desc.handle);
+    } catch {}
+    desc.handle = null;
+  }
+
+  /// The host's own descriptor for an open file, opened the first time something needs it and kept
+  /// until the last guest descriptor on it is closed. A program that makes a temporary file unlinks
+  /// it and keeps reading and writing through the descriptor it opened, and the bytes have to stay
+  /// reachable: a path goes away, an open file does not.
+  handleOf(entry) {
+    const desc = entry.desc;
+    if (desc.handle !== null) return desc.handle;
+    const flags = desc.readable && desc.writable ? O_RDWR : desc.writable ? O_WRONLY : 0;
+    desc.handle = fs.openSync(entry.host, flags);
+    return desc.handle;
   }
 
   bytes(entry, off, len) {
     if (entry.virtual) return entry.virtual.subarray(off, off + len);
     const buf = Buffer.alloc(len);
-    const fd = fs.openSync(entry.host, "r");
-    try {
-      const n = fs.readSync(fd, buf, 0, len, off);
-      return buf.subarray(0, n);
-    } finally {
-      fs.closeSync(fd);
-    }
+    const n = fs.readSync(this.handleOf(entry), buf, 0, len, off);
+    return buf.subarray(0, n);
   }
 
   read(fd, len) {
@@ -417,13 +445,9 @@ export class Files {
     if (entry.kind === "zero") return data.length;
     if (entry.kind === "full") return -ENOSPC;
     if (!entry.desc.writable) return -EBADF;
-    const at = entry.desc.append ? Number(fs.statSync(entry.host).size) : entry.desc.pos;
-    const handle = fs.openSync(entry.host, "r+");
-    try {
-      fs.writeSync(handle, data, 0, data.length, at);
-    } finally {
-      fs.closeSync(handle);
-    }
+    const handle = this.handleOf(entry);
+    const at = entry.desc.append ? Number(fs.fstatSync(handle).size) : entry.desc.pos;
+    fs.writeSync(handle, data, 0, data.length, at);
     entry.desc.pos = at + data.length;
     entry.size = Math.max(entry.size ?? 0, entry.desc.pos);
     return data.length;
@@ -499,6 +523,8 @@ export class Files {
       return { mode: 0o100644n, nlink: 1n, size: BigInt(entry.virtual.length), ino: BigInt(fd + 1), dev: 0n, rdev: 0n };
     }
     try {
+      // A file that is open answers for the file it opened, which is what survives an unlink.
+      if (entry.desc && entry.desc.handle !== null) return fs.fstatSync(entry.desc.handle, { bigint: true });
       return fs.statSync(entry.host, { bigint: true });
     } catch (e) {
       return fromErrno(e, -ENOENT);
@@ -669,7 +695,8 @@ export class Files {
     if (!entry) return -EBADF;
     if (entry.kind !== "file") return -EINVAL;
     try {
-      fs.truncateSync(entry.host, len);
+      if (entry.desc && entry.desc.handle !== null) fs.ftruncateSync(entry.desc.handle, len);
+      else fs.truncateSync(entry.host, len);
       if (entry.desc && entry.desc.pos > len) entry.desc.pos = len;
       return 0;
     } catch (e) {
