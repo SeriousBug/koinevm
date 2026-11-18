@@ -66,7 +66,7 @@ export class Kernel {
     /// a package manager's own sandbox work rather than argue with it.
     this.ids = { uid: 0, euid: 0, gid: 0, egid: 0, groups: [0] };
     this.table = new Map();
-    this.random = 0;
+    this.random = 0n;
     // What a syscall that cannot finish inside the guest's wasm call leaves for the host: the run
     // returns, this is served, and the process is resumed with x0 as the answer.
     this.pending = null;
@@ -1474,12 +1474,14 @@ export class Kernel {
     });
 
     this.on(278, (k, buf, len) => {
-      // Deterministic, not random: the same run twice has to produce the same bytes.
+      // Deterministic, not random: the same run twice has to produce the same bytes. The state is
+      // 64 bits wide and held as one, because the product of the step does not fit in a double and
+      // a name built from a zeroed generator is a name that is always taken.
       const n = Number(len);
       const bytes = Buffer.alloc(n);
       for (let i = 0; i < n; i++) {
-        k.random = (k.random * 6364136223846793005 + 1442695040888963407) % 2 ** 32;
-        bytes[i] = k.random & 0xff;
+        k.random = (k.random * 6364136223846793005n + 1442695040888963407n) & 0xffffffffffffffffn;
+        bytes[i] = Number((k.random >> 33n) & 0xffn);
       }
       if (!k.put(buf, bytes)) return k.fail(EFAULT);
       return [BigInt(n), 0];

@@ -65,6 +65,8 @@ export class Files {
     this.map = new Map();
     this.next = 3;
     this.seed = 1;
+    /// The bytes `/dev/urandom` and `getrandom` hand out: one stream, so a run twice is a run twice.
+    this.random = 1n;
     this.cwd = "/";
     this.umask = 0o022;
     this.map.set(0, { kind: "stdin" });
@@ -216,10 +218,12 @@ export class Files {
 
   /// Bytes from a generator that starts from a fixed point, so a run reproduces.
   randomBytes(len) {
+    // Deterministic, and 64 bits wide: the step's product does not fit in a double, and the low
+    // bytes of a rounded one are always zero.
     const out = Buffer.alloc(len);
     for (let i = 0; i < len; i++) {
-      this.seed = (this.seed * 6364136223846793005 + 1442695040888963407) % 2 ** 32;
-      out[i] = this.seed & 0xff;
+      this.random = (this.random * 6364136223846793005n + 1442695040888963407n) & 0xffffffffffffffffn;
+      out[i] = Number((this.random >> 33n) & 0xffn);
     }
     return out;
   }
