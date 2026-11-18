@@ -768,11 +768,23 @@ export class Kernel {
         if (!k.put32(arg, waiting || 0)) return k.fail(EFAULT);
         return [0n, 0];
       }
+      // FIONBIO asks for what F_SETFL sets, so a program that never falls back to `fcntl` still
+      // gets its non-blocking descriptor.
+      if (req === 0x5421) {
+        const entry = k.files.get(Number(fd));
+        if (!entry?.desc) return k.fail(ENOTTY);
+        entry.desc.nonblock = (k.u32(arg) & 1) !== 0;
+        return [0n, 0];
+      }
       // There is no console, so the streams are pipes and `isatty` has to say so: a program that
       // believes it has a terminal formats for one, and its output stops matching a real run.
       if (req === 0x5401) return k.fail(ENOTTY); // TCGETS
       if (req === 0x5413) return k.fail(ENOTTY); // TIOCGWINSZ
-      return [0n, 0];
+      // An ioctl nobody here implements has to fail. Answering zero tells the caller the request
+      // worked, and `cp` reads that as `FICLONE` having copied the file: it closes both descriptors
+      // and the destination stays empty. Real kernels answer ENOTTY for anything they do not know,
+      // and callers are written to fall back from it.
+      return k.fail(ENOTTY);
     });
   }
 
