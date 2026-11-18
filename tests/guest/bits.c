@@ -99,7 +99,14 @@ static const unsigned long pat[] = {
     X(extr_x_9, "extr x #9 of two", "lsl %0, %1, #3\n extr %0, %1, %0, #9")                \
     /* The high half of a product, which bignum code is built from: `mul` alone answers the low. */ \
     X(umulh_self, "umulh x", "umulh %0, %1, %1")                                                \
-    X(smulh_self, "smulh x", "smulh %0, %1, %1")
+    X(smulh_self, "smulh x", "smulh %0, %1, %1")                                                \
+    /* The carry forms, which is how bignum code adds a limb: the first instruction makes the
+     * carry and the second one spends it, so a second operand that is stored instead of the sum
+     * shows up as the wrong limb rather than as a wrong flag. */                                 \
+    X(adcs_after_adds, "adcs after adds", "adds %0, %1, %1\n adcs %0, %0, %1")                   \
+    X(sbcs_after_subs, "sbcs after subs", "subs %0, %1, %1\n sbcs %0, %1, %0")                   \
+    X(adcs_w, "adcs w", "adds %w0, %w1, %w1\n adcs %w0, %w0, %w1")                               \
+    X(sbcs_w, "sbcs w", "subs %w0, %w1, %w1\n sbcs %w0, %w1, %w0")
 
 #define DEF(name, tag, body)                                                                  \
     __attribute__((noinline)) static unsigned long b_##name(unsigned long v) {                \

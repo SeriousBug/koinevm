@@ -3420,10 +3420,11 @@ impl<'a> RegionEmitter<'a> {
                 self.f.op(I32_OR);
                 self.f.op(I64_EXTEND_I32_U);
                 self.f.ls(L_T3); // carry out
+                // The result moves to T0, where the store reads it whatever the flags wanted: the
+                // formulas take T1 and T2 for the two operands, and T2 is where the result was.
+                self.f.lg(L_T2);
+                self.f.ls(L_T0);
                 if setflags {
-                    // T0 = res, T1 = a, T2 = b for the flag formulas
-                    self.f.lg(L_T2);
-                    self.f.ls(L_T0);
                     self.f.lg(L_T4);
                     self.f.ls(L_T2);
                     self.flags_addsub(sf, sub);
@@ -3438,7 +3439,7 @@ impl<'a> RegionEmitter<'a> {
                     self.f.ls(32);
                 }
                 if rd != 31 {
-                    self.f.lg(L_T2);
+                    self.f.lg(L_T0);
                     self.mask_w(sf);
                     self.f.ls(rd);
                 }
