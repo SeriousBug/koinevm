@@ -1,0 +1,47 @@
+# Processes, threads and signals
+
+A process is one WebAssembly instance: its own linear memory, page table and descriptor table. A
+thread is a coroutine inside that instance, with its own registers and stack, and the scheduler runs
+whichever thread asks the host for nothing. Neither can be preempted: a process gives up the CPU at
+a syscall, which is enough for a fork, a pipe and a wait, and is not enough for a busy loop to be
+interrupted by anything but its own syscalls.
+
+`fork` copies the memory and the state beside it; `execve` builds a new instance of a newly
+translated image and keeps the descriptor table and the ids. `wait4` answers the pid and a status
+word in the shape the ABI defines: an exit code in bits 8-15, or the signal in the low seven bits
+when a signal is what ended the process.
+
+## The ids
+
+There is one user and one group in the tree, and nothing checks a permission against them. The ids
+are still per process, because programs look: a package manager's download method drops to `_apt`
+before it talks to the network, then reads the ids back and refuses to continue if they still say
+root. The setters move them, the getters report them, `fork` copies them, and `exec` keeps them.
+
+## Signals
+
+`kill`, `tkill` and `tgkill` are implemented, and what a signal does is what its *target* asked for:
+
+- a signal number of zero asks whether a process is there, and answers `ESRCH` if it is not. A
+  process that has ended but has not been reaped is still there, and the signal is discarded.
+- a disposition of *ignore* is nothing at all.
+- a disposition of *catch* is recorded and not run. Entering a guest handler is not something this
+  kernel can do: it has no way to make the guest's code run on the signal's behalf, so a caught
+  signal stops at the disposition rather than ending a process that asked to survive it. A program
+  that waits for a signal to interrupt a blocking call would wait for ever.
+- the default action of a terminating signal ends the process, and its parent's `wait4` reports that
+  signal. `SIGKILL` and `SIGSTOP` have no disposition: asking about one succeeds and setting one is
+  `EINVAL`, as on Linux.
+- `SIGCHLD`, `SIGURG` and `SIGWINCH` do nothing, and so do the stop signals: a coroutine cannot be
+  stopped where it stands, so `SIGSTOP`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU` are accepted and have no
+  effect.
+
+Signals are not queued or blocked, `rt_sigprocmask` reads as an empty set, and a signal sent while
+one is already pending is coalesced. A `SIGPIPE` is not raised when a guest writes to a pipe nobody
+reads: the write answers `EPIPE` instead, which is what a program that had ignored `SIGPIPE` would
+see.
+
+## What is not modelled
+
+Process groups and sessions (a `kill` with a negative pid reaches every process but the caller), job
+control, `ptrace`, and the rusage a `wait4` caller can ask for, which is zeroed.

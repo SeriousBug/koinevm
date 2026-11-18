@@ -12,7 +12,7 @@
 // the child can run, and a deadlock is reported as one instead of hanging.
 
 import fs from "node:fs";
-import { Kernel, ECHILD, EBADF, EFAULT } from "./syscall.mjs";
+import { Kernel, ECHILD, EBADF, EFAULT, ESRCH } from "./syscall.mjs";
 import { WOULD_BLOCK, ENOENT, EACCES } from "./files.mjs";
 import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
@@ -34,6 +34,11 @@ const CLONE_CHILD_CLEARTID = 0x00200000;
 const CLONE_CHILD_SETTID = 0x01000000;
 const WNOHANG = 1;
 const ENOEXEC = 8;
+
+/// The signals whose default action is to end the process. The rest either do nothing - SIGCHLD,
+/// SIGURG, SIGWINCH - or stop it, which a coroutine has no way to be.
+const FATAL = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 13, 14, 15, 16, 24, 25, 26, 31]);
+for (let sig = 32; sig <= 64; sig++) FATAL.add(sig);
 
 export class Session {
   constructor({ translator, rootfs, makeImports }) {
@@ -129,6 +134,7 @@ export class Session {
       files,
       net: this.net,
       resolver: this.resolver,
+      signal: (request) => this.signal(request),
       wake: () => this.poll(),
       futexWake: (addr, n) => this.futexWake(proc, addr, n),
     });
@@ -284,6 +290,52 @@ export class Session {
         console.error(`armjit: pid ${proc.pid} asked for an unknown host action ${request.kind}`);
         return 1;
     }
+  }
+
+  /// A signal from one process to another. There is no handler to run, so what a signal does is
+  /// what its default action says: a disposition that ignores it does nothing, a caught one is
+  /// recorded and not run, and a default action that terminates ends the process and leaves its
+  /// parent a wait status that says so.
+  signal({ from, pid, sig, tid }) {
+    const targets = [];
+    if (tid) {
+      for (const proc of this.processes) {
+        const thread = proc.threads.find((t) => t.tid === tid);
+        if (thread) targets.push({ proc, thread });
+      }
+    } else if (pid > 0) {
+      const proc = this.processes.find((p) => p.pid === pid);
+      if (proc) targets.push({ proc, thread: null });
+    } else if (pid === 0) {
+      const proc = this.processes.find((p) => p.pid === from);
+      if (proc) targets.push({ proc, thread: null });
+    } else if (pid === -1) {
+      // Every process there is, which is the whole of one user's session.
+      for (const proc of this.processes) if (proc.pid !== from) targets.push({ proc, thread: null });
+    }
+    // A process that has ended but not been reaped is still there to a signal: it answers and the
+    // signal is thrown away, which is what a zombie does.
+    const live = targets.filter(({ proc }) => proc.state !== "exited" || !proc.reaped);
+    if (live.length === 0) return -ESRCH;
+    if (sig === 0) return 0;
+    for (const { proc, thread } of live) {
+      if (proc.state === "exited") continue;
+      // The disposition is the target's, and SIGKILL and SIGSTOP have none to consult.
+      const how = sig === 9 || sig === 19 ? "default" : (proc.kernel.signals.get(sig) ?? "default");
+      if (how === "ignore") continue;
+      if (how === "catch") {
+        // The handler is guest code, and entering it is not something this kernel can do. The signal
+        // stops here rather than ending a process that asked to survive it.
+        if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`signal: ${sig} to ${proc.pid} caught, not run`);
+        continue;
+      }
+      if (!FATAL.has(sig)) continue;
+      if (thread) this.exitThread(proc, thread, 0, sig);
+      else this.exit(proc, 0, sig);
+      // The caller may have just ended itself, and then there is no answer to give it.
+      if (proc.pid === from) proc.kernel.exited = 0;
+    }
+    return 0;
   }
 
   /// x0 is the syscall's answer and the guest continues after the `svc`. The address to continue at
@@ -565,8 +617,11 @@ export class Session {
     // The ids are the process's, not the address space's: a program that dropped privileges stays
     // dropped when it execs.
     const ids = proc.kernel.ids;
+    // A caught signal is back to its default after an exec, and an ignored one stays ignored.
+    const ignored = new Map([...proc.kernel.signals].filter(([, how]) => how === "ignore"));
     this.instantiate(proc, files);
     proc.kernel.ids = ids;
+    proc.kernel.signals = ignored;
     // An exec leaves one thread behind: the one that called it, with the others gone with the
     // address space they were in.
     proc.threads.forEach((t) => {
@@ -685,7 +740,12 @@ export class Session {
   /// The wait status a real kernel would give, and the rusage a program that asks for one reads.
   reap(parent, child, request) {
     const view = new DataView(parent.memory.buffer);
-    if (request.wstatus) view.setInt32(request.wstatus, (child.code & 0xff) << 8, true);
+    // A process that a signal ended reports the signal, not an exit code: the low seven bits are the
+    // one a `WIFSIGNALED` reader looks at.
+    if (request.wstatus) {
+      const status = child.signal ? child.signal & 0x7f : (child.code & 0xff) << 8;
+      view.setInt32(request.wstatus, status, true);
+    }
     if (request.rusage) new Uint8Array(parent.memory.buffer).fill(0, request.rusage, request.rusage + 144);
     child.reaped = true;
     if (process.env.ARMJIT_TRACE_PROCESSES) {
@@ -698,9 +758,10 @@ export class Session {
 
   /// A thread that ended: the process goes with the last one, and `CLONE_CHILD_CLEARTID` is how a
   /// joining thread learns that it did.
-  exitThread(proc, thread, code) {
+  exitThread(proc, thread, code, signal = 0) {
     thread.state = "exited";
     thread.code = code & 0xff;
+    thread.signal = signal;
     if (thread.clearTid) {
       new DataView(proc.memory.buffer).setUint32(thread.clearTid, 0, true);
       this.futexWake(proc, thread.clearTid, -1);
@@ -711,17 +772,21 @@ export class Session {
       );
     }
     const live = proc.threads.filter((t) => t.state !== "exited");
-    if (live.length === 0) return this.exit(proc, code);
+    if (live.length === 0) return this.exit(proc, code, signal);
     thread.pending = null;
     return 0;
   }
 
-  exit(proc, code) {
+  exit(proc, code, signal = 0) {
+    if (proc.state === "exited") return 0;
     proc.state = "exited";
     proc.code = code & 0xff;
+    proc.signal = signal & 0x7f;
     for (const t of proc.threads) t.state = "exited";
     proc.kernel.files.closeAll();
-    if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exit: ${proc.pid} status ${proc.code}`);
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(`exit: ${proc.pid} ${proc.signal ? `signal ${proc.signal}` : `status ${proc.code}`}`);
+    }
     // A parent that was waiting for this one has something to see now, and a pipe this process
     // held the last writer of has reached its end.
     this.wake(proc);

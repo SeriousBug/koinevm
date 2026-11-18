@@ -1,0 +1,29 @@
+ok   a signal of zero to itself asks and answers
+ok   and the same through the thread id
+ok   and through the thread group
+ok   a process that is not there is ESRCH
+ok   SIGKILL can be asked about
+ok   and has no disposition to set
+ok   pipes to order the two processes
+ok   fork
+ok   fork
+ok   the child says it is up
+ok   SIGTERM to the child
+ok   its parent reaps it
+ok   the status says a signal ended it
+ok   fork
+ok   fork
+ok   the child installs its disposition and is up
+ok   SIGTERM to the child that ignores it
+ok   the ignored signal left it there
+ok   the parent lets it go on
+ok   it ran to its own exit status
+ok   fork
+ok   fork
+ok   the child is up
+ok   SIGKILL to a child that ignores SIGTERM
+ok   a zombie is there to a signal
+ok   SIGKILL ends it whatever it asked for
+ok   the pipes close
+ok   both of them
+signals: all checks passed

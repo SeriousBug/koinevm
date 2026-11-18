@@ -21,6 +21,7 @@ import {
 } from "./net.mjs";
 
 export const ENOSYS = 38;
+export const ESRCH = 3;
 export const EBADF = 9;
 export const ENOTTY = 25;
 export const ECHILD = 10;
@@ -55,6 +56,12 @@ export class Kernel {
     this.pending = null;
     /// Called when something a process may be waiting for has happened.
     this.wake = options.wake ?? (() => {});
+    /// Signal dispositions this process installed: `catch` or `ignore`, and nothing at all for the
+    /// default. A caught signal is recorded and not run, because there is nowhere to run it.
+    this.signals = new Map();
+    /// Called to deliver a signal to a process or a thread of the session, which is the host's job
+    /// because the target may not be this process. Answers 0 or a negative errno.
+    this.signal = options.signal ?? (() => -ESRCH);
     /// The sockets of the session. A fork shares them, because a socket description is shared by
     /// every descriptor on it, the same way an open file is.
     this.net = options.net ?? new Net({ wake: this.wake });
@@ -253,6 +260,7 @@ export class Kernel {
       cwd: this.files.cwd,
       random: this.random,
       ids: { ...this.ids, groups: [...this.ids.groups] },
+      signals: new Map(this.signals),
     };
   }
 
@@ -265,6 +273,7 @@ export class Kernel {
     this.files.cwd = state.cwd;
     this.random = state.random;
     this.ids = state.ids;
+    this.signals = state.signals;
   }
 
   registerProcess() {
@@ -649,6 +658,14 @@ export class Kernel {
   // it, and the operations are the ones the ABI names. What cannot finish here (a bind that has to
   // reach the host, a receive with nothing queued) goes back through `ask`, and the host answers it
   // by calling the same helper again.
+
+  /// A signal from this process to another, or to one of its own threads. A signal of zero asks
+  /// whether the target is there and does nothing else.
+  kill(pid, sig, tid = 0) {
+    if (sig < 0 || sig > 64) return -EINVAL;
+    // What the signal does is the *target's* business, so the disposition is the host's to look up.
+    return this.signal({ from: this.pid, pid, sig, tid });
+  }
 
   /// The description behind a socket descriptor, or the negative errno the syscall answers with.
   socketDesc(fd) {
@@ -1294,7 +1311,38 @@ export class Kernel {
       return [BigInt(n), 0];
     });
 
-    this.on(134, () => [0n, 0]); // rt_sigaction: recorded nowhere yet
+    // A signal number of zero asks whether a process is there, and a disposition of its own decides
+    // what the rest do: an ignored signal is nothing, and a caught one is recorded here and never
+    // run, because a handler is guest code this kernel has no way to enter.
+    // A signal to the calling process itself is the way a program kills itself, so a call that ends
+    // the caller has to end the wasm run too rather than answer and carry on.
+    const stopped = (k, answer) => [BigInt(answer), k.exited !== null ? 1 : 0];
+    this.on(129, (k, pid, sig) => stopped(k, k.kill(Number(BigInt.asIntN(32, pid)), Number(sig)))); // kill
+    this.on(130, (k, tid, sig) => stopped(k, k.kill(0, Number(sig), Number(BigInt.asIntN(32, tid))))); // tkill
+    this.on(131, (k, tgid, tid, sig) =>
+      // tgkill: the thread id names the target, and the group is a check Linux makes that this
+      // kernel has nothing to check it against.
+      stopped(k, k.kill(0, Number(sig), Number(BigInt.asIntN(32, tid)))),
+    );
+
+    this.on(134, (k, sig, act, old) => {
+      const n = Number(sig);
+      if (n < 1 || n > 64) return k.fail(EINVAL);
+      // SIGKILL and SIGSTOP have no disposition to set: asking about one is fine, and setting one
+      // is EINVAL.
+      if ((n === 9 || n === 19) && Number(act) !== 0) return k.fail(EINVAL);
+      if (Number(old) !== 0) {
+        // `struct sigaction` is the handler, the flags, the restorer and the mask.
+        if (!k.put(Number(old), Buffer.alloc(32))) return k.fail(EFAULT);
+      }
+      if (Number(act) !== 0) {
+        const handler = Number(k.u64(act));
+        k.signals.set(n, handler === 1 ? "ignore" : "catch");
+      } else {
+        k.signals.delete(n);
+      }
+      return [0n, 0];
+    });
     this.on(135, (k, how, set, old) => {
       if (Number(old) !== 0) k.put64(old, 0n);
       return [0n, 0];
