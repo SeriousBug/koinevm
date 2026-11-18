@@ -17,6 +17,8 @@ export const PTE = {
 export const PROT = { READ: 1, WRITE: 2, EXEC: 4 };
 export const MAP = { SHARED: 0x01, PRIVATE: 0x02, FIXED: 0x10, ANONYMOUS: 0x20, POPULATE: 0x8000 };
 
+export const MREMAP = { MAYMOVE: 1, FIXED: 2, DONTUNMAP: 4 };
+
 export const EINVAL = 22;
 export const ENOMEM = 12;
 export const EFAULT = 14;
@@ -151,6 +153,39 @@ export class AddressSpace {
     }
     this.free = merged;
     return 0;
+  }
+
+  /// mremap(2): a mapping that has to be bigger, and the bytes it already holds. A move is a new
+  /// reservation with the old contents in it; in place is the same only when the range that would
+  /// follow the old one is free, which is what `apt`'s cache grows into when it can.
+  mremap(oldAddr, oldLen, newLen, flags, newAddr) {
+    oldLen = roundUp(oldLen, PAGE);
+    newLen = roundUp(newLen, PAGE);
+    if (oldAddr % PAGE !== 0) return -EINVAL;
+    if (newLen <= 0) return -EINVAL;
+    const fixed = (flags & MREMAP.FIXED) !== 0;
+    const mayMove = fixed || (flags & MREMAP.MAYMOVE) !== 0;
+    if (newLen === oldLen && !fixed) return oldAddr;
+    // Growing where it stands: the pages just past the old range have to be nobody's.
+    if (!fixed && newLen > oldLen) {
+      const tail = this.free.find((s) => s.lo === oldAddr + oldLen);
+      if (tail && tail.lo + (newLen - oldLen) <= tail.hi) {
+        this.reserve(newLen - oldLen, oldAddr + oldLen, true);
+        this.bytes(oldAddr + oldLen, newLen - oldLen).fill(0);
+        this.setPtes(oldAddr + oldLen, oldAddr + newLen, this.ptes[oldAddr >> 12] & ~PTE.TRANSLATED);
+        return oldAddr;
+      }
+    }
+    if (!mayMove) return -ENOMEM;
+    const at = this.reserve(newLen, fixed ? newAddr : 0, fixed);
+    if (at < 0) return at;
+    const keep = Math.min(oldLen, newLen);
+    const view = this.bytes(at, newLen);
+    view.fill(0);
+    view.set(this.bytes(oldAddr, keep));
+    this.setPtes(at, at + newLen, this.ptes[oldAddr >> 12] & ~PTE.TRANSLATED);
+    this.munmap(oldAddr, oldLen);
+    return at;
   }
 
   mprotect(addr, len, prot) {

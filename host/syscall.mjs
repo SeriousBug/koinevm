@@ -13,6 +13,7 @@ import {
   encodeSockaddr,
   sockaddrFor,
   AF_UNSPEC,
+  SOCK_DGRAM,
   AF_INET,
   AF_INET6,
   EAGAIN,
@@ -249,6 +250,13 @@ export class Kernel {
     });
 
     this.on(215, (k, addr, len) => [BigInt(k.space.munmap(k.addr(addr), Number(len))), 0]);
+
+    this.on(216, (k, addr, len, newLen, flags, newAddr) => [
+      BigInt(
+        k.space.mremap(k.addr(addr), Number(len), Number(newLen), Number(flags), k.addr(newAddr)),
+      ),
+      0,
+    ]);
 
     this.on(226, (k, addr, len, prot) => [
       BigInt(k.space.mprotect(k.addr(addr), Number(len), Number(prot))),
@@ -1145,6 +1153,10 @@ export class Kernel {
       // and SO_ERROR, which is the path every non-blocking client takes.
       const started = desc.connect(want);
       if (typeof started === "number") return [BigInt(started), 0];
+      // A datagram socket's connect reaches for no peer, so it never waits on the network the way a
+      // connection does: the answer is the host's own refusal or success, and a program reads it
+      // from the return value in the same breath.
+      if (desc.type === SOCK_DGRAM) return k.ask({ kind: "connect", fd: Number(fd) });
       if (desc.nonblock) {
         started.catch(() => {});
         return k.fail(EINPROGRESS);
