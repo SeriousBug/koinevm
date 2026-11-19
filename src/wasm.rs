@@ -313,6 +313,10 @@ pub mod simd {
     pub const F32X4_FLOOR: u32 = 0x68;
     pub const F32X4_TRUNC: u32 = 0x69;
     pub const F32X4_NEAREST: u32 = 0x6a;
+    pub const F64X2_CEIL: u32 = 0x74;
+    pub const F64X2_FLOOR: u32 = 0x75;
+    pub const F64X2_TRUNC: u32 = 0x7a;
+    pub const F64X2_NEAREST: u32 = 0x94;
     pub const I8X16_SHL: u32 = 0x6b;
     pub const I8X16_SHR_S: u32 = 0x6c;
     pub const I8X16_SHR_U: u32 = 0x6d;

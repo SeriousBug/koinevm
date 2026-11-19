@@ -35,14 +35,15 @@ pub const L_T2: u32 = L_T1 + 1;
 pub const L_T3: u32 = L_T2 + 1;
 pub const L_T4: u32 = L_T3 + 1;
 pub const L_TI: u32 = L_T4 + 1;
-/// Two 128-bit scratch values for the sequences that need more than one vector live at a time.
+/// The scratch 128-bit values for the sequences that need more than one vector live at a time.
 pub const L_V0: u32 = L_TI + 1;
 pub const L_V1: u32 = L_V0 + 1;
 pub const L_V2: u32 = L_V1 + 1;
 pub const L_V3: u32 = L_V2 + 1;
+pub const L_V4: u32 = L_V3 + 1;
 /// Two scalars wide enough that an f32 can go through them exactly, for the sequences that need a
 /// temporary in the middle of a floating point operation.
-pub const L_F0: u32 = L_V3 + 1;
+pub const L_F0: u32 = L_V4 + 1;
 pub const L_F1: u32 = L_F0 + 1;
 /// Where the trace writes the vector file, one 16-byte value per register.
 pub const SHADOW_V0: u64 = 0x600;
@@ -1436,6 +1437,21 @@ fn sign_mask(double: bool) -> [u8; 16] {
     m
 }
 
+/// One float spread across every lane of a register, which is how a constant meets a vector op.
+fn lane_repeat(double: bool, wide: u64, narrow: u32) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    if double {
+        for half in 0..2 {
+            out[half * 8..half * 8 + 8].copy_from_slice(&wide.to_le_bytes());
+        }
+    } else {
+        for lane in 0..4 {
+            out[lane * 4..lane * 4 + 4].copy_from_slice(&narrow.to_le_bytes());
+        }
+    }
+    out
+}
+
 fn low_half_mask() -> [u8; 16] {
     let mut out = [0xffu8; 16];
     for b in 8..16 {
@@ -1644,6 +1660,46 @@ fn struct_store_mask(count: u32, e: u32, p: u32, pair: u32, bytes: u32) -> ([u8;
 }
 
 /// Move lanes `width..2*width` down onto `0..width`, for one step of a reduction.
+/// Where the even and odd lanes of a pairwise FP operation come from, by lane width in bytes and how
+/// many lanes of each source it covers.
+fn fp_pair_masks(lane: u32, lanes: u32) -> ([u8; 16], [u8; 16]) {
+    let (lane, lanes) = (lane as usize, lanes as usize);
+    let mut even = [0u8; 16];
+    let mut odd = [0u8; 16];
+    for i in 0..lanes / 2 {
+        for b in 0..lane {
+            even[i * lane + b] = (2 * i * lane + b) as u8;
+            odd[i * lane + b] = ((2 * i + 1) * lane + b) as u8;
+            even[(lanes / 2 + i) * lane + b] = (16 + 2 * i * lane + b) as u8;
+            odd[(lanes / 2 + i) * lane + b] = (16 + (2 * i + 1) * lane + b) as u8;
+        }
+    }
+    (even, odd)
+}
+
+/// The two halves of a register swapped, which folds the lanes of a `d` register together.
+fn swap_halves_mask() -> [u8; 16] {
+    let mut m = [0u8; 16];
+    for i in 0..8 {
+        m[i] = (i + 8) as u8;
+        m[i + 8] = i as u8;
+    }
+    m
+}
+
+/// The 32-bit words of each half swapped, the second fold of a four-lane reduction.
+fn swap_words_mask() -> [u8; 16] {
+    let mut m = [0u8; 16];
+    for half in 0..2 {
+        for w in 0..2 {
+            for b in 0..4 {
+                m[half * 8 + w * 4 + b] = (half * 8 + (1 - w) * 4 + b) as u8;
+            }
+        }
+    }
+    m
+}
+
 fn halve_mask(size: u32, width: u32) -> [u8; 16] {
     let lane = 1u32 << size;
     let mut m = [0u8; 16];
@@ -1829,7 +1885,7 @@ impl<'a> RegionEmitter<'a> {
         unsupported: &'a mut Vec<(u64, String)>,
     ) -> Self {
         let mut f = Func::new(ids.ty_region);
-        f.locals = vec![I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128, F64, F64];
+        f.locals = vec![I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128, V128, F64, F64];
         RegionEmitter { f, region, layout, ids, unsupported, open: 0, cur_pc: 0, narrow: false }
     }
 
@@ -2760,6 +2816,168 @@ impl<'a> RegionEmitter<'a> {
         self.setv(rd);
     }
 
+    /// `fmax`/`fmin` and their `nm` pair, lane by lane. A lane with a NaN on both sides keeps the
+    /// first of them in the order the architecture passes NaN operands on, quieted - a signalling
+    /// one before a quiet one, and the first operand before the second - and the two forms part
+    /// only where one side is a number: the plain form passes the NaN on, `nm` answers the number.
+    /// wasm's own max decides a NaN lane for itself, so every such lane is put right afterwards.
+    fn vec_minmax(&mut self, rn: u32, rm: u32, rd: u32, double: bool, max: bool, number: bool) {
+        self.getv(rn);
+        self.f.ls(L_V0);
+        self.getv(rm);
+        self.f.ls(L_V1);
+        self.minmax_into(double, max, number);
+        self.f.lg(L_V2);
+        self.setv(rd);
+    }
+
+    /// The same, on the two operands the caller left in the first two scratch values, with the
+    /// answer in the third: a reduction has to fold a vector against a copy of itself.
+    fn minmax_into(&mut self, double: bool, max: bool, number: bool) {
+        let (op, ne, eq) = if double {
+            (
+                if max { simd::F64X2_MAX } else { simd::F64X2_MIN },
+                simd::F64X2_NE,
+                simd::I64X2_EQ,
+            )
+        } else {
+            (
+                if max { simd::F32X4_MAX } else { simd::F32X4_MIN },
+                simd::F32X4_NE,
+                simd::I32X4_EQ,
+            )
+        };
+        let quiet = lane_repeat(double, 0x0008_0000_0000_0000, 0x0040_0000);
+        self.f.lg(L_V0);
+        self.f.lg(L_V1);
+        self.f.simd(op);
+        self.f.ls(L_V2);
+        // `bitselect` takes its first operand where the mask is set, so each step names what the
+        // lanes it covers should hold, and the one that is not a NaN comes next.
+        self.nan_lanes_quiet(L_V1, L_V2, ne, quiet);
+        self.nan_lanes_quiet(L_V0, L_V2, ne, quiet);
+        // The second operand signalling where the first is only quiet is the one passed on.
+        self.f.lg(L_V1);
+        self.f.v128c(quiet);
+        self.f.simd(simd::V128_OR);
+        self.f.lg(L_V2);
+        self.f.lg(L_V1);
+        self.f.lg(L_V1);
+        self.f.simd(ne);
+        self.f.lg(L_V1);
+        self.f.v128c(quiet);
+        self.f.simd(simd::V128_AND);
+        self.f.v128c([0; 16]);
+        self.f.simd(eq);
+        self.f.simd(simd::V128_AND);
+        self.f.lg(L_V0);
+        self.f.v128c(quiet);
+        self.f.simd(simd::V128_AND);
+        self.f.v128c([0; 16]);
+        self.f.simd(eq);
+        self.f.simd(simd::V128_ANDNOT);
+        self.f.simd(simd::V128_BITSELECT);
+        self.f.ls(L_V2);
+        if number {
+            // One NaN and one number: the number is the answer.
+            self.nan_lanes_take_number(L_V1, L_V0, L_V2, ne, eq, quiet);
+            self.nan_lanes_take_number(L_V0, L_V1, L_V2, ne, eq, quiet);
+        }
+    }
+
+    /// The lanes of `scratch` where `other` is a NaN, taken as its quiet form.
+    fn nan_lanes_quiet(&mut self, other: u32, scratch: u32, ne: u32, quiet: [u8; 16]) {
+        self.f.lg(other);
+        self.f.v128c(quiet);
+        self.f.simd(simd::V128_OR);
+        self.f.lg(scratch);
+        self.f.lg(other);
+        self.f.lg(other);
+        self.f.simd(ne);
+        self.f.simd(simd::V128_BITSELECT);
+        self.f.ls(scratch);
+    }
+
+    /// The lanes of `scratch` where `nan` is a quiet NaN and `number` is not a NaN: those take the
+    /// number, which is the whole difference `nm` has from the plain max and min. A signalling NaN
+    /// is not one of them: it is passed on, quieted, by both forms.
+    fn nan_lanes_take_number(
+        &mut self,
+        nan: u32,
+        number: u32,
+        scratch: u32,
+        ne: u32,
+        eq: u32,
+        quiet: [u8; 16],
+    ) {
+        self.f.lg(number);
+        self.f.lg(scratch);
+        self.f.lg(nan);
+        self.f.lg(nan);
+        self.f.simd(ne);
+        self.f.lg(number);
+        self.f.lg(number);
+        self.f.simd(ne);
+        self.f.simd(simd::V128_NOT);
+        self.f.simd(simd::V128_AND);
+        self.f.lg(nan);
+        self.f.v128c(quiet);
+        self.f.simd(simd::V128_AND);
+        self.f.v128c([0; 16]);
+        self.f.simd(eq);
+        self.f.simd(simd::V128_ANDNOT);
+        self.f.simd(simd::V128_BITSELECT);
+        self.f.ls(scratch);
+    }
+
+    /// Round to integral with ties away from zero, lane by lane: the truncation plus one in the
+    /// direction of the sign where half a lane or more was left over. A value that is already an
+    /// integer, and an infinity or a NaN, come back as they are, because their leftover is either
+    /// zero or not a number.
+    fn vec_round_away(&mut self, rn: u32, rd: u32, double: bool) {
+        let (trunc, sub, abs, ge, add) = if double {
+            (
+                simd::F64X2_TRUNC,
+                simd::F64X2_SUB,
+                simd::F64X2_ABS,
+                simd::F64X2_GE,
+                simd::F64X2_ADD,
+            )
+        } else {
+            (
+                simd::F32X4_TRUNC,
+                simd::F32X4_SUB,
+                simd::F32X4_ABS,
+                simd::F32X4_GE,
+                simd::F32X4_ADD,
+            )
+        };
+        self.getv(rn);
+        self.f.simd(trunc);
+        self.f.ls(L_V0);
+        self.getv(rn);
+        self.f.ls(L_V1);
+        // The leftover, as a magnitude: what is left after the truncation, one way or the other.
+        self.f.lg(L_V1);
+        self.f.lg(L_V0);
+        self.f.simd(sub);
+        self.f.simd(abs);
+        self.f.v128c(lane_repeat(double, 0x3fe0_0000_0000_0000, 0x3f00_0000));
+        self.f.simd(ge);
+        self.f.ls(L_V2);
+        // One with the sign of the value, masked out where the leftover was less than a half.
+        self.f.lg(L_V1);
+        self.f.v128c(sign_mask(double));
+        self.f.simd(simd::V128_AND);
+        self.f.v128c(lane_repeat(double, 0x3ff0_0000_0000_0000, 0x3f80_0000));
+        self.f.simd(simd::V128_OR);
+        self.f.lg(L_V2);
+        self.f.simd(simd::V128_AND);
+        self.f.lg(L_V0);
+        self.f.simd(add);
+        self.setv(rd);
+    }
+
     /// Element width code (0..3) to the matching wasm lane opcode, so one table can serve all sizes.
     fn lanes_op(&self, size: u32, ops: [u32; 4]) -> Option<u32> {
         if size > 3 {
@@ -2979,6 +3197,52 @@ impl<'a> RegionEmitter<'a> {
         // The partial sums past the first lane are dead: the reduction is a scalar result.
         self.f.lg(L_V0);
         self.f.v128c(lane_zero_mask(size));
+        self.f.simd(simd::V128_AND);
+        self.setv(rd);
+    }
+
+    /// The FP forms of the across group: a scalar out of the two lanes of a `d` register or the four
+    /// of a `q` one, by folding the halves of the register together.
+    fn vec_across_fp(&mut self, rn: u32, rd: u32, double: bool, max: bool) {
+        self.getv(rn);
+        self.f.ls(L_V0);
+        self.f.lg(L_V0);
+        self.f.lg(L_V0);
+        self.f.simd(simd::I8X16_SHUFFLE);
+        self.f.body.extend_from_slice(&swap_halves_mask());
+        self.f.ls(L_V1);
+        self.minmax_into(double, max, false);
+        if !double {
+            self.f.lg(L_V2);
+            self.f.ls(L_V0);
+            self.f.lg(L_V0);
+            self.f.lg(L_V0);
+            self.f.simd(simd::I8X16_SHUFFLE);
+            self.f.body.extend_from_slice(&swap_words_mask());
+            self.f.ls(L_V1);
+            self.minmax_into(double, max, false);
+        }
+        // The lanes past the first are dead: a scalar result, with the rest of the register clear.
+        self.f.lg(L_V2);
+        self.f.v128c(lane_zero_mask(if double { 3 } else { 2 }));
+        self.f.simd(simd::V128_AND);
+        self.setv(rd);
+    }
+
+    /// `faddp` in its scalar form: the two lanes of a `d` register added.
+    fn vec_across_fp_add(&mut self, rn: u32, rd: u32, double: bool) {
+        let add = if double { simd::F64X2_ADD } else { simd::F32X4_ADD };
+        self.getv(rn);
+        self.f.ls(L_V0);
+        self.f.lg(L_V0);
+        self.f.lg(L_V0);
+        self.f.simd(simd::I8X16_SHUFFLE);
+        self.f.body.extend_from_slice(&swap_halves_mask());
+        self.f.ls(L_V1);
+        self.f.lg(L_V0);
+        self.f.lg(L_V1);
+        self.f.simd(add);
+        self.f.v128c(lane_zero_mask(if double { 3 } else { 2 }));
         self.f.simd(simd::V128_AND);
         self.setv(rd);
     }
@@ -4351,9 +4615,38 @@ impl<'a> RegionEmitter<'a> {
                             self.vec_pairwise(size, o, rn, rm, rd);
                         }
                     }
+                    // The pairwise forms of the FP group: the lane pairs of the two sources, added
+                    // or compared. The same opcodes as the elementwise ones, with the U bit set, and
+                    // without the lane width in the size field - bit 1 is the min half of min/max.
+                    (true, _, 0b11010) if size < 2 => {
+                        let (even, odd) = fp_pair_masks(if size & 1 == 1 { 8 } else { 4 }, if !q { 2 } else if size & 1 == 1 { 2 } else { 4 });
+                        self.shuffle(NVEC0 + rn, NVEC0 + rm, even);
+                        self.f.ls(L_V0);
+                        self.shuffle(NVEC0 + rn, NVEC0 + rm, odd);
+                        self.f.ls(L_V1);
+                        self.f.lg(L_V0);
+                        self.f.lg(L_V1);
+                        self.f.simd(if size & 1 == 1 { simd::F64X2_ADD } else { simd::F32X4_ADD });
+                        self.setv(rd);
+                    }
+                    (true, _, 0b11110) => {
+                        let (even, odd) = fp_pair_masks(if size & 1 == 1 { 8 } else { 4 }, if size & 2 != 0 || q { 4 } else { 2 });
+                        self.shuffle(NVEC0 + rn, NVEC0 + rm, even);
+                        self.f.ls(L_V0);
+                        self.shuffle(NVEC0 + rn, NVEC0 + rm, odd);
+                        self.f.ls(L_V1);
+                        self.minmax_into(size & 1 == 1, size & 2 == 0, false);
+                        self.f.lg(L_V2);
+                        self.setv(rd);
+                    }
                     // The FP group. Bit 22 is the lane type and bit 23 the low bit of the opcode
                     // where the operation has a pair, so the size field carries both: an odd size
                     // is double, and the pairs (add/sub, mla/mls) take the second when it is set.
+                    // fmax/fmin and their `nm` pair: the larger or the smaller of the two, and the
+                    // one that is not a NaN where only one of them is.
+                    (false, _, 0b11110) | (false, _, 0b11000) => {
+                        self.vec_minmax(rn, rm, rd, size & 1 == 1, size & 2 == 0, op == 0b11000);
+                    }
                     (false, 0 | 1, 0b11010) => {
                         self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_ADD } else { simd::F32X4_ADD })
                     }
@@ -4487,6 +4780,33 @@ impl<'a> RegionEmitter<'a> {
                         rd,
                         if size & 1 == 1 { simd::F64X2_SQRT } else { simd::F32X4_SQRT },
                     ),
+                    // The rounding family: to integral, in the mode the opcode names. Bit 23 picks
+                    // the second of each mode's pair and bit 22 is the lane width, which is why
+                    // `frintp` reads as `frintn` one lane width up until both bits are taken.
+                    (u, _, 0b11000) | (u, _, 0b11001) => {
+                        let double = size & 1 == 1;
+                        let upper = size & 2 != 0;
+                        if u && op == 0b11000 && !upper {
+                            // frinta: ties away from zero, which wasm has no form of.
+                            self.vec_round_away(rn, rd, double);
+                        } else {
+                            let (narrow, wide) = match (u, op, upper) {
+                                (false, 0b11000, false) => (simd::F32X4_NEAREST, simd::F64X2_NEAREST),
+                                (false, 0b11000, true) => (simd::F32X4_CEIL, simd::F64X2_CEIL),
+                                (false, 0b11001, false) => (simd::F32X4_FLOOR, simd::F64X2_FLOOR),
+                                (false, 0b11001, true) => (simd::F32X4_TRUNC, simd::F64X2_TRUNC),
+                                // frintx and frinti round in the mode FPCR holds; nothing here
+                                // changes the default, so they are the nearest the others are.
+                                (true, 0b11001, _) => (simd::F32X4_NEAREST, simd::F64X2_NEAREST),
+                                _ => {
+                                    return self.refuse(format!(
+                                        "unsupported rounding u={u} size={size} op={op:05b} at 0x{addr:x}"
+                                    ))
+                                }
+                            };
+                            self.vec2(rn, rd, if double { wide } else { narrow });
+                        }
+                    }
                     // The conversions between an integer vector and a float one, which only the
                     // 4s and 2d widths have: the 2d form has no wasm equivalent, so its two lanes
                     // convert one at a time.
@@ -4583,6 +4903,11 @@ impl<'a> RegionEmitter<'a> {
                             self.vec_across(size, o, rn, rd);
                         }
                     }
+                    // fmaxp/fminp and the nm pair, from two lanes or four. Bit 0 of the size field
+                    // is the lane width, bit 1 the choice between the two of each pair.
+                    (true, 0b01111) => self.vec_across_fp(rn, rd, size & 1 == 1, size & 2 == 0),
+                    // faddp: the lanes added.
+                    (true, 0b01101) => self.vec_across_fp_add(rn, rd, size & 1 == 1),
                     _ => return self.refuse(format!("unsupported across-lane op {op:05b} u={u} at 0x{addr:x}")),
                 }
             }
@@ -5554,12 +5879,31 @@ impl<'a> RegionEmitter<'a> {
                 }
                 self.fp_put(rd, double);
             }
-            Insn::FpToInt { double, unsigned, rn, rd } => {
+            Insn::FpToInt { double, unsigned, rmode, rn, rd } => {
                 // The scalar becomes an integer in the same register, saturating at the ends of the
                 // range for a value out of it, which is what the instruction does with those and
-                // with a NaN.
+                // with a NaN. Rounding first is what tells the members of the family apart, and
+                // the saturating conversion truncates the rest of the way.
                 self.fp_base();
-                self.fp_get(rn, double);
+                match rmode {
+                    round::AWAY => self.fp_round_away(rn, double),
+                    round::ZERO | round::DOWN | round::UP | round::NEAREST => {
+                        self.fp_get(rn, double);
+                        let pre = match (rmode, double) {
+                            (round::DOWN, true) => Some(F64_FLOOR),
+                            (round::DOWN, false) => Some(F32_FLOOR),
+                            (round::UP, true) => Some(F64_CEIL),
+                            (round::UP, false) => Some(F32_CEIL),
+                            (round::NEAREST, true) => Some(F64_NEAREST),
+                            (round::NEAREST, false) => Some(F32_NEAREST),
+                            _ => None,
+                        };
+                        if let Some(op) = pre {
+                            self.f.op(op);
+                        }
+                    }
+                    _ => return self.refuse(format!("floating point rounding {rmode} at 0x{addr:x}")),
+                }
                 self.f.sat(if double {
                     if unsigned {
                         sat::I64_TRUNC_SAT_F64_U

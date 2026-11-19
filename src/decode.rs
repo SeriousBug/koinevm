@@ -177,8 +177,10 @@ pub enum Insn {
     /// the same width.
     FpFromInt { double: bool, unsigned: bool, rn: u32, rd: u32 },
     /// `fcvtzu d0, d0`: the scalar in an FP register converted to an integer of its own width, left
-    /// in the same register, which is the form a cast that stays in the vector file takes.
-    FpToInt { double: bool, unsigned: bool, rn: u32, rd: u32 },
+    /// in the same register, which is the form a cast that stays in the vector file takes. `rmode`
+    /// is how the value is rounded on the way, which is the only thing the family's members differ
+    /// in: truncate, floor, ceiling, nearest or away.
+    FpToInt { double: bool, unsigned: bool, rmode: u32, rn: u32, rd: u32 },
     /// Ordered and exclusive loads and stores. One thread, so an exclusive always succeeds.
     Atomic { is_load: bool, exclusive: bool, size: u32, rn: u32, rt: u32, rs: u32 },
     /// Compare and swap (`cas`/`casa`/`casl`): the loaded value goes back into Rs either way.
@@ -1019,20 +1021,35 @@ fn decode_scalar_fp(w: u32) -> Insn {
     }
 
     // The same group the other way round: an FP scalar converted to an integer of its own width, in
-    // the register it came from. Bit 23 is what tells this group from `*cvtf`, whose result is a
-    // float; the type, the rounding and the sign are the fields that vary.
-    if (w & 0xdfbffc00) == 0x5ea1b800 {
-        return Insn::FpToInt {
-            double: (w >> 22) & 1 == 1,
-            unsigned: (w >> 29) & 1 == 1,
-            rn,
-            rd,
+    // the register it came from. Bits 21:16 are the marker and bits 15:10 pick the rounding, in
+    // pairs that bit 23 splits: `n`/`p`, `m`/`z` and `a` alone. The marker is not enough on its own,
+    // because `fsqrt` and `fabs` carry it with an opcode of 110000.
+    if (w >> 16) & 0x3f == 0b100001 {
+        let second = (w >> 23) & 1 == 1;
+        let rmode = match ((w >> 10) & 0x3f, second) {
+            (0b101010, false) => Some(round::NEAREST),
+            (0b101010, true) => Some(round::UP),
+            (0b101110, false) => Some(round::DOWN),
+            (0b101110, true) => Some(round::ZERO),
+            (0b110010, false) => Some(round::AWAY),
+            _ => None,
         };
+        if let Some(rmode) = rmode {
+            return Insn::FpToInt {
+                double: (w >> 22) & 1 == 1,
+                unsigned: (w >> 29) & 1 == 1,
+                rmode,
+                rn,
+                rd,
+            };
+        }
     }
 
     // An integer in a scalar FP register converted to floating point. Bits 15:10 are 110110, where
-    // `fcsel` puts a condition in 15:12 and 11 in 11:10, so the whole field is what tells them apart.
-    if (w >> 21) & 1 == 1 && (w >> 10) & 0x3f == 0b110110 {
+    // `fcsel` puts a condition in 15:12 and 11 in 11:10, so the whole field is what tells them
+    // apart - and the class bits have to be part of the pattern too, because the pairwise pair at
+    // 7e70d820 shares the field without being one.
+    if w & 0xdf3ffc00 == 0x5e21d800 {
         return Insn::FpFromInt {
             double: (w >> 22) & 1 == 1,
             unsigned: (w >> 29) & 1 == 1,

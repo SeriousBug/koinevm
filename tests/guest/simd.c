@@ -554,6 +554,29 @@ static void setup(void) {
     X(ucvtf_s_w_f20, "ucvtf s, w, #20", "ucvtf s2, %w1, #0x14\n" S2W)                           \
     X(scvtf_d_x_f10, "scvtf d, x, #10", "scvtf d2, %3, #0xa\n" D2X)                             \
     X(ucvtf_d_x_f32, "ucvtf d, x, #32", "ucvtf d2, %3, #0x20\n" D2X)                            \
+    /* The conversions between a float and an integer in the same register, every rounding. */ \
+    X(fcvtzu_d, "fcvtzu d", "fmov d0, %3\n fcvtzu d2, d0\n fmov %0, d2") \
+    X(fcvtzu_s, "fcvtzu s", "fmov s0, %w1\n fcvtzu s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(fcvtns_d, "fcvtns d", "fmov d0, %3\n fcvtns d2, d0\n fmov %0, d2") \
+    X(fcvtns_s, "fcvtns s", "fmov s0, %w1\n fcvtns s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(fcvtms_d, "fcvtms d", "fmov d0, %3\n fcvtms d2, d0\n fmov %0, d2") \
+    X(fcvtms_s, "fcvtms s", "fmov s0, %w1\n fcvtms s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(fcvtps_d, "fcvtps d", "fmov d0, %3\n fcvtps d2, d0\n fmov %0, d2") \
+    X(fcvtps_s, "fcvtps s", "fmov s0, %w1\n fcvtps s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(fcvtas_d, "fcvtas d", "fmov d0, %3\n fcvtas d2, d0\n fmov %0, d2") \
+    X(fcvtas_s, "fcvtas s", "fmov s0, %w1\n fcvtas s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(fcvtmu_d, "fcvtmu d", "fmov d0, %3\n fcvtmu d2, d0\n fmov %0, d2") \
+    X(fcvtmu_s, "fcvtmu s", "fmov s0, %w1\n fcvtmu s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(fcvtnu_d, "fcvtnu d", "fmov d0, %3\n fcvtnu d2, d0\n fmov %0, d2") \
+    X(fcvtnu_s, "fcvtnu s", "fmov s0, %w1\n fcvtnu s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(fcvtpu_d, "fcvtpu d", "fmov d0, %3\n fcvtpu d2, d0\n fmov %0, d2") \
+    X(fcvtpu_s, "fcvtpu s", "fmov s0, %w1\n fcvtpu s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(fcvtau_d, "fcvtau d", "fmov d0, %3\n fcvtau d2, d0\n fmov %0, d2") \
+    X(fcvtau_s, "fcvtau s", "fmov s0, %w1\n fcvtau s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(scvtf_d_self, "scvtf d, d", "fmov d0, %3\n scvtf d2, d0\n fmov %0, d2") \
+    X(ucvtf_d_self, "ucvtf d, d", "fmov d0, %3\n ucvtf d2, d0\n fmov %0, d2") \
+    X(scvtf_s_self, "scvtf s, s", "fmov s0, %w1\n scvtf s2, s0\n fmov w9, s2\n mov %0, x9") \
+    X(ucvtf_s_self, "ucvtf s, s", "fmov s0, %w1\n ucvtf s2, s0\n fmov w9, s2\n mov %0, x9") \
     X(scvtf_s_x_f40, "scvtf s, x, #40", "scvtf s2, %3, #0x28\n" S2W)
 
 struct vcase {
