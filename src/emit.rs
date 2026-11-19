@@ -2614,8 +2614,8 @@ impl<'a> RegionEmitter<'a> {
         self.f.op(if double { F64_LT } else { F32_LT });
         self.f.op(IF);
         self.f.body.push(ty);
-        self.f.lg(tmp);
         self.fp_const(0, double);
+        self.f.lg(tmp);
         self.f.op(if double { F64_COPYSIGN } else { F32_COPYSIGN });
         self.f.op(ELSE);
         self.f.lg(tmp);
@@ -2663,6 +2663,71 @@ impl<'a> RegionEmitter<'a> {
         self.f.end();
         self.f.end();
         self.f.lg(tmp);
+    }
+
+    /// One binary FP operation, with the flushing path emitted only where FPCR asks for it.
+    fn fp_binary(&mut self, rn: u32, rm: u32, double: bool, op: u32, post: &[u32]) {
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(if double { F64 } else { F32 });
+        self.fp_operands(rn, rm, None, double, op, post, true);
+        self.f.op(ELSE);
+        self.fp_operands(rn, rm, None, double, op, post, false);
+        self.f.end();
+    }
+
+    /// All four fused forms are the accumulator plus the product with a sign each: bit 21 negates
+    /// the product, bit 15 subtracts the sum, so FMSUB is `Va - Vn*Vm` and FNMSUB is `-Va + Vn*Vm`.
+    /// The accumulator goes on the stack first because that is the NaN a result of two carries, as
+    /// the hardware reports it.
+    fn fp_fused(
+        &mut self,
+        rn: u32,
+        rm: u32,
+        ra: u32,
+        double: bool,
+        negate_product: bool,
+        subtract: bool,
+        flush: bool,
+    ) {
+        self.fp_arg(ra, double, flush);
+        if negate_product {
+            self.f.op(if double { F64_NEG } else { F32_NEG });
+        }
+        self.fp_arg(rn, double, flush);
+        self.fp_arg(rm, double, flush);
+        self.f.op(if double { F64_MUL } else { F32_MUL });
+        if negate_product != subtract {
+            self.f.op(if double { F64_NEG } else { F32_NEG });
+        }
+        self.f.op(if double { F64_ADD } else { F32_ADD });
+        if flush {
+            self.fp_fixup(double);
+        }
+    }
+
+    fn fp_operands(
+        &mut self,
+        rn: u32,
+        rm: u32,
+        ra: Option<u32>,
+        double: bool,
+        op: u32,
+        post: &[u32],
+        flush: bool,
+    ) {
+        if let Some(ra) = ra {
+            self.fp_arg(ra, double, flush);
+        }
+        self.fp_arg(rn, double, flush);
+        self.fp_arg(rm, double, flush);
+        self.f.op(op as u8);
+        for &p in post {
+            self.f.op(p as u8);
+        }
+        if flush {
+            self.fp_fixup(double);
+        }
     }
 
     /// The result of an FP operation into lane 0 of `r`, having let FZ and DN at it.
@@ -3048,8 +3113,8 @@ impl<'a> RegionEmitter<'a> {
         self.f.op(I32_EQZ);
         self.f.op(IF);
         self.f.body.push(scalar);
-        self.fp_get(rn, double);
-        self.fp_get(rm, double);
+        self.fp_arg(rn, double, true);
+        self.fp_arg(rm, double, true);
         self.f.op(op);
         self.f.op(ELSE);
         self.fp_is_snan(rn, double);
@@ -6002,9 +6067,8 @@ impl<'a> RegionEmitter<'a> {
                 self.fp_base();
                 if (4..=7).contains(&opcode) {
                     self.fp_minmax(rn, rm, double, opcode & 1 == 0, opcode >= 6);
+                    self.fp_fixup(double);
                 } else {
-                    self.fp_get(rn, double);
-                    self.fp_get(rm, double);
                     let op = match opcode {
                         0 | 8 => if double { F64_MUL } else { F32_MUL },
                         1 => if double { F64_DIV } else { F32_DIV },
@@ -6012,26 +6076,25 @@ impl<'a> RegionEmitter<'a> {
                         3 => if double { F64_SUB } else { F32_SUB },
                         _ => return self.refuse(format!("floating point opcode {opcode} at 0x{addr:x}")),
                     };
-                    self.f.op(op);
-                    if opcode == 8 {
-                        // fnmul: the product, then the sign flipped.
-                        self.f.op(if double { F64_NEG } else { F32_NEG });
-                    }
+                    // fnmul is the product with the sign flipped, and nothing else differs.
+                    let neg = if double { F64_NEG } else { F32_NEG } as u32;
+                    let post: [u32; 1] = [neg];
+                    self.fp_binary(rn, rm, double, op as u32, if opcode == 8 { &post } else { &[] });
                 }
                 self.fp_put(rd, double);
             }
             Insn::FpScalarSame { double, multiply, rn, rm, rd } => {
                 self.fp_base();
-                self.fp_get(rn, double);
-                self.fp_get(rm, double);
                 if multiply {
                     // `fmulx` differs from a plain multiply only for zero times infinity, which it
                     // answers with 2.0 where a multiply gives a NaN.
-                    self.f.op(if double { F64_MUL } else { F32_MUL });
+                    let mul = if double { F64_MUL } else { F32_MUL } as u32;
+                    self.fp_binary(rn, rm, double, mul, &[]);
                 } else {
                     // `fabd`: the absolute value of the difference.
-                    self.f.op(if double { F64_SUB } else { F32_SUB });
-                    self.f.op(if double { F64_ABS } else { F32_ABS });
+                    let sub = if double { F64_SUB } else { F32_SUB } as u32;
+                    let abs = if double { F64_ABS } else { F32_ABS } as u32;
+                    self.fp_binary(rn, rm, double, sub, &[abs]);
                 }
                 self.fp_put(rd, double);
             }
@@ -6043,21 +6106,13 @@ impl<'a> RegionEmitter<'a> {
                 // There is no fused multiply-add in wasm, so this rounds twice and can differ from
                 // the instruction in the last bit. docs/poc-results.md records that.
                 self.fp_base();
-                // All four forms are the accumulator plus the product with a sign each: bit 21
-                // negates the accumulator and bit 15 the product, so FMSUB is `Va - Vn*Vm` and
-                // FNMSUB is `-Va + Vn*Vm`. The accumulator goes on the stack first because that is
-                // the NaN a result of two carries, as the hardware reports it.
-                self.fp_get(ra, double);
-                if negate_product {
-                    self.f.op(if double { F64_NEG } else { F32_NEG });
-                }
-                self.fp_get(rn, double);
-                self.fp_get(rm, double);
-                self.f.op(if double { F64_MUL } else { F32_MUL });
-                if negate_product != subtract {
-                    self.f.op(if double { F64_NEG } else { F32_NEG });
-                }
-                self.f.op(if double { F64_ADD } else { F32_ADD });
+                self.fpcr_flag(FPCR_FZ | FPCR_DN);
+                self.f.op(IF);
+                self.f.body.push(if double { F64 } else { F32 });
+                self.fp_fused(rn, rm, ra, double, negate_product, subtract, true);
+                self.f.op(ELSE);
+                self.fp_fused(rn, rm, ra, double, negate_product, subtract, false);
+                self.f.end();
                 self.fp_put(rd, double);
             }
             Insn::FpCompareZero { double, op, integer, rn, rd } => {
@@ -6282,6 +6337,8 @@ impl<'a> RegionEmitter<'a> {
                             ops.map(|o| o as u32)
                         },
                     );
+                    // Rounding a NaN is still a NaN, and DN decides which one.
+                    self.fp_fixup(double);
                     self.fp_put(rd, double);
                     return Ok(());
                 }

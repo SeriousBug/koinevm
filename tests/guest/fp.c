@@ -394,6 +394,33 @@ static void upper_lanes(void) {
  * the bits it is about and puts the register back in the same asm block, so nothing else in the
  * program runs under anything but the default. The native build is the oracle for these too: an
  * Apple aarch64 honours a written FPCR, which is what makes it one. */
+/* The host's clang lays this fixture's mergeable string literals out one byte short now and
+ * then, which would corrupt a heading, so they are writable arrays here: those it does not
+ * merge. */
+static char H_READ_BACK[] = "fpcr read back";
+static char H_SCVTF_D[] = "fpcr scvtf d";
+static char H_SCVTF_S[] = "fpcr scvtf s";
+static char H_SCVTF_FIXED[] = "fpcr scvtf fixed";
+static char H_FCVT[] = "fpcr fcvt";
+static char H_FRINTX[] = "fpcr frintx";
+static char H_FRINTI[] = "fpcr frinti";
+static char H_FRINT_V[] = "fpcr frint vector";
+static char H_FCVTN[] = "fpcr fcvtn";
+static char H_FZ[] = "fpcr fz";
+static char H_NO_FZ[] = "fpcr no fz";
+static char H_DN[] = "fpcr dn";
+static char H_NO_DN[] = "fpcr no dn";
+static char H_D_ADD[] = "d add";
+static char H_D_SUB[] = "d sub";
+static char H_D_MUL[] = "d mul";
+static char H_D_DIV[] = "d div";
+static char H_D_SQRT[] = "d sqrt";
+static char H_S_ADD[] = "s add";
+static char H_S_MUL[] = "s mul";
+static char H_S_DIV[] = "s div";
+static char H_S_SQRT[] = "s sqrt";
+static char H_CONVERT[] = "convert";
+
 #define FPCR_RM(m) ((unsigned long)(m) << 22)
 #define FPCR_FZ (1UL << 24)
 #define FPCR_DN (1UL << 25)
@@ -652,10 +679,10 @@ static const unsigned long rm_d[] = {
 };
 
 static void fpcr_rounding(void) {
-    put_name("fpcr read back");
+    put_name(H_READ_BACK);
     put_bits(fpcr_read());
 
-    put_name("fpcr scvtf d");
+    put_name(H_SCVTF_D);
     for (unsigned long m = 0; m < 4; m++) {
         for (unsigned long i = 0; i < sizeof rm_i64 / sizeof rm_i64[0]; i++)
             put_bits(d_scvtf(rm_i64[i], FPCR_RM(m)));
@@ -663,7 +690,7 @@ static void fpcr_rounding(void) {
             put_bits(d_ucvtf(rm_u64[i], FPCR_RM(m)));
     }
 
-    put_name("fpcr scvtf s");
+    put_name(H_SCVTF_S);
     for (unsigned long m = 0; m < 4; m++) {
         for (unsigned long i = 0; i < sizeof rm_i64 / sizeof rm_i64[0]; i++)
             put_bits32(s_scvtf(rm_i64[i], FPCR_RM(m)));
@@ -675,7 +702,7 @@ static void fpcr_rounding(void) {
         put_bits32(s_ucvtf_w(0x1000001u, FPCR_RM(m)));
     }
 
-    put_name("fpcr scvtf fixed");
+    put_name(H_SCVTF_FIXED);
     for (unsigned long m = 0; m < 4; m++) {
         for (unsigned long i = 0; i < sizeof rm_i64 / sizeof rm_i64[0]; i++) {
             put_bits(d_scvtf_fixed(rm_i64[i], 2, FPCR_RM(m)));
@@ -685,7 +712,7 @@ static void fpcr_rounding(void) {
         }
     }
 
-    put_name("fpcr fcvt");
+    put_name(H_FCVT);
     for (unsigned long m = 0; m < 4; m++) {
         for (unsigned long i = 0; i < sizeof rm_d / sizeof rm_d[0]; i++) {
             put_bits32(s_fcvt_in(rm_d[i], FPCR_RM(m)));
@@ -693,19 +720,19 @@ static void fpcr_rounding(void) {
         }
     }
 
-    put_name("fpcr frintx");
+    put_name(H_FRINTX);
     for (unsigned long m = 0; m < 4; m++)
         for (unsigned long i = 0; i < sizeof rm_d / sizeof rm_d[0]; i++)
             put_bits(fpcr_d_frintx(d_of(rm_d[i]), FPCR_RM(m)));
 
-    put_name("fpcr frinti");
+    put_name(H_FRINTI);
     for (unsigned long m = 0; m < 4; m++)
         for (unsigned long i = 0; i < sizeof rm_d / sizeof rm_d[0]; i++) {
             put_bits(fpcr_d_frinti(d_of(rm_d[i]), FPCR_RM(m)));
             put_bits32(fpcr_s_frintx(f_of((unsigned int)rm_d[i]), FPCR_RM(m)));
         }
 
-    put_name("fpcr frint vector");
+    put_name(H_FRINT_V);
     for (unsigned long m = 0; m < 4; m++)
         for (int insn = 0; insn < 2; insn++)
             for (unsigned long i = 0; i + 1 < sizeof rm_d / sizeof rm_d[0]; i += 2) {
@@ -715,7 +742,7 @@ static void fpcr_rounding(void) {
                 put_bits(out[1]);
             }
 
-    put_name("fpcr fcvtn");
+    put_name(H_FCVTN);
     for (unsigned long m = 0; m < 4; m++)
         for (int upper = 0; upper < 2; upper++)
             for (unsigned long i = 0; i + 1 < sizeof rm_d / sizeof rm_d[0]; i += 2) {
@@ -752,42 +779,42 @@ static const unsigned long fz_s[] = {
 static void fpcr_flush_denormals(void) {
     for (int on = 0; on < 2; on++) {
         unsigned long f = on ? FPCR_FZ : 0;
-        put_name(on ? "fpcr fz" : "fpcr no fz");
-        put_name("d add");
+        put_name(on ? H_FZ : H_NO_FZ);
+        put_name(H_D_ADD);
         for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
             for (unsigned long j = 0; j < sizeof fz_d / sizeof fz_d[0]; j++)
                 put_bits(fz_d_fadd(fz_d[i], fz_d[j], f));
-        put_name("d sub");
+        put_name(H_D_SUB);
         for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
             for (unsigned long j = 0; j < sizeof fz_d / sizeof fz_d[0]; j++)
                 put_bits(fz_d_fsub(fz_d[i], fz_d[j], f));
-        put_name("d mul");
+        put_name(H_D_MUL);
         for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
             for (unsigned long j = 0; j < sizeof fz_d / sizeof fz_d[0]; j++)
                 put_bits(fz_d_fmul(fz_d[i], fz_d[j], f));
-        put_name("d div");
+        put_name(H_D_DIV);
         for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
             for (unsigned long j = 0; j < sizeof fz_d / sizeof fz_d[0]; j++)
                 put_bits(fz_d_fdiv(fz_d[i], fz_d[j], f));
-        put_name("d sqrt");
+        put_name(H_D_SQRT);
         for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
             put_bits(fz_d_fsqrt(fz_d[i], f));
-        put_name("s add");
+        put_name(H_S_ADD);
         for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
             for (unsigned long j = 0; j < sizeof fz_s / sizeof fz_s[0]; j++)
                 put_bits32((unsigned int)fz_s_fadd(fz_s[i], fz_s[j], f));
-        put_name("s mul");
+        put_name(H_S_MUL);
         for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
             for (unsigned long j = 0; j < sizeof fz_s / sizeof fz_s[0]; j++)
                 put_bits32((unsigned int)fz_s_fmul(fz_s[i], fz_s[j], f));
-        put_name("s div");
+        put_name(H_S_DIV);
         for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
             for (unsigned long j = 0; j < sizeof fz_s / sizeof fz_s[0]; j++)
                 put_bits32((unsigned int)fz_s_fdiv(fz_s[i], fz_s[j], f));
-        put_name("s sqrt");
+        put_name(H_S_SQRT);
         for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
             put_bits32((unsigned int)fz_s_fsqrt(fz_s[i], f));
-        put_name("convert");
+        put_name(H_CONVERT);
         for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
             put_bits32(s_fcvt_in(fz_d[i], f));
         for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
@@ -799,7 +826,7 @@ static void fpcr_flush_denormals(void) {
 static void fpcr_default_nan(void) {
     for (int on = 0; on < 2; on++) {
         unsigned long f = on ? FPCR_DN : 0;
-        put_name(on ? "fpcr dn" : "fpcr no dn");
+        put_name(on ? H_DN : H_NO_DN);
         for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++) {
             put_bits(fz_d_fadd(fz_d[i], 0x3ff0000000000000UL, f));
             put_bits(fz_d_fmul(fz_d[i], 0x3ff0000000000000UL, f));
