@@ -97,7 +97,16 @@ pipe: only the descriptors that name the console answer `tcgetattr`, and everyth
 and reading until a read fails, so `O_NONBLOCK` has to stick to a console descriptor the way it
 sticks to any other: the standard descriptors carry an open file description for it. With both,
 `apt-get install` unpacks and configures on the console, and the `[Y/n]` it asks before a removal is
-answered with `y`.
+answered with `y` or declined with `n`.
+
+A signal the guest catches runs the guest's own code, because the interrupt reaches every process
+that has not ignored it - the shell and the command it waits for, which is one process group's worth.
+`Ctrl-C` ends the `sleep` a shell is waiting for, prints `KeyboardInterrupt` and a fresh prompt from
+a Python REPL, and runs a `trap` in a `dash` script. A handler that a libc installs names no
+restorer, because an aarch64 kernel ends every handler at its own trampoline in the vDSO: this
+machine recognises that return as `rt_sigreturn` and puts the frame the signal left back on the
+stack. A pager wants all of it: `less /etc/os-release` takes the screen, pages on a space, quits on
+`q`, and gives the shell its terminal back.
 
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
