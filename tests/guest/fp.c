@@ -389,6 +389,437 @@ static void upper_lanes(void) {
     put('\n');
 }
 
+/* FPCR is the guest's own state: RMode picks the rounding of the instructions that have no mode
+ * of their own, FZ flushes denormals and DN makes every NaN result the default one. Each case sets
+ * the bits it is about and puts the register back in the same asm block, so nothing else in the
+ * program runs under anything but the default. The native build is the oracle for these too: an
+ * Apple aarch64 honours a written FPCR, which is what makes it one. */
+#define FPCR_RM(m) ((unsigned long)(m) << 22)
+#define FPCR_FZ (1UL << 24)
+#define FPCR_DN (1UL << 25)
+
+static unsigned long fpcr_read(void) {
+    unsigned long v;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(v));
+    return v;
+}
+
+static unsigned long d_scvtf(long v, unsigned long fpcr) {
+    double r;
+    __asm__ volatile("msr fpcr, %2\nscvtf %d0, %1\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+    return u_of_d(r);
+}
+
+static unsigned long d_ucvtf(unsigned long v, unsigned long fpcr) {
+    double r;
+    __asm__ volatile("msr fpcr, %2\nucvtf %d0, %1\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+    return u_of_d(r);
+}
+
+static unsigned long s_scvtf(long v, unsigned long fpcr) {
+    float r;
+    __asm__ volatile("msr fpcr, %2\nscvtf %s0, %1\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+    return u_of_f(r);
+}
+
+static unsigned long s_ucvtf(unsigned long v, unsigned long fpcr) {
+    float r;
+    __asm__ volatile("msr fpcr, %2\nucvtf %s0, %1\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+    return u_of_f(r);
+}
+
+static unsigned long s_scvtf_w(int v, unsigned long fpcr) {
+    float r;
+    __asm__ volatile("msr fpcr, %2\nscvtf %s0, %w1\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+    return u_of_f(r);
+}
+
+static unsigned long s_ucvtf_w(unsigned int v, unsigned long fpcr) {
+    float r;
+    __asm__ volatile("msr fpcr, %2\nucvtf %s0, %w1\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+    return u_of_f(r);
+}
+
+static unsigned long d_scvtf_fixed(long v, unsigned fbits, unsigned long fpcr) {
+    double r;
+    switch (fbits) {
+    case 2:
+        __asm__ volatile("msr fpcr, %2\nscvtf %d0, %1, #2\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+        break;
+    case 63:
+        __asm__ volatile("msr fpcr, %2\nscvtf %d0, %1, #63\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+        break;
+    default:
+        __asm__ volatile("msr fpcr, %2\nucvtf %d0, %1, #40\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+        break;
+    }
+    return u_of_d(r);
+}
+
+static unsigned long s_scvtf_fixed(long v, unsigned fbits, unsigned long fpcr) {
+    float r;
+    switch (fbits) {
+    case 3:
+        __asm__ volatile("msr fpcr, %2\nscvtf %s0, %1, #3\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+        break;
+    default:
+        __asm__ volatile("msr fpcr, %2\nucvtf %s0, %1, #30\nmsr fpcr, xzr" : "=w"(r) : "r"(v), "r"(fpcr));
+        break;
+    }
+    return u_of_f(r);
+}
+
+static unsigned long s_fcvt_in(unsigned long v, unsigned long fpcr) {
+    float r;
+    __asm__ volatile("msr fpcr, %2\nfcvt %s0, %d1\nmsr fpcr, xzr" : "=w"(r) : "w"(d_of(v)), "r"(fpcr));
+    return u_of_f(r);
+}
+
+static unsigned long d_fcvt_in(unsigned long v, unsigned long fpcr) {
+    double r;
+    __asm__ volatile("msr fpcr, %2\nfcvt %d0, %s1\nmsr fpcr, xzr" : "=w"(r) : "w"(f_of((unsigned int)v)), "r"(fpcr));
+    return u_of_d(r);
+}
+
+static unsigned long fpcr_d_frintx(double a, unsigned long fpcr) {
+    double r;
+    __asm__ volatile("msr fpcr, %2\nfrintx %d0, %d1\nmsr fpcr, xzr" : "=w"(r) : "w"(a), "r"(fpcr));
+    return u_of_d(r);
+}
+
+static unsigned long fpcr_d_frinti(double a, unsigned long fpcr) {
+    double r;
+    __asm__ volatile("msr fpcr, %2\nfrinti %d0, %d1\nmsr fpcr, xzr" : "=w"(r) : "w"(a), "r"(fpcr));
+    return u_of_d(r);
+}
+
+static unsigned long fpcr_s_frintx(float a, unsigned long fpcr) {
+    float r;
+    __asm__ volatile("msr fpcr, %2\nfrintx %s0, %s1\nmsr fpcr, xzr" : "=w"(r) : "w"(a), "r"(fpcr));
+    return u_of_f(r);
+}
+
+/* One operation under a given FPCR, on the bit patterns both sides agree on. */
+#define FPCR2_D(name, insn)                                                                   \
+    static unsigned long name(unsigned long a, unsigned long b, unsigned long fpcr) {          \
+        double r;                                                                             \
+        __asm__ volatile("msr fpcr, %3\n" insn " %d0, %d1, %d2\nmsr fpcr, xzr"                 \
+                         : "=w"(r)                                                            \
+                         : "w"(d_of(a)), "w"(d_of(b)), "r"(fpcr));                             \
+        return u_of_d(r);                                                                     \
+    }
+FPCR2_D(fz_d_fadd, "fadd")
+FPCR2_D(fz_d_fsub, "fsub")
+FPCR2_D(fz_d_fmul, "fmul")
+FPCR2_D(fz_d_fdiv, "fdiv")
+
+#define FPCR1_D(name, insn)                                                                   \
+    static unsigned long name(unsigned long a, unsigned long fpcr) {                          \
+        double r;                                                                             \
+        __asm__ volatile("msr fpcr, %2\n" insn " %d0, %d1\nmsr fpcr, xzr"                      \
+                         : "=w"(r) : "w"(d_of(a)), "r"(fpcr));                                 \
+        return u_of_d(r);                                                                     \
+    }
+FPCR1_D(fz_d_fsqrt, "fsqrt")
+
+#define FPCR2_S(name, insn)                                                                   \
+    static unsigned long name(unsigned long a, unsigned long b, unsigned long fpcr) {          \
+        float r;                                                                              \
+        __asm__ volatile("msr fpcr, %3\n" insn " %s0, %s1, %s2\nmsr fpcr, xzr"                 \
+                         : "=w"(r)                                                            \
+                         : "w"(f_of((unsigned int)a)), "w"(f_of((unsigned int)b)),             \
+                           "r"(fpcr));                                                        \
+        return u_of_f(r);                                                                     \
+    }
+FPCR2_S(fz_s_fadd, "fadd")
+FPCR2_S(fz_s_fmul, "fmul")
+FPCR2_S(fz_s_fdiv, "fdiv")
+
+#define FPCR1_S(name, insn)                                                                   \
+    static unsigned long name(unsigned long a, unsigned long fpcr) {                          \
+        float r;                                                                              \
+        __asm__ volatile("msr fpcr, %2\n" insn " %s0, %s1\nmsr fpcr, xzr"                      \
+                         : "=w"(r) : "w"(f_of((unsigned int)a)), "r"(fpcr));                   \
+        return u_of_f(r);                                                                     \
+    }
+FPCR1_S(fz_s_fsqrt, "fsqrt")
+
+/* The vector narrowing, which has no mode of its own either: two doubles in, two singles out.
+ * The 16 bytes are what the whole register holds, which is what says fcvtn2 kept the low half. */
+static void fcvtn_bits(unsigned long lo, unsigned long hi, unsigned long fpcr, int upper,
+                       unsigned long *out) {
+    unsigned char buf[16];
+    if (upper) {
+        __asm__ volatile("movi v0.16b, #0xff\n"
+                         "fmov d1, %1\n"
+                         "fmov d2, %2\n"
+                         "msr fpcr, %3\n"
+                         "fcvtn2 v0.4s, v1.2d\n"
+                         "msr fpcr, xzr\n"
+                         "str q0, [%0]"
+                         :
+                         : "r"(buf), "r"(lo), "r"(hi), "r"(fpcr)
+                         : "v0", "v1", "v2", "memory");
+    } else {
+        __asm__ volatile("fmov d0, %1\n"
+                         "fmov d1, %2\n"
+                         "msr fpcr, %3\n"
+                         "fcvtn v0.2s, v0.2d\n"
+                         "msr fpcr, xzr\n"
+                         "str q0, [%0]"
+                         :
+                         : "r"(buf), "r"(lo), "r"(hi), "r"(fpcr)
+                         : "v0", "v1", "memory");
+    }
+    for (int i = 0; i < 4; i++) {
+        out[i] = (unsigned long)buf[4 * i] | ((unsigned long)buf[4 * i + 1] << 8) |
+                 ((unsigned long)buf[4 * i + 2] << 16) | ((unsigned long)buf[4 * i + 3] << 24);
+    }
+}
+
+/* The vector rounding family under FPCR's mode, which is the same question the scalar one asks. */
+static void frint_vector(unsigned long lo, unsigned long hi, unsigned long fpcr, int insn,
+                         unsigned long fpcr2, unsigned long *out) {
+    unsigned char buf[16];
+    if (insn == 0) {
+        __asm__ volatile("fmov d0, %1\n"
+                         "fmov d1, %2\n"
+                         "msr fpcr, %3\n"
+                         "frintx v0.2d, v0.2d\n"
+                         "msr fpcr, xzr\n"
+                         "str q0, [%0]"
+                         :
+                         : "r"(buf), "r"(lo), "r"(hi), "r"(fpcr)
+                         : "v0", "v1", "memory");
+    } else {
+        __asm__ volatile("fmov d0, %1\n"
+                         "fmov d1, %2\n"
+                         "msr fpcr, %3\n"
+                         "frinti v0.2d, v0.2d\n"
+                         "msr fpcr, xzr\n"
+                         "str q0, [%0]"
+                         :
+                         : "r"(buf), "r"(lo), "r"(hi), "r"(fpcr)
+                         : "v0", "v1", "memory");
+    }
+    (void)fpcr2;
+    for (int i = 0; i < 2; i++) {
+        out[i] = 0;
+        for (int k = 0; k < 8; k++) out[i] |= (unsigned long)buf[8 * i + k] << (8 * k);
+    }
+}
+
+/* Values that only a rounding mode can tell apart: a mantissa that ends in the middle of a step,
+ * halfway cases in both signs, and values whose step is the whole number. */
+static const long rm_i64[] = {
+    0x20000000000001L,   /* 2^53+1 */
+    -0x20000000000001L,  /* -(2^53+1) */
+    0x20000000000003L,   /* 2^53+3 */
+    0x7fffffffffffffffL, /* 2^63-1 */
+    -0x8000000000000000L,
+    0x1000001L,          /* 2^24+1 */
+    -0x1000001L,
+    0x1ffffffL,          /* 2^25-1 */
+    3L,
+    -3L,
+    0L,
+};
+static const unsigned long rm_u64[] = {
+    0xffffffffffffffffUL,
+    0x8000000000000001UL,
+    0x1000003UL,
+    1UL,
+};
+static const unsigned long rm_d[] = {
+    0x3ff0000008000000UL, /* 1 + 2^-24, halfway between two singles */
+    0x3ff0000018000000UL, /* 1 + 3*2^-24 */
+    0xbff0000008000000UL, /* -(1 + 2^-24) */
+    0x3ff0000008000001UL, /* just above the halfway */
+    0x3fefffffffffffffUL, /* just below 1 */
+    0x0000000000000001UL, /* 2^-1074, below the smallest single */
+    0x8000000000000001UL, /* -2^-1074 */
+    0x0000000000000003UL, /* 3*2^-1074 */
+    0x47efffffe0000000UL, /* just below the single overflow point */
+    0x4004000000000000UL, /* 2.5 */
+    0xc004000000000000UL, /* -2.5 */
+    0x3fe0000000000000UL, /* 0.5 */
+    0xbfe0000000000000UL, /* -0.5 */
+    0x400c000000000000UL, /* 3.5 */
+    0x3ff6666666666666UL, /* 1.4 */
+    0xbff6666666666666UL, /* -1.4 */
+    0x7ff0000000000000UL, /* +inf */
+    0x0000000000000000UL, /* +0 */
+};
+
+static void fpcr_rounding(void) {
+    put_name("fpcr read back");
+    put_bits(fpcr_read());
+
+    put_name("fpcr scvtf d");
+    for (unsigned long m = 0; m < 4; m++) {
+        for (unsigned long i = 0; i < sizeof rm_i64 / sizeof rm_i64[0]; i++)
+            put_bits(d_scvtf(rm_i64[i], FPCR_RM(m)));
+        for (unsigned long i = 0; i < sizeof rm_u64 / sizeof rm_u64[0]; i++)
+            put_bits(d_ucvtf(rm_u64[i], FPCR_RM(m)));
+    }
+
+    put_name("fpcr scvtf s");
+    for (unsigned long m = 0; m < 4; m++) {
+        for (unsigned long i = 0; i < sizeof rm_i64 / sizeof rm_i64[0]; i++)
+            put_bits32(s_scvtf(rm_i64[i], FPCR_RM(m)));
+        for (unsigned long i = 0; i < sizeof rm_u64 / sizeof rm_u64[0]; i++)
+            put_bits32(s_ucvtf(rm_u64[i], FPCR_RM(m)));
+        for (unsigned long i = 0; i < sizeof rm_i64 / sizeof rm_i64[0]; i++)
+            put_bits32(s_scvtf_w((int)rm_i64[i], FPCR_RM(m)));
+        put_bits32(s_ucvtf_w(0xffffffffu, FPCR_RM(m)));
+        put_bits32(s_ucvtf_w(0x1000001u, FPCR_RM(m)));
+    }
+
+    put_name("fpcr scvtf fixed");
+    for (unsigned long m = 0; m < 4; m++) {
+        for (unsigned long i = 0; i < sizeof rm_i64 / sizeof rm_i64[0]; i++) {
+            put_bits(d_scvtf_fixed(rm_i64[i], 2, FPCR_RM(m)));
+            put_bits(d_scvtf_fixed(rm_i64[i], 63, FPCR_RM(m)));
+            put_bits32(s_scvtf_fixed(rm_i64[i], 3, FPCR_RM(m)));
+            put_bits32(s_scvtf_fixed(rm_i64[i], 30, FPCR_RM(m)));
+        }
+    }
+
+    put_name("fpcr fcvt");
+    for (unsigned long m = 0; m < 4; m++) {
+        for (unsigned long i = 0; i < sizeof rm_d / sizeof rm_d[0]; i++) {
+            put_bits32(s_fcvt_in(rm_d[i], FPCR_RM(m)));
+            put_bits(d_fcvt_in(rm_d[i], FPCR_RM(m)));
+        }
+    }
+
+    put_name("fpcr frintx");
+    for (unsigned long m = 0; m < 4; m++)
+        for (unsigned long i = 0; i < sizeof rm_d / sizeof rm_d[0]; i++)
+            put_bits(fpcr_d_frintx(d_of(rm_d[i]), FPCR_RM(m)));
+
+    put_name("fpcr frinti");
+    for (unsigned long m = 0; m < 4; m++)
+        for (unsigned long i = 0; i < sizeof rm_d / sizeof rm_d[0]; i++) {
+            put_bits(fpcr_d_frinti(d_of(rm_d[i]), FPCR_RM(m)));
+            put_bits32(fpcr_s_frintx(f_of((unsigned int)rm_d[i]), FPCR_RM(m)));
+        }
+
+    put_name("fpcr frint vector");
+    for (unsigned long m = 0; m < 4; m++)
+        for (int insn = 0; insn < 2; insn++)
+            for (unsigned long i = 0; i + 1 < sizeof rm_d / sizeof rm_d[0]; i += 2) {
+                unsigned long out[2];
+                frint_vector(rm_d[i], rm_d[i + 1], FPCR_RM(m), insn, 0, out);
+                put_bits(out[0]);
+                put_bits(out[1]);
+            }
+
+    put_name("fpcr fcvtn");
+    for (unsigned long m = 0; m < 4; m++)
+        for (int upper = 0; upper < 2; upper++)
+            for (unsigned long i = 0; i + 1 < sizeof rm_d / sizeof rm_d[0]; i += 2) {
+                unsigned long out[4];
+                fcvtn_bits(rm_d[i], rm_d[i + 1], FPCR_RM(m), upper, out);
+                for (int k = 0; k < 4; k++) put_bits32((unsigned int)out[k]);
+            }
+}
+
+/* Denormals: the smallest ones as inputs, and operations whose exact result is one. */
+static const unsigned long fz_d[] = {
+    0x0000000000000001UL, /* 2^-1074 */
+    0x8000000000000001UL,
+    0x0000000000000003UL,
+    0x000fffffffffffffUL, /* the largest denormal */
+    0x0010000000000000UL, /* the smallest normal */
+    0x3fe0000000000000UL, /* 0.5 */
+    0x4000000000000000UL, /* 2.0 */
+    0x7ff0000000000000UL, /* +inf */
+    0x7ff8000000000001UL, /* a quiet NaN with a payload */
+};
+static const unsigned long fz_s[] = {
+    0x00000001UL, /* 2^-149 */
+    0x80000001UL,
+    0x00000003UL,
+    0x007fffffUL, /* the largest denormal */
+    0x00800000UL, /* the smallest normal */
+    0x3f000000UL, /* 0.5 */
+    0x40000000UL, /* 2.0 */
+    0x7f800000UL, /* +inf */
+    0x7fc00001UL, /* a quiet NaN with a payload */
+};
+
+static void fpcr_flush_denormals(void) {
+    for (int on = 0; on < 2; on++) {
+        unsigned long f = on ? FPCR_FZ : 0;
+        put_name(on ? "fpcr fz" : "fpcr no fz");
+        put_name("d add");
+        for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
+            for (unsigned long j = 0; j < sizeof fz_d / sizeof fz_d[0]; j++)
+                put_bits(fz_d_fadd(fz_d[i], fz_d[j], f));
+        put_name("d sub");
+        for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
+            for (unsigned long j = 0; j < sizeof fz_d / sizeof fz_d[0]; j++)
+                put_bits(fz_d_fsub(fz_d[i], fz_d[j], f));
+        put_name("d mul");
+        for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
+            for (unsigned long j = 0; j < sizeof fz_d / sizeof fz_d[0]; j++)
+                put_bits(fz_d_fmul(fz_d[i], fz_d[j], f));
+        put_name("d div");
+        for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
+            for (unsigned long j = 0; j < sizeof fz_d / sizeof fz_d[0]; j++)
+                put_bits(fz_d_fdiv(fz_d[i], fz_d[j], f));
+        put_name("d sqrt");
+        for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
+            put_bits(fz_d_fsqrt(fz_d[i], f));
+        put_name("s add");
+        for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
+            for (unsigned long j = 0; j < sizeof fz_s / sizeof fz_s[0]; j++)
+                put_bits32((unsigned int)fz_s_fadd(fz_s[i], fz_s[j], f));
+        put_name("s mul");
+        for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
+            for (unsigned long j = 0; j < sizeof fz_s / sizeof fz_s[0]; j++)
+                put_bits32((unsigned int)fz_s_fmul(fz_s[i], fz_s[j], f));
+        put_name("s div");
+        for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
+            for (unsigned long j = 0; j < sizeof fz_s / sizeof fz_s[0]; j++)
+                put_bits32((unsigned int)fz_s_fdiv(fz_s[i], fz_s[j], f));
+        put_name("s sqrt");
+        for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
+            put_bits32((unsigned int)fz_s_fsqrt(fz_s[i], f));
+        put_name("convert");
+        for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++)
+            put_bits32(s_fcvt_in(fz_d[i], f));
+        for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++)
+            put_bits(d_fcvt_in(fz_s[i], f));
+    }
+}
+
+/* The default NaN, which is what DN asks for instead of the payload an operation would carry. */
+static void fpcr_default_nan(void) {
+    for (int on = 0; on < 2; on++) {
+        unsigned long f = on ? FPCR_DN : 0;
+        put_name(on ? "fpcr dn" : "fpcr no dn");
+        for (unsigned long i = 0; i < sizeof fz_d / sizeof fz_d[0]; i++) {
+            put_bits(fz_d_fadd(fz_d[i], 0x3ff0000000000000UL, f));
+            put_bits(fz_d_fmul(fz_d[i], 0x3ff0000000000000UL, f));
+            put_bits(fz_d_fdiv(fz_d[i], 0x4000000000000000UL, f));
+            put_bits(fz_d_fsqrt(fz_d[i], f));
+            put_bits(fpcr_d_frintx(d_of(fz_d[i]), f));
+        }
+        for (unsigned long i = 0; i < sizeof fz_s / sizeof fz_s[0]; i++) {
+            put_bits32((unsigned int)fz_s_fadd(fz_s[i], 0x3f800000UL, f));
+            put_bits32((unsigned int)fz_s_fmul(fz_s[i], 0x3f800000UL, f));
+            put_bits32((unsigned int)fz_s_fsqrt(fz_s[i], f));
+            put_bits32(s_fcvt_in(0x7ff8000000000001UL, f));
+        }
+        put_bits(fz_d_fadd(0x7ff8000000000123UL, 0x7ff0000000000123UL, f));
+        put_bits(fz_d_fdiv(0UL, 0UL, f));
+        put_bits(fz_d_fsub(0x7ff0000000000000UL, 0x7ff0000000000000UL, f));
+        put_bits32((unsigned int)fz_s_fdiv(0UL, 0UL, f));
+    }
+}
+
 static const unsigned long dvals[] = {
     0x0000000000000000UL, /* +0 */
     0x8000000000000000UL, /* -0 */
@@ -565,6 +996,10 @@ __attribute__((used)) void GUEST_ENTRY(void) {
 
     put_name("upper lanes");
     upper_lanes();
+
+    fpcr_rounding();
+    fpcr_flush_denormals();
+    fpcr_default_nan();
 
     fcvt_same_register();
 

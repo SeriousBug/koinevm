@@ -2687,7 +2687,9 @@ impl<'a> RegionEmitter<'a> {
         self.f.lg(L_F0);
         self.f.op(F32_DEMOTE_F64);
         self.f.ls(L_S0);
-        // Which way the answer lies from the nearest f32, as a step of -1, 0 or 1.
+        // Which way the answer lies from the nearest f32, as a step of -1, 0 or 1 on the pattern.
+        // A step there moves the magnitude either way depending on the sign, so towards +inf is
+        // one up above zero and one down below it, and towards zero is always one down.
         self.f.i32c(0);
         self.f.ls(L_TI);
         self.fpcr_rmode();
@@ -2698,8 +2700,7 @@ impl<'a> RegionEmitter<'a> {
         self.narrow_beyond(true);
         self.f.op(IF);
         self.f.body.push(0x40);
-        self.f.i32c(1);
-        self.f.ls(L_TI);
+        self.narrow_step(1, -1);
         self.f.end();
         self.f.end();
         self.fpcr_rmode();
@@ -2710,15 +2711,27 @@ impl<'a> RegionEmitter<'a> {
         self.narrow_beyond(false);
         self.f.op(IF);
         self.f.body.push(0x40);
+        self.narrow_step(-1, 1);
+        self.f.end();
+        self.f.end();
+        self.fpcr_rmode();
+        self.f.i32c(3);
+        self.f.op(I32_EQ);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.f.lg(L_S0);
+        self.f.op(F64_PROMOTE_F32);
+        self.f.op(F64_ABS);
+        self.f.lg(L_F0);
+        self.f.op(F64_ABS);
+        self.f.op(F64_GT);
+        self.f.op(IF);
+        self.f.body.push(0x40);
         self.f.i32c(-1);
         self.f.ls(L_TI);
         self.f.end();
         self.f.end();
         // A step off zero lands on the smallest denormal, whose pattern is not zero minus one.
-        self.f.lg(L_S0);
-        self.f.op(I32_REINTERPRET_F32);
-        self.f.lg(L_TI);
-        self.f.op(I32_ADD);
         self.f.lg(L_F0);
         self.fp_const(0, true);
         self.f.op(F64_LT);
@@ -2728,6 +2741,10 @@ impl<'a> RegionEmitter<'a> {
         self.f.op(ELSE);
         self.f.i32c(1);
         self.f.end();
+        self.f.lg(L_S0);
+        self.f.op(I32_REINTERPRET_F32);
+        self.f.lg(L_TI);
+        self.f.op(I32_ADD);
         self.f.lg(L_S0);
         self.f.op(I32_REINTERPRET_F32);
         self.f.i32c(0x7fff_ffff);
@@ -2742,12 +2759,171 @@ impl<'a> RegionEmitter<'a> {
         self.f.end();
     }
 
+    /// The pattern step for a source of this sign: `positive` above zero, `negative` below it.
+    fn narrow_step(&mut self, positive: i32, negative: i32) {
+        self.f.lg(L_F0);
+        self.fp_const(0, true);
+        self.f.op(F64_LT);
+        self.f.op(IF);
+        self.f.body.push(I32);
+        self.f.i32c(negative);
+        self.f.op(ELSE);
+        self.f.i32c(positive);
+        self.f.end();
+        self.f.ls(L_TI);
+    }
+
     /// Whether the nearest f32 of `L_F0` is above it (`up`) or below it.
     fn narrow_beyond(&mut self, up: bool) {
         self.f.lg(L_S0);
         self.f.op(F64_PROMOTE_F32);
         self.f.lg(L_F0);
         self.f.op(if up { F64_LT } else { F64_GT });
+    }
+
+    /// The integer on the stack as a float, rounded in the mode FPCR names. `sf` and `signed` are
+    /// the guest's register, `double` the width written, and `fbits` the fixed-point form's count,
+    /// which scales by an exact power of two after the one rounding the instruction asks for.
+    fn fp_from_int(&mut self, sf: bool, signed: bool, double: bool, fbits: u32) {
+        let ty = if double { F64 } else { F32 };
+        let tmp = if double { L_F0 } else { L_S0 };
+        let to_float = match (sf, double, signed) {
+            (true, true, false) => F64_CONVERT_I64_U,
+            (true, true, true) => F64_CONVERT_I64_S,
+            (true, false, false) => F32_CONVERT_I64_U,
+            (true, false, true) => F32_CONVERT_I64_S,
+            (false, true, false) => F64_CONVERT_I32_U,
+            (false, true, true) => F64_CONVERT_I32_S,
+            (false, false, false) => F32_CONVERT_I32_U,
+            (false, false, true) => F32_CONVERT_I32_S,
+        };
+        if sf {
+            self.f.ls(L_T0);
+        } else {
+            self.f.ls(L_TI);
+        }
+        self.fpcr_rmode();
+        self.f.op(I32_EQZ);
+        self.f.op(IF);
+        self.f.body.push(ty);
+        self.f.lg(if sf { L_T0 } else { L_TI });
+        self.f.op(to_float);
+        self.fp_scale(fbits, double);
+        self.f.op(ELSE);
+        if !sf {
+            self.f.lg(L_TI);
+            self.f.op(if signed { I64_EXTEND_I32_S } else { I64_EXTEND_I32_U });
+            self.f.ls(L_T0);
+        }
+        // The exact value is the integer itself, so the rounding happens on the integer: drop the
+        // low bits the significand cannot hold, and add the step those bits are worth when the mode
+        // wants the value that dropping them cannot reach. The magnitude is rounded, and the sign
+        // carried separately, because a two's complement integer has no symmetric range.
+        if signed {
+            self.f.lg(L_T0);
+            self.f.i64c(0);
+            self.f.op(I64_LT_S);
+            self.f.ls(L_TI);
+            self.f.lg(L_TI);
+            self.f.op(IF);
+            self.f.body.push(I64);
+            self.f.i64c(0);
+            self.f.lg(L_T0);
+            self.f.op(I64_SUB);
+            self.f.op(ELSE);
+            self.f.lg(L_T0);
+            self.f.end();
+        } else {
+            self.f.i32c(0);
+            self.f.ls(L_TI);
+            self.f.lg(L_T0);
+        }
+        self.f.ls(L_T1);
+        // The shift is how far the significand falls short of the magnitude's own length, and zero
+        // when the whole number fits.
+        self.f.i64c(64);
+        self.f.lg(L_T1);
+        self.f.op(I64_CLZ);
+        self.f.op(I64_SUB);
+        self.f.i64c(if double { 53 } else { 24 });
+        self.f.op(I64_SUB);
+        self.f.ls(L_T2);
+        self.f.lg(L_T2);
+        self.f.lg(L_T2);
+        self.f.i64c(63);
+        self.f.op(I64_SHR_S);
+        self.f.i64c(-1);
+        self.f.op(I64_XOR);
+        self.f.op(I64_AND);
+        self.f.ls(L_T2);
+        self.f.i64c(1);
+        self.f.lg(L_T2);
+        self.f.op(I64_SHL);
+        self.f.ls(L_T3);
+        self.f.lg(L_T1);
+        self.f.lg(L_T3);
+        self.f.i64c(1);
+        self.f.op(I64_SUB);
+        self.f.op(I64_AND);
+        self.f.ls(L_T4);
+        self.f.lg(L_T1);
+        self.f.lg(L_T4);
+        self.f.op(I64_SUB);
+        self.f.ls(L_T1);
+        // Upwards is what rounding away from zero by a power of two means, and which way that is
+        // depends on the sign: towards +inf above zero, towards -inf below it.
+        self.f.lg(L_T4);
+        self.f.op(I64_EQZ);
+        self.f.op(I32_EQZ);
+        self.fpcr_rmode();
+        self.f.i32c(1);
+        self.f.op(I32_EQ);
+        self.f.lg(L_TI);
+        self.f.op(I32_EQZ);
+        self.f.op(I32_AND);
+        self.fpcr_rmode();
+        self.f.i32c(2);
+        self.f.op(I32_EQ);
+        self.f.lg(L_TI);
+        self.f.op(I32_AND);
+        self.f.op(I32_OR);
+        self.f.op(I32_AND);
+        self.f.op(IF);
+        self.f.body.push(ty);
+        self.f.lg(L_T1);
+        self.f.op(if double { F64_CONVERT_I64_U } else { F32_CONVERT_I64_U });
+        self.f.lg(L_T3);
+        self.f.op(if double { F64_CONVERT_I64_U } else { F32_CONVERT_I64_U });
+        self.f.op(if double { F64_ADD } else { F32_ADD });
+        self.f.op(ELSE);
+        self.f.lg(L_T1);
+        self.f.op(if double { F64_CONVERT_I64_U } else { F32_CONVERT_I64_U });
+        self.f.end();
+        self.f.ls(tmp);
+        self.f.lg(L_TI);
+        self.f.op(IF);
+        self.f.body.push(ty);
+        self.f.lg(tmp);
+        self.f.op(if double { F64_NEG } else { F32_NEG });
+        self.f.op(ELSE);
+        self.f.lg(tmp);
+        self.f.end();
+        self.fp_scale(fbits, double);
+        self.f.end();
+    }
+
+    /// The fixed-point form's exact scaling, which only moves the significand unless the result
+    /// lands in the denormal range.
+    fn fp_scale(&mut self, fbits: u32, double: bool) {
+        if fbits > 0 {
+            if double {
+                self.f.f64c(2f64.powi(-(fbits as i32)).to_bits());
+                self.f.op(F64_MUL);
+            } else {
+                self.f.f32c(2f32.powi(-(fbits as i32)).to_bits());
+                self.f.op(F32_MUL);
+            }
+        }
     }
 
     fn fp_get(&mut self, r: u32, double: bool) {
@@ -5811,26 +5987,9 @@ impl<'a> RegionEmitter<'a> {
                         self.f.simd_lane(simd::F32X4_REPLACE_LANE, 0);
                     }
                 } else {
-                    // scvtf/ucvtf: an integer converted to FP.
-                    if sf {
-                        self.get(rn, true);
-                        self.f.op(if double {
-                            if signed { F64_CONVERT_I64_S } else { F64_CONVERT_I64_U }
-                        } else if signed {
-                            F32_CONVERT_I64_S
-                        } else {
-                            F32_CONVERT_I64_U
-                        });
-                    } else {
-                        self.get(rn, false);
-                        self.f.op(if double {
-                            if signed { F64_CONVERT_I32_S } else { F64_CONVERT_I32_U }
-                        } else if signed {
-                            F32_CONVERT_I32_S
-                        } else {
-                            F32_CONVERT_I32_U
-                        });
-                    }
+                    // scvtf/ucvtf: an integer converted to FP, rounded in the mode FPCR holds.
+                    self.get(rn, sf);
+                    self.fp_from_int(sf, signed, double, 0);
                     self.f.simd_lane(if double { simd::F64X2_REPLACE_LANE } else { simd::F32X4_REPLACE_LANE }, 0);
                 }
                 self.setv(rd);
@@ -6152,49 +6311,25 @@ impl<'a> RegionEmitter<'a> {
                 self.fp_put(rd, double);
             }
             Insn::FpFromInt { double, unsigned, rn, rd } => {
-                // The register holds an integer in its low lane, which becomes a float. The
-                // conversion is exact up to the mantissa, which is what the instruction does.
+                // The register holds an integer in its low lane, which becomes a float rounded in
+                // the mode FPCR holds.
                 self.fp_base();
                 self.getv(rn);
-                if double {
-                    self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
-                    self.f.op(if unsigned { F64_CONVERT_I64_U } else { F64_CONVERT_I64_S });
-                } else if unsigned {
-                    self.f.simd_lane(simd::I32X4_EXTRACT_LANE, 0);
-                    self.f.op(F32_CONVERT_I32_U);
-                } else {
-                    self.f.simd_lane(simd::I32X4_EXTRACT_LANE, 0);
-                    self.f.op(F32_CONVERT_I32_S);
-                }
+                self.f.simd_lane(if double { simd::I64X2_EXTRACT_LANE } else { simd::I32X4_EXTRACT_LANE }, 0);
+                self.fp_from_int(double, !unsigned, double, 0);
                 self.fp_put(rd, double);
             }
             Insn::FpFromIntFixed { sf, unsigned, size, fbits, rn, rd } => {
-                // The integer becomes a float, then scales by a power of two: scaling moves the
-                // significand without changing it, so the one rounding the instruction asks for is
-                // the one that happens.
+                // The integer becomes a float rounded in the mode FPCR holds, then scales by a
+                // power of two: scaling moves the significand without changing it, so the one
+                // rounding the instruction asks for is the one that happens.
                 if size > 1 {
                     return self.refuse(format!("half precision floating point at 0x{addr:x}"));
                 }
                 let double = size == 1;
                 self.fp_base();
                 self.get(rn, sf);
-                self.f.op(match (sf, double, unsigned) {
-                    (true, true, false) => F64_CONVERT_I64_S,
-                    (true, true, true) => F64_CONVERT_I64_U,
-                    (true, false, false) => F32_CONVERT_I64_S,
-                    (true, false, true) => F32_CONVERT_I64_U,
-                    (false, true, false) => F64_CONVERT_I32_S,
-                    (false, true, true) => F64_CONVERT_I32_U,
-                    (false, false, false) => F32_CONVERT_I32_S,
-                    (false, false, true) => F32_CONVERT_I32_U,
-                });
-                if double {
-                    self.f.f64c(2f64.powi(-(fbits as i32)).to_bits());
-                    self.f.op(F64_MUL);
-                } else {
-                    self.f.f32c(2f32.powi(-(fbits as i32)).to_bits());
-                    self.f.op(F32_MUL);
-                }
+                self.fp_from_int(sf, !unsigned, double, fbits);
                 self.fp_put(rd, double);
             }
             Insn::FpToInt { double, unsigned, rmode, rn, rd } => {
