@@ -1134,6 +1134,7 @@ export class Kernel {
     out.writeInt32LE(p.code ?? SI_USER, 8);
     out.writeUInt32LE(p.pid ?? this.pid, 12);
     out.writeUInt32LE(p.uid ?? 0, 16);
+    out.writeInt32LE(p.status ?? 0, 40);
     return out;
   }
 

@@ -249,7 +249,7 @@ export class Session {
     // in the shadow: the last return from a region put it there.
     const entry = proc.kernel.takeSignal();
     if (entry) {
-      if (thread.pending) {
+      if (thread.pending && this.caught(proc, entry.sig)) {
         // The call it was waiting on is interrupted rather than restarted: the handler runs first,
         // and the frame remembers the -EINTR the guest will find when it returns.
         thread.pending = null;
@@ -421,13 +421,20 @@ export class Session {
   /// Hand the process the next signal it may take. The frame goes on the guest's stack, in the
   /// shape the kernel builds one, and the handler starts with the registers a call to it would
   /// have: the signal number, and the two pointers when the disposition asked for them.
+  /// Whether a signal has code of the guest's to run. An ignored one, and one whose default action
+  /// is not to end the process, has none, and a kernel drops it without interrupting a call.
+  caught(proc, sig) {
+    const act = proc.kernel.disposition(sig);
+    if (!act || act === "ignore" || act === "default") return false;
+    return Number(BigInt.asUintN(64, act.handler)) !== 0;
+  }
+
   deliver(proc, entry) {
     const kernel = proc.kernel;
     const view = new DataView(proc.memory.buffer);
+    if (!this.caught(proc, entry.sig)) return false;
     const act = kernel.disposition(entry.sig);
-    if (!act || act === "ignore" || act === "default") return false;
     const handler = Number(BigInt.asUintN(64, act.handler));
-    if (handler === 0) return false;
 
     const sp = view.getBigUint64(0xf8, true);
     const alt = kernel.altstack;
@@ -1015,8 +1022,11 @@ export class Session {
   }
 
   wait(proc, thread, request) {
+    // A child that has been reaped is gone from the table a `wait` is answered from: a program that
+    // loops until there is nothing left to wait for (`waitpid(-1, ..., WNOHANG)` returning -1) has
+    // to be told there is nothing left, or it loops for ever. `script` is one.
     const kids = this.processes.filter(
-      (c) => c.ppid === proc.pid && (request.pid <= 0 || c.pid === request.pid),
+      (c) => c.ppid === proc.pid && !c.reaped && (request.pid <= 0 || c.pid === request.pid),
     );
     if (kids.length === 0) return this.resume(proc, thread, -ECHILD);
     const done = kids.find((c) => c.state === "exited" && !c.reaped);
@@ -1132,12 +1142,7 @@ export class Session {
   /// The wait status a real kernel would give, and the rusage a program that asks for one reads.
   reap(parent, child, request) {
     const view = new DataView(parent.memory.buffer);
-    // A process that a signal ended reports the signal, not an exit code: the low seven bits are the
-    // one a `WIFSIGNALED` reader looks at.
-    if (request.wstatus) {
-      const status = child.signal ? child.signal & 0x7f : (child.code & 0xff) << 8;
-      view.setInt32(request.wstatus, status, true);
-    }
+    if (request.wstatus) view.setInt32(request.wstatus, this.statusOf(child), true);
     if (request.rusage) new Uint8Array(parent.memory.buffer).fill(0, request.rusage, request.rusage + 144);
     child.reaped = true;
     if (process.env.ARMJIT_TRACE_PROCESSES) {
@@ -1146,6 +1151,12 @@ export class Session {
           ` = ${request.wstatus ? view.getInt32(request.wstatus, true) : "none"}`,
       );
     }
+  }
+
+  /// The word a parent reads: the signal that ended the process in the low seven bits, which is
+  /// what a `WIFSIGNALED` reader looks at, or its exit code in the eight above them.
+  statusOf(proc) {
+    return proc.signal ? proc.signal & 0x7f : (proc.code & 0xff) << 8;
   }
 
   /// A thread that ended: the process goes with the last one, and `CLONE_CHILD_CLEARTID` is how a
@@ -1178,6 +1189,18 @@ export class Session {
     proc.kernel.files.closeAll();
     if (process.env.ARMJIT_TRACE_PROCESSES) {
       console.error(`exit: ${proc.pid} ${proc.signal ? `signal ${proc.signal}` : `status ${proc.code}`}`);
+    }
+    // The parent hears about the child that ended. Without this a program that never calls `wait4`
+    // - one that waits on a `signalfd`, or has a handler for `SIGCHLD` - would wait for ever, which
+    // is what `script`'s own event loop does.
+    const parent = this.processes.find((p) => p.pid === proc.ppid);
+    if (parent && parent !== proc && parent.state !== "exited") {
+      parent.kernel.queueSignal(17, {
+        code: proc.signal ? 2 : 1, // CLD_KILLED, CLD_EXITED
+        pid: proc.pid,
+        uid: 0,
+        status: this.statusOf(proc),
+      });
     }
     // A parent that was waiting for this one has something to see now, and a pipe this process
     // held the last writer of has reached its end.
