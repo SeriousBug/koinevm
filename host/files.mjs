@@ -69,6 +69,126 @@ function tracePath(op, text, result) {
   console.error(`${op} ${text} -> ${result}`);
 }
 
+const ISIG = 0x1;
+const ICANON = 0x2;
+/// Input translation: a carriage return from a terminal becomes a newline.
+const ICRNL = 0x100;
+const ECHO = 0x8;
+
+/// The host's own input, shared by every process of a run: a fork inherits the terminal it was
+/// started at, so there is one of these and not one per descriptor table. `live` is what a test
+/// wants off, because a guest that reads a console nobody is typing at would wait forever.
+export const terminal = {
+  data: Buffer.alloc(0),
+  closed: false,
+  live: false,
+  /// Whether the input is a terminal rather than a pipe. A terminal echoes what is typed at it; a
+  /// pipe's bytes are not typed at anything, and echoing them would print a script twice.
+  viaTty: false,
+  /// Whether the guest has turned off canonical input and echo, which is what a line editor does
+  /// before it reads one keystroke at a time and draws them itself.
+  raw: false,
+  /// Whether the last thing typed was the end-of-file character on an empty line.
+  eof: false,
+  /// What the guest last said the console is. The flags are the ones a Linux tty starts with, so a
+  /// program that only reads them sees a terminal rather than a row of zeros.
+  termios: {
+    iflag: 0x6400, // ICRNL IXON IUTF8
+    oflag: 0x0005, // OPOST ONLCR
+    cflag: 0x00bf, // B38400 CS8 CREAD
+    lflag: 0xa85b, // ISIG ICANON ECHO ECHOE ECHOK ECHOCTL ECHOKE IEXTEN
+    cc: [3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 0, 18, 15, 23, 22, 0, 0, 0],
+  },
+  setTermios(t) {
+    this.termios = t;
+    this.raw = (t.lflag & (ICANON | ECHO)) !== (ICANON | ECHO);
+  },
+  /// Called with the number of a signal the terminal raised, as its line discipline does for the
+  /// interrupt and quit characters rather than passing them on as bytes.
+  onSignal: null,
+  /// The bytes node delivered, through the line discipline the guest asked for.
+  ///
+  /// The host's terminal stays in raw mode for the whole session, because the process holding it is
+  /// this one: a cooked terminal would turn the interrupt character into a signal here, and the
+  /// guest would never see it. So this is the discipline - the interrupt and quit characters become
+  /// signals, a carriage return from a terminal that no longer translates it becomes a newline, the
+  /// erase character edits the line, and in canonical mode the character that was typed is echoed
+  /// back, which is what a terminal does and what a guest reading a line does not.
+  feed(chunk) {
+    for (const byte of chunk) {
+      const l = this.termios.lflag;
+      if (l & ISIG) {
+        if (byte === this.termios.cc[0]) {
+          this.onSignal?.(2);
+          continue;
+        }
+        if (byte === this.termios.cc[1]) {
+          this.onSignal?.(3);
+          continue;
+        }
+      }
+      if (this.raw) {
+        this.data = Buffer.concat([this.data, Buffer.from([byte])]);
+        continue;
+      }
+      const echo = (l & ECHO) !== 0 && this.viaTty;
+      if (byte === 0x0d && (this.termios.iflag & ICRNL)) {
+        this.data = Buffer.concat([this.data, Buffer.from([0x0a])]);
+        if (echo) process.stdout.write("\r\n");
+        continue;
+      }
+      if (byte === this.termios.cc[4]) {
+        // End of file: a partial line is delivered as it stands, and an empty one ends the read.
+        if (this.data.length && this.data[this.data.length - 1] !== 0x0a) {
+          this.data = Buffer.concat([this.data, Buffer.from([0x0a])]);
+          if (echo) process.stdout.write("\n");
+        } else if (!this.data.length) {
+          this.eof = true;
+        }
+        continue;
+      }
+      if (echo && (byte === this.termios.cc[2] || byte === 0x08)) {
+        if (this.data.length && this.data[this.data.length - 1] !== 0x0a) {
+          this.data = this.data.subarray(0, this.data.length - 1);
+          process.stdout.write("\b \b");
+        }
+        continue;
+      }
+      if (echo && byte === this.termios.cc[3]) {
+        while (this.data.length && this.data[this.data.length - 1] !== 0x0a) {
+          this.data = this.data.subarray(0, this.data.length - 1);
+          process.stdout.write("\b \b");
+        }
+        continue;
+      }
+      this.data = Buffer.concat([this.data, Buffer.from([byte])]);
+      if (!echo) continue;
+      // The terminal echoes what was typed, and the newline goes out as a carriage return and a
+      // newline, because the guest's output side is not translating it any more either.
+      if (byte === 0x0a) process.stdout.write("\r\n");
+      else if (byte >= 0x20 || byte === 0x09) process.stdout.write(Buffer.from([byte]));
+    }
+  },
+  /// Up to `len` bytes, or null when there are none to give.
+  ///
+  /// A console that the guest has not taken over hands over one line at a time, which is what makes
+  /// a program that reads its input line by line behave as it does at a terminal; a partial line
+  /// waits for its newline. In raw mode the bytes go over as they came, which is what a line editor
+  /// reading one keystroke at a time needs.
+  take(len) {
+    if (!this.data.length) return null;
+    let end = Math.min(len, this.data.length);
+    if (!this.raw) {
+      const nl = this.data.indexOf(0x0a);
+      if (nl >= 0) end = Math.min(end, nl + 1);
+      else if (!this.closed) return null;
+    }
+    const out = this.data.subarray(0, end);
+    this.data = this.data.subarray(out.length);
+    return Buffer.from(out);
+  },
+};
+
 export class Files {
   constructor(rootfs, options = {}) {
     this.rootfs = rootfs ? path.resolve(rootfs) : null;
@@ -279,7 +399,9 @@ export class Files {
   /// Whether a read of this descriptor would return now instead of waiting.
   readReady(fd) {
     const entry = this.map.get(fd);
-    if (!entry || entry.kind !== "pipe") return true;
+    if (!entry) return true;
+    if (entry.kind === "stdin") return !terminal.live || terminal.data.length > 0 || terminal.closed;
+    if (entry.kind !== "pipe") return true;
     return entry.desc.data.length > 0 || entry.desc.writers === 0;
   }
 
@@ -443,7 +565,22 @@ export class Files {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     if (entry.kind === "dir") return -EISDIR;
-    if (entry.kind === "stdin") return Buffer.alloc(0); // stdin is empty: no console yet
+    if (entry.kind === "stdin") {
+      // A console the host is not reading is an empty one: the guest sees end of file, which is
+      // what a program run from a test expects of its input.
+      if (!terminal.live) return Buffer.alloc(0);
+      const out = terminal.take(len);
+      if (out) return out;
+      if (terminal.eof) {
+        terminal.eof = false;
+        return Buffer.alloc(0);
+      }
+      if (terminal.closed) return Buffer.alloc(0);
+      if (entry.desc?.nonblock) return -EAGAIN;
+      // The thread parks and the host's event loop turns: the bytes the terminal delivers answer
+      // the read, the way a pipe's writer answers one.
+      return WOULD_BLOCK;
+    }
     if (entry.kind === "null") return Buffer.alloc(0);
     if (entry.kind === "zero" || entry.kind === "full") return Buffer.alloc(len);
     if (entry.kind === "random") return this.randomBytes(len);

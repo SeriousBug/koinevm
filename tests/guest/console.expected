@@ -1,0 +1,11 @@
+root@armjit:/# echo one
+one
+root@armjit:/# read x
+root@armjit:/# echo "read:$x"
+read:hello there
+root@armjit:/# printf "%s\n" a b c | wc -l
+3
+root@armjit:/# nosuchcommand 2>/dev/null || echo "status:$?"
+status:127
+root@armjit:/# exit
+exit

@@ -6,7 +6,7 @@
 
 import fs from "node:fs";
 import { AddressSpace, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
-import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK, O_WRONLY, O_RDWR } from "./files.mjs";
+import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK, O_WRONLY, O_RDWR, terminal } from "./files.mjs";
 import {
   Net,
   decodeSockaddr,
@@ -116,6 +116,10 @@ export const SIG_BLOCK = 0;
 export const SIG_UNBLOCK = 1;
 export const SIG_SETMASK = 2;
 export const SS_DISABLE = 2;
+
+/// The size the kernel's `struct termios` occupies: four flag words, `c_line`, and `NCCS = 19`
+/// control characters. The speeds live in glibc's struct and nowhere in this one.
+const KERNEL_TERMIOS = 36;
 
 export class Kernel {
   constructor(memory, meta, options = {}) {
@@ -829,7 +833,12 @@ export class Kernel {
       // reads an answer into. Without it the size is zero and the answer is read into nothing.
       if (req === 0x541b) {
         const entry = k.files.get(Number(fd));
-        const waiting = entry?.kind === "socket" ? entry.desc.pending() : entry?.kind === "pipe" && entry.desc.data.length;
+        const waiting =
+          entry?.kind === "socket"
+            ? entry.desc.pending()
+            : entry?.kind === "stdin"
+              ? terminal.data.length
+              : entry?.kind === "pipe" && entry.desc.data.length;
         if (!k.put32(arg, waiting || 0)) return k.fail(EFAULT);
         return [0n, 0];
       }
@@ -841,10 +850,60 @@ export class Kernel {
         entry.desc.nonblock = (k.u32(arg) & 1) !== 0;
         return [0n, 0];
       }
-      // There is no console, so the streams are pipes and `isatty` has to say so: a program that
-      // believes it has a terminal formats for one, and its output stops matching a real run.
-      if (req === 0x5401) return k.fail(ENOTTY); // TCGETS
-      if (req === 0x5413) return k.fail(ENOTTY); // TIOCGWINSZ
+      // The console. A run that is not reading the host's input has no terminal, and says so: a
+      // program that believes it has one formats for it, and a test's output stops being the output
+      // of a pipe. With one, `isatty` is true, and the termios the guest writes is what decides
+      // whether the host reads it a line at a time or a keystroke at a time.
+      if (req === 0x5401 || (req >= 0x5402 && req <= 0x5404)) {
+        if (!terminal.live) return k.fail(ENOTTY);
+        // The kernel's own `struct termios`: the four flag words, the line discipline and nineteen
+        // control characters. glibc keeps the speeds in its own, larger struct and reads them out
+        // of `c_cflag`, so a kernel that wrote the whole of that one would run past the end.
+        const at = k.addr(arg);
+        const raw = k.read(at, KERNEL_TERMIOS);
+        if (!raw || raw.length < KERNEL_TERMIOS) return k.fail(EFAULT);
+        const buf = Buffer.from(raw);
+        if (req === 0x5401) {
+          const t = terminal.termios;
+          buf.writeUInt32LE(t.iflag >>> 0, 0);
+          buf.writeUInt32LE(t.oflag >>> 0, 4);
+          buf.writeUInt32LE(t.cflag >>> 0, 8);
+          buf.writeUInt32LE(t.lflag >>> 0, 12);
+          buf.writeUInt8(0, 16); // c_line
+          for (let i = 0; i < 19; i++) buf.writeUInt8(t.cc[i] ?? 0, 17 + i);
+          if (!k.put(arg, buf)) return k.fail(EFAULT);
+          return [0n, 0];
+        }
+        terminal.setTermios({
+          iflag: buf.readUInt32LE(0),
+          oflag: buf.readUInt32LE(4),
+          cflag: buf.readUInt32LE(8),
+          lflag: buf.readUInt32LE(12),
+          cc: Array.from({ length: 19 }, (_, i) => buf.readUInt8(17 + i)),
+        });
+        return [0n, 0];
+      }
+      if (req === 0x5413) {
+        // The window: the host's own, so a program that lays text out in columns uses the terminal
+        // it is actually in.
+        if (!terminal.live) return k.fail(ENOTTY);
+        const ws = Buffer.alloc(8);
+        ws.writeUInt16LE(process.stdout.rows || 24, 0);
+        ws.writeUInt16LE(process.stdout.columns || 80, 2);
+        if (!k.put(arg, ws)) return k.fail(EFAULT);
+        return [0n, 0];
+      }
+      // The process group of the terminal, which an interactive shell compares with its own before
+      // it takes the console over. One process group is what this kernel has.
+      if (req === 0x540f) {
+        if (!terminal.live) return k.fail(ENOTTY);
+        if (!k.put32(arg, k.pid)) return k.fail(EFAULT);
+        return [0n, 0];
+      }
+      if (req === 0x5410) {
+        if (!terminal.live) return k.fail(ENOTTY);
+        return [0n, 0];
+      }
       // An ioctl nobody here implements has to fail. Answering zero tells the caller the request
       // worked, and `cp` reads that as `FICLONE` having copied the file: it closes both descriptors
       // and the destination stays empty. Real kernels answer ENOTTY for anything they do not know,
@@ -1243,6 +1302,12 @@ export class Kernel {
     if (entry.kind === "pipe") {
       const read = entry.end === "read" && (entry.desc.data.length > 0 || entry.desc.writers === 0);
       return { read, write: entry.end === "write", err: false, hup: read && entry.desc.writers === 0 };
+    }
+    if (entry.kind === "stdin") {
+      // A console is readable when there is something to read or when it has ended, which is what
+      // a shell that waits for input and a program that waits for the end of it both ask.
+      const read = this.files.readReady(fd);
+      return { read, write: false, err: false, hup: false };
     }
     // A file, a device or a directory: the host never makes one wait.
     return { read: true, write: entry.kind !== "dir" && entry.desc?.writable !== false, err: false, hup: false };

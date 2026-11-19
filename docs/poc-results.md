@@ -66,13 +66,27 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Twenty-four more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+checks on and off. Twenty-seven more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
 memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`, which makes two names that
 differ only in case and checks they stay two files), the pages a guest may not touch
 (`tests/faults.sh`), the handler a caught signal runs (`tests/sighandler.sh`), a signal and another
 process reaching a spinning guest (`tests/poll.sh`), a guest patching its own code (`tests/smc.sh`),
-and the socket, epoll, signal and resolver paths, each in both address-check modes. `bash
-tests/run.sh` runs all 105.
+the console an interactive shell reads (`tests/console.sh`), and the socket, epoll, signal and
+resolver paths, each in both address-check modes. `bash tests/run.sh` runs all 107.
+
+The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
+/bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
+input, so a read parks the thread and the bytes node delivers answer it; `isatty` is true and
+`tcgetattr`/`tcsetattr` carry the flags a Linux tty starts with. The host's terminal is in raw mode
+for the whole session, because the process holding it is this one, so the line discipline is here
+instead: the interrupt and quit characters become signals, a carriage return becomes a newline, the
+erase and kill characters edit the line, and a canonical console echoes what is typed and hands over
+one line at a time - which is what a terminal does and what a guest reading a line does not. A guest
+that turns off `ICANON` and `ECHO`, which is what readline does before it reads one keystroke at a
+time and draws the line itself, gets the bytes as they come and does its own echo, so the up arrow
+recalls what was run, backspace edits it, `Ctrl-C` ends the command that is running and `Ctrl-D` at
+the prompt ends the shell. `read x` takes the next line the way it does at a terminal, and `python3`
+prints its banner and a `>>>` prompt.
 
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
@@ -177,6 +191,13 @@ Two things follow.
   gives it, when a syscall is where the signal can be taken; a signal that arrives while the guest is
   in the middle of a computation waits for the next syscall. A fault is still fatal, so a `SIGSEGV`
   handler does not run.
+- **Job control, and a pty of the guest's own.** One console and one process group: `Ctrl-Z`, `fg`,
+  `jobs`, and a window that is resized (`SIGWINCH`) are not there, so a stopped job cannot be
+  resumed. A program that opens a *pty* (`script`, `expect`, `ssh`) gets the console or nothing,
+  because there is no `/dev/ptmx` behind it. And the console's interrupt reaches the processes that
+  take the default action for it: the shell catches it so that it can tidy up after the command it
+  waits for, and with one process group the disposition is what stands in for "the foreground job",
+  so a program that handles `SIGINT` itself - a Python REPL, say - does not see the `Ctrl-C`.
 - **Threads are coroutines, and nothing has a disk.** `clone` makes a thread inside one instance with
   its own registers and stack. A guest that spins without a syscall gives the CPU back at a backward
   branch, so it no longer stalls the others, but a thread is switched only there and at a syscall:

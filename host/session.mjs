@@ -183,7 +183,11 @@ export class Session {
   /// or a deadline a timer will pass.
   waiting() {
     return this.processes.some((p) =>
-      p.threads.some((t) => t.state === "blocked" && (t.waitingFor === "socket" || t.waitingFor === "sleep")),
+      p.threads.some(
+        (t) =>
+          t.state === "blocked" &&
+          (t.waitingFor === "socket" || t.waitingFor === "sleep" || t.waitingFor === "stdin"),
+      ),
     );
   }
 
@@ -193,8 +197,12 @@ export class Session {
     let wait = 200;
     for (const proc of this.processes) {
       for (const thread of proc.threads) {
-        const deadline = thread.state === "blocked" ? thread.pending?.deadline : 0;
+        if (thread.state !== "blocked") continue;
+        const deadline = thread.pending?.deadline;
         if (deadline) wait = Math.min(wait, Math.max(0, deadline - Date.now()));
+        // Typing is a fact the host's event loop knows before anything here does, so a console
+        // read is asked again on a short timer rather than the long one.
+        if (thread.waitingFor === "stdin") wait = Math.min(wait, 20);
       }
     }
     return wait;
@@ -516,6 +524,22 @@ export class Session {
     const entry = proc.kernel.takeSignal();
     if (entry) this.deliver(proc, entry);
     return 0;
+  }
+
+  /// The console's interrupt and quit characters. A terminal turns them into signals to the
+  /// foreground job, and the foreground job here is every process there is: one console, one
+  /// process group, so a command that is running gets the signal and the shell that ignores it
+  /// while it waits does not.
+  interrupt(sig) {
+    // A terminal signals the foreground command, and the shell is not the command: it catches the
+    // interrupt so that it can tidy up after what it was waiting for. With one process group, the
+    // disposition is what stands in for that - a process that handles the signal is the shell, and
+    // the command it started is the one whose default action runs.
+    for (const proc of this.processes) {
+      if (proc.state === "exited") continue;
+      if (proc.kernel.disposition(sig) !== "default") continue;
+      this.signal({ from: 0, pid: proc.pid, sig });
+    }
   }
 
   /// A signal from one process to another. There is no handler to run, so what a signal does is
@@ -990,6 +1014,7 @@ export class Session {
   /// What a blocked thread is waiting for, in words a report can print.
   reason(thread) {
     if (thread.waitingFor === "pipe") return `a pipe (fd ${thread.pending?.fd ?? "?"})`;
+    if (thread.waitingFor === "stdin") return "the console";
     if (thread.waitingFor === "futex") return `futex 0x${thread.blockedOn.toString(16)}`;
     if (thread.waitingFor === "epoll") return `an epoll (fd ${thread.blockedOn})`;
     if (thread.waitingFor === "sleep") return `a sleep (${thread.pending?.deadline ?? 0})`;
@@ -1017,7 +1042,8 @@ export class Session {
   read(proc, thread, request) {
     const got = proc.kernel.files.read(request.fd, request.len);
     if (got === WOULD_BLOCK) {
-      this.block(thread, 0, "pipe");
+      const entry = proc.kernel.files.get(request.fd);
+      this.block(thread, 0, entry?.kind === "stdin" ? "stdin" : "pipe");
       thread.pending = request;
       return 0;
     }
@@ -1035,6 +1061,8 @@ export class Session {
         if (thread.state !== "blocked") continue;
         if (thread.waitingFor === "socket" || thread.waitingFor === "epoll") thread.state = "runnable";
         else if (thread.waitingFor === "pipe" && proc.kernel.files.readReady(thread.pending.fd)) {
+          thread.state = "runnable";
+        } else if (thread.waitingFor === "stdin" && proc.kernel.files.readReady(thread.pending.fd)) {
           thread.state = "runnable";
         } else if (thread.waitingFor === "sleep" && Date.now() >= thread.pending.deadline) {
           // A sleep cannot be a `setTimeout` alone: the host's event loop does not turn while a

@@ -8,6 +8,7 @@
 import fs from "node:fs";
 import { Translator } from "./host/pages.mjs";
 import { Session } from "./host/session.mjs";
+import { terminal } from "./host/files.mjs";
 
 const wasmPath = process.argv[2];
 if (!wasmPath) {
@@ -407,6 +408,32 @@ if (process.env.ARMJIT_DUMP_STACK) {
     const ascii = Buffer.from(new Uint8Array(memory.buffer, at + i * 8, 8)).toString("latin1");
     console.error(`sp+${i * 8}: 0x${w.toString(16)} ${JSON.stringify(ascii)}`);
   }
+}
+
+// The console: a guest that reads fd 0 waits on the host's own input, which node delivers while
+// the scheduler waits for something. Off by default, because a test that runs a program which reads
+// its input would otherwise wait for a line nobody is going to type.
+if (process.env.ARMJIT_CONSOLE) {
+  terminal.live = true;
+  // The host's terminal is in raw mode for the whole session: this process is the one holding it, so
+  // a cooked terminal would do the line discipline for a guest that asked to do it itself, and its
+  // interrupt character would end this process instead of the command the guest is running.
+  terminal.viaTty = Boolean(process.stdin.isTTY);
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+  terminal.onSignal = (sig) => session.interrupt(sig);
+  process.stdin.on("data", (chunk) => {
+    terminal.feed(chunk);
+    session.poll();
+  });
+  process.stdin.on("end", () => {
+    terminal.closed = true;
+    session.poll();
+  });
+  process.stdin.resume();
+  // Leaving the terminal raw would follow the shell back to the prompt it was started from.
+  process.on("exit", () => {
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+  });
 }
 
 const started = process.hrtime.bigint();
