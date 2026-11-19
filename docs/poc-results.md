@@ -108,6 +108,16 @@ machine recognises that return as `rt_sigreturn` and puts the frame the signal l
 stack. A pager wants all of it: `less /etc/os-release` takes the screen, pages on a space, quits on
 `q`, and gives the shell its terminal back.
 
+Terminals beget terminals. `posix_openpt` and `/dev/ptmx` make a pseudo-terminal pair, `/dev/pts/N`
+names its slave, and the two ends carry data with the line discipline, the window size and the flags
+between them, so the `E: Can not write log (Is /dev/pts mounted?)` that `apt` used to print while it
+ran `dpkg` is gone: it has a terminal of its own for the package manager now, and the escapes of the
+progress bar come back out of the master. `signalfd` is where `script` waits for its child, and a
+read of one is a `struct signalfd_siginfo`. Debconf is the other half of an interactive install: with
+`whiptail` in the tree its Dialog frontend draws the question on the console (the image ships
+neither it nor `Term::ReadLine`, so it had fallen back to the Teletype frontend, whose yes/no prompt
+wants the word, not the letter).
+
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
 a container and records the oracle there) through the translated `ld-linux` and `libc.so.6`, in both
@@ -192,6 +202,13 @@ Two things follow.
   result that lands in the denormal range can be a step out. One known inexactness: wasm has no
   fused multiply-add, so `fmadd` and its siblings round twice and can differ from the instruction in
   the last bit.
+- **An editor.** `nvim` is the biggest libuv program here and it does not run yet. Two faults, both
+  inside libuv. On a terminal, a thread calls `uv_async_send` on a handle whose `loop` field is null
+  and dies on the load at `libuv+0xee2c`, so the async handle it was given was never initialised or
+  is not the one that was; with its output on a pipe there is no thread, and instead `uv__io_poll`'s
+  watcher queue never empties - the head still points at a node that has been removed - so the
+  process spins on `epoll_ctl` and never reaches `epoll_wait`. Neither is anywhere a smaller program
+  goes, and a test tree of fixtures cannot see either.
 - **Instruction coverage of a big library.** The parts of libc that nothing reaches (a page of
   `strlen` variants, the MTE paths in `malloc`) report `undecoded instruction`, and the words are SVE
   and MTE: the loader does not pick them because `ID_AA64PFR0` and `ID_AA64ISAR0` are a baseline

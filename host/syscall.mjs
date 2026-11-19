@@ -125,9 +125,13 @@ export const SS_DISABLE = 2;
 /// program that asks it - that a pipe is a terminal, which is how `tar` came to refuse the archive
 /// `dpkg` handed it on stdin.
 const onConsole = (k, fd) => {
-  if (!terminal.live) return false;
   const entry = k.files.get(Number(fd));
-  return Boolean(entry) && (entry.kind === "stdin" || entry.kind === "stdout" || entry.kind === "stderr");
+  if (!entry) return false;
+  // A pseudo-terminal is a terminal whichever end of it is asked, and one a program made for a
+  // child exists whether this run has a console of its own or not.
+  if (entry.kind === "pty") return true;
+  if (!terminal.live) return false;
+  return entry.kind === "stdin" || entry.kind === "stdout" || entry.kind === "stderr";
 };
 
 /// The size the kernel's `struct termios` occupies: four flag words, `c_line`, and `NCCS = 19`
@@ -183,6 +187,8 @@ export class Kernel {
     /// Called to wake the threads asleep on a futex word; answers how many woke.
     this.futexWake = options.futexWake ?? (() => 0);
     this.register();
+    // A signalfd's readiness is this process's queue, so the table asks the kernel it belongs to.
+    this.files.signalReady = (desc) => this.signalWaiting(desc);
   }
 
   /// A syscall the host has to perform, which means giving up the wasm call until it can.
@@ -642,6 +648,13 @@ export class Kernel {
 
     this.on(63, (k, fd, buf, count) => {
       const entry = k.files.get(Number(fd));
+      if (entry && entry.kind === "signalfd") {
+        const got = k.readSignalfd(entry, Number(count));
+        if (got === WOULD_BLOCK) return k.ask({ kind: "read", fd: Number(fd), buf: k.addr(buf), len: 128 });
+        if (typeof got === "number") return k.done(got);
+        if (!k.put(buf, got)) return k.fail(EFAULT);
+        return [BigInt(got.length), 0];
+      }
       if (entry && entry.kind === "socket") {
         return k.done(k.recvInto(Number(fd), k.addr(buf), Number(count), 0, 0, 0));
       }
@@ -677,6 +690,21 @@ export class Kernel {
       const wrote = k.files.write(Number(fd), Buffer.from(bytes));
       if (wrote > 0) k.wake();
       return [BigInt(wrote), 0];
+    });
+
+    // `signalfd4`: a descriptor a program reads its signals from instead of installing a handler.
+    // `script` waits for its child that way, so that the signal's own data comes with it.
+    this.on(74, (k, fd, mask, sizemask, flags) => {
+      if (Number(sizemask) !== 8) return k.fail(EINVAL);
+      const set = BigInt.asUintN(64, k.u64(mask));
+      const at = Number(fd);
+      if (at >= 0) {
+        const entry = k.files.get(at);
+        if (!entry || entry.kind !== "signalfd") return k.fail(EINVAL);
+        entry.desc.mask = set;
+        return [BigInt(at), 0];
+      }
+      return [BigInt(k.files.add({ kind: "signalfd", desc: { mask: set, nonblock: (Number(flags) & 0x800) !== 0 }, cloexec: (Number(flags) & 0x80000) !== 0 })), 0];
     });
 
     this.on(66, (k, fd, iov, count) => {
@@ -877,8 +905,9 @@ export class Kernel {
         const raw = k.read(at, KERNEL_TERMIOS);
         if (!raw || raw.length < KERNEL_TERMIOS) return k.fail(EFAULT);
         const buf = Buffer.from(raw);
+        const tty = k.files.terminalOf(k.files.get(Number(fd)));
         if (req === 0x5401) {
-          const t = terminal.termios;
+          const t = tty.termios;
           buf.writeUInt32LE(t.iflag >>> 0, 0);
           buf.writeUInt32LE(t.oflag >>> 0, 4);
           buf.writeUInt32LE(t.cflag >>> 0, 8);
@@ -888,7 +917,7 @@ export class Kernel {
           if (!k.put(arg, buf)) return k.fail(EFAULT);
           return [0n, 0];
         }
-        terminal.setTermios({
+        tty.setTermios({
           iflag: buf.readUInt32LE(0),
           oflag: buf.readUInt32LE(4),
           cflag: buf.readUInt32LE(8),
@@ -899,14 +928,43 @@ export class Kernel {
       }
       if (req === 0x5413) {
         // The window: the host's own, so a program that lays text out in columns uses the terminal
-        // it is actually in.
+        // it is actually in, and for a pty the one its master was given.
         if (!onConsole(k, fd)) return k.fail(ENOTTY);
+        const entry = k.files.get(Number(fd));
+        const size = entry.kind === "pty" ? entry.desc.size : { rows: process.stdout.rows || 24, cols: process.stdout.columns || 80 };
         const ws = Buffer.alloc(8);
-        ws.writeUInt16LE(process.stdout.rows || 24, 0);
-        ws.writeUInt16LE(process.stdout.columns || 80, 2);
+        ws.writeUInt16LE(size.rows, 0);
+        ws.writeUInt16LE(size.cols, 2);
         if (!k.put(arg, ws)) return k.fail(EFAULT);
         return [0n, 0];
       }
+      if (req === 0x5414) {
+        // TIOCSWINSZ: the window a pty was told it has, which `apt` copies from its own onto the
+        // one it made for `dpkg`.
+        const entry = k.files.get(Number(fd));
+        if (!onConsole(k, fd) || entry.kind !== "pty") return k.fail(ENOTTY);
+        const ws = k.read(k.addr(arg), 8);
+        if (!ws || ws.length < 8) return k.fail(EFAULT);
+        const view = new DataView(ws.buffer, ws.byteOffset, ws.length);
+        entry.desc.size = { rows: view.getUint16(0, true), cols: view.getUint16(2, true) };
+        return [0n, 0];
+      }
+      // The pty master's two: the number its slave is named by, and the lock `unlockpt` takes off.
+      if (req === 0x80045430) {
+        const entry = k.files.get(Number(fd));
+        if (!entry || entry.kind !== "pty" || entry.end !== "master") return k.fail(ENOTTY);
+        if (!k.put32(arg, entry.desc.id)) return k.fail(EFAULT);
+        return [0n, 0];
+      }
+      if (req === 0x40045431) {
+        const entry = k.files.get(Number(fd));
+        if (!entry || entry.kind !== "pty" || entry.end !== "master") return k.fail(ENOTTY);
+        entry.desc.locked = k.u32(arg) !== 0;
+        return [0n, 0];
+      }
+      // TIOCSCTTY: a session leader takes the terminal it opened as its controlling one. There is
+      // one terminal per run here and one process group, so there is nothing to take.
+      if (req === 0x540e) return [0n, 0];
       // The process group of the terminal, which an interactive shell compares with its own before
       // it takes the console over. One process group is what this kernel has.
       if (req === 0x540f) {
@@ -1057,6 +1115,28 @@ export class Kernel {
   }
 
   /// The next signal this process may take: one that is pending and not blocked.
+  /// Whether the mask a `signalfd` holds has a signal waiting: the question both its `poll` and its
+  /// `read` ask.
+  signalWaiting(desc) {
+    return this.pendingSignals.some((p) => (desc.mask & (1n << BigInt(p.sig - 1))) !== 0n);
+  }
+
+  /// One `struct signalfd_siginfo` for a signal the descriptor's mask holds, taken out of the
+  /// queue the handler's would have come from.
+  readSignalfd(entry, count) {
+    if (count < 128) return -EINVAL;
+    const at = this.pendingSignals.findIndex((p) => (entry.desc.mask & (1n << BigInt(p.sig - 1))) !== 0n);
+    if (at < 0) return entry.desc.nonblock ? -EAGAIN : WOULD_BLOCK;
+    const p = this.pendingSignals.splice(at, 1)[0];
+    const out = Buffer.alloc(128);
+    out.writeUInt32LE(p.sig, 0);
+    out.writeInt32LE(0, 4); // ssi_errno
+    out.writeInt32LE(p.code ?? SI_USER, 8);
+    out.writeUInt32LE(p.pid ?? this.pid, 12);
+    out.writeUInt32LE(p.uid ?? 0, 16);
+    return out;
+  }
+
   takeSignal() {
     const at = this.pendingSignals.findIndex((p) => (this.sigblock & (1n << BigInt(p.sig - 1))) === 0n);
     if (at < 0) return null;
@@ -1316,6 +1396,14 @@ export class Kernel {
     if (entry.kind === "pipe") {
       const read = entry.end === "read" && (entry.desc.data.length > 0 || entry.desc.writers === 0);
       return { read, write: entry.end === "write", err: false, hup: read && entry.desc.writers === 0 };
+    }
+    if (entry.kind === "signalfd") {
+      return { read: this.signalWaiting(entry.desc), write: false, err: false, hup: false };
+    }
+    if (entry.kind === "pty") {
+      const read = this.files.readReady(fd);
+      const gone = entry.end === "master" ? entry.desc.slave === 0 : entry.desc.master === 0;
+      return { read, write: true, err: false, hup: read && gone };
     }
     if (this.files.consoleEntry(entry)) {
       // A console is readable when there is something to read or when it has ended, which is what

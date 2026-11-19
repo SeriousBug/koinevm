@@ -75,10 +75,12 @@ const ICANON = 0x2;
 const ICRNL = 0x100;
 const ECHO = 0x8;
 
-/// The host's own input, shared by every process of a run: a fork inherits the terminal it was
-/// started at, so there is one of these and not one per descriptor table. `live` is what a test
-/// wants off, because a guest that reads a console nobody is typing at would wait forever.
-export const terminal = {
+/// A terminal: one device with an input side a program reads and an output side it writes, a line
+/// discipline between them, and the flags that say what the discipline does. The console is the one
+/// this run was started at; a pseudo-terminal is one a program made for a child that insists on
+/// having a terminal of its own, and its two ends are as real as this one.
+function makeTerminal({ viaTty = false, sink = (bytes) => process.stdout.write(bytes) } = {}) {
+  return {
   data: Buffer.alloc(0),
   closed: false,
   live: false,
@@ -134,14 +136,14 @@ export const terminal = {
       const echo = (l & ECHO) !== 0 && this.viaTty;
       if (byte === 0x0d && (this.termios.iflag & ICRNL)) {
         this.data = Buffer.concat([this.data, Buffer.from([0x0a])]);
-        if (echo) process.stdout.write("\r\n");
+        if (echo) this.out("\r\n");
         continue;
       }
       if (byte === this.termios.cc[4]) {
         // End of file: a partial line is delivered as it stands, and an empty one ends the read.
         if (this.data.length && this.data[this.data.length - 1] !== 0x0a) {
           this.data = Buffer.concat([this.data, Buffer.from([0x0a])]);
-          if (echo) process.stdout.write("\n");
+          if (echo) this.out("\n");
         } else if (!this.data.length) {
           this.eof = true;
         }
@@ -150,14 +152,14 @@ export const terminal = {
       if (echo && (byte === this.termios.cc[2] || byte === 0x08)) {
         if (this.data.length && this.data[this.data.length - 1] !== 0x0a) {
           this.data = this.data.subarray(0, this.data.length - 1);
-          process.stdout.write("\b \b");
+          this.out("\b \b");
         }
         continue;
       }
       if (echo && byte === this.termios.cc[3]) {
         while (this.data.length && this.data[this.data.length - 1] !== 0x0a) {
           this.data = this.data.subarray(0, this.data.length - 1);
-          process.stdout.write("\b \b");
+          this.out("\b \b");
         }
         continue;
       }
@@ -165,8 +167,8 @@ export const terminal = {
       if (!echo) continue;
       // The terminal echoes what was typed, and the newline goes out as a carriage return and a
       // newline, because the guest's output side is not translating it any more either.
-      if (byte === 0x0a) process.stdout.write("\r\n");
-      else if (byte >= 0x20 || byte === 0x09) process.stdout.write(Buffer.from([byte]));
+      if (byte === 0x0a) this.out("\r\n");
+      else if (byte >= 0x20 || byte === 0x09) this.out(Buffer.from([byte]));
     }
   },
   /// Up to `len` bytes, or null when there are none to give.
@@ -195,7 +197,23 @@ export const terminal = {
     if (!this.data.length) return false;
     return this.raw || this.data.includes(0x0a);
   },
-};
+  /// Bytes the device sends to whoever is looking at it: what the discipline echoes, and what a
+  /// program writes to it. A console's go to the host's own output, and a pty's to its master.
+  out(bytes) {
+    this.sink(bytes);
+  },
+  };
+}
+
+/// The host's own terminal, shared by every process of a run: a fork inherits the terminal it was
+/// started at, so there is one of these and not one per descriptor table. `live` is what a test
+/// wants off, because a guest that reads a console nobody is typing at would wait forever.
+export const terminal = makeTerminal();
+
+/// The pseudo-terminals of the run, by number. A device belongs to the machine rather than to the
+/// process that made it, so a program can hand its child the name of one and the child can open it.
+const ptys = new Map();
+let nextPty = 1;
 
 export class Files {
   constructor(rootfs, options = {}) {
@@ -218,6 +236,9 @@ export class Files {
     // A description of their own, so that `O_NONBLOCK` sticks to them: `apt` empties the terminal
     // before it starts `dpkg`, by setting stdin non-blocking and reading until a read fails, and a
     // console that ignored the setting would hold that read until the next line was typed.
+    /// Whether a `signalfd` has a signal waiting, which the kernel that owns this table answers:
+    /// the queue is the process's, and the descriptor is only where the guest reads it.
+    this.signalReady = () => false;
     this.map.set(0, { kind: "stdin", desc: { nonblock: false } });
     this.map.set(1, { kind: "stdout", desc: { nonblock: false } });
     this.map.set(2, { kind: "stderr", desc: { nonblock: false } });
@@ -404,6 +425,10 @@ export class Files {
     // shares it the way it shares an open file.
     if (entry.kind === "socket") entry.desc.refs++;
     if (entry.kind === "file") entry.desc.refs++;
+    if (entry.kind === "pty") {
+      if (entry.end === "master") entry.desc.master++;
+      else entry.desc.slave++;
+    }
     return copy;
   }
 
@@ -411,6 +436,11 @@ export class Files {
   readReady(fd) {
     const entry = this.map.get(fd);
     if (!entry) return true;
+    if (entry.kind === "signalfd") return this.signalReady(entry.desc);
+    if (entry.kind === "pty") {
+      if (entry.end === "master") return entry.desc.output.length > 0 || entry.desc.slave === 0;
+      return entry.desc.tty.readable() || entry.desc.master === 0;
+    }
     if (this.consoleEntry(entry)) return !terminal.live || terminal.readable();
     if (entry.kind !== "pipe") return true;
     return entry.desc.data.length > 0 || entry.desc.writers === 0;
@@ -476,7 +506,32 @@ export class Files {
         cloexec: (flags & O_CLOEXEC) !== 0,
       });
     }
-    const device = DEVICES.get(this.guestPath(guestPath));
+    // A pseudo-terminal. `/dev/ptmx` makes a new one and hands back its master, and the name the
+    // slave has is what `ptsname` asks for: a program that needs a child to have a terminal opens
+    // the slave, and everything the child writes comes back out of the master.
+    const name = this.guestPath(guestPath);
+    if (name === "/dev/ptmx") {
+      const pty = this.pty();
+      pty.master++;
+      return this.add({
+        kind: "pty",
+        end: "master",
+        desc: pty,
+        cloexec: (flags & O_CLOEXEC) !== 0,
+      });
+    }
+    if (name.startsWith("/dev/pts/")) {
+      const pty = ptys.get(Number(name.slice("/dev/pts/".length)));
+      if (!pty) return -ENOENT;
+      pty.slave++;
+      return this.add({
+        kind: "pty",
+        end: "slave",
+        desc: pty,
+        cloexec: (flags & O_CLOEXEC) !== 0,
+      });
+    }
+    const device = DEVICES.get(name);
     if (device) return this.add({ ...device, desc: { pos: 0 }, cloexec: (flags & O_CLOEXEC) !== 0 });
     const host = this.resolveAt(guestPath, dirfd);
     if (host < 0) return host;
@@ -541,6 +596,10 @@ export class Files {
       else entry.desc.writers--;
       this.note(`close fd ${fd} ${entry.end} end`, entry.desc);
     }
+    if (entry.kind === "pty") {
+      if (entry.end === "master") entry.desc.master--;
+      else entry.desc.slave--;
+    }
     if (entry.kind === "file" && entry.desc && --entry.desc.refs <= 0) this.closeHandle(entry.desc);
     return 0;
   }
@@ -572,6 +631,40 @@ export class Files {
     return buf.subarray(0, n);
   }
 
+  /// The pseudo-terminal a number names, or null: `/dev/ptmx` hands out a new one, and everything
+  /// written to its master is what its slave reads, through the discipline the slave's flags set.
+  pty() {
+    const id = nextPty++;
+    const pty = {
+      id,
+      /// The bytes the master has not read yet: what the slave wrote, and what the discipline echoed.
+      output: Buffer.alloc(0),
+      size: { rows: 24, cols: 80 },
+      /// The lock `unlockpt` takes off, and how many descriptors hold each end, which is what says
+      /// when a read finds the far side gone rather than waiting for it.
+      locked: true,
+      master: 0,
+      slave: 0,
+    };
+    pty.tty = makeTerminal({ viaTty: true, sink: (bytes) => pty.tty?.out(bytes) });
+    // `sink` is where the discipline's echo goes, which on this device is the master's reader.
+    pty.tty.sink = (bytes) => {
+      pty.output = Buffer.concat([pty.output, Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)]);
+    };
+    pty.tty.live = true;
+    // An interrupt typed into a pty goes to the command reading it, the way the console's does:
+    // one process group, one foreground job.
+    pty.tty.onSignal = (sig) => terminal.onSignal?.(sig);
+    ptys.set(id, pty);
+    return pty;
+  }
+
+  /// The terminal a descriptor is on: the console's for the three standard ones, and the slave's or
+  /// the master's for a pseudo-terminal, which are one terminal with two ends.
+  terminalOf(entry) {
+    return entry.kind === "pty" ? entry.desc.tty : terminal;
+  }
+
   /// Whether this descriptor is the console. A terminal is one device, opened on all three standard
   /// descriptors, so each of them reads and writes the same one: `less` takes its keys from whichever
   /// it was handed, and here that is stderr, because there is no `/dev/tty` to open. A run with no
@@ -586,6 +679,27 @@ export class Files {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     if (entry.kind === "dir") return -EISDIR;
+    if (entry.kind === "pty") {
+      const pty = entry.desc;
+      if (entry.end === "master") {
+        if (!pty.output.length) {
+          if (pty.slave === 0) return Buffer.alloc(0);
+          return entry.desc.nonblock ? -EAGAIN : WOULD_BLOCK;
+        }
+        const out = pty.output.subarray(0, len);
+        pty.output = pty.output.subarray(out.length);
+        return Buffer.from(out);
+      }
+      const tty = pty.tty;
+      if (!tty.data.length && pty.master === 0) return Buffer.alloc(0);
+      const out = tty.take(len);
+      if (out) return out;
+      if (tty.eof) {
+        tty.eof = false;
+        return Buffer.alloc(0);
+      }
+      return entry.desc.nonblock ? -EAGAIN : WOULD_BLOCK;
+    }
     if (this.consoleEntry(entry)) {
       // A console the host is not reading is an empty one: the guest sees end of file, which is
       // what a program run from a test expects of its input.
@@ -721,6 +835,29 @@ export class Files {
       }
       return data.length;
     }
+    // A pty is one terminal: what the master is given is what the slave reads, and what the slave
+    // writes is what the master reads, with the output flags applied on the way.
+    if (entry.kind === "pty") {
+      const pty = entry.desc;
+      if (entry.end === "master") {
+        pty.tty.feed(data);
+        return data.length;
+      }
+      let bytes = data;
+      if ((pty.tty.termios.oflag & 0x4) !== 0) {
+        // ONLCR: the newline a program wrote comes out as a carriage return and a newline, which is
+        // what a terminal does with it and what the program reading the master expects.
+        const out = Buffer.alloc(data.length * 2);
+        let at = 0;
+        for (const byte of data) {
+          if (byte === 0x0a) out[at++] = 0x0d;
+          out[at++] = byte;
+        }
+        bytes = out.subarray(0, at);
+      }
+      pty.output = Buffer.concat([pty.output, bytes]);
+      return data.length;
+    }
     if (entry.kind === "null") return data.length;
     if (entry.kind === "zero") return data.length;
     if (entry.kind === "full") return -ENOSPC;
@@ -791,6 +928,20 @@ export class Files {
     }
     if (entry.kind === "socket") {
       return { mode: 0o140777n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
+    }
+    if (entry.kind === "pty") {
+      // A character device, which is what a program that fstats a terminal reads it for: a slave of
+      // the UNIX98 range, `major 136`, whose minor is the number `/dev/pts` names it by. A libc
+      // reads the name of a terminal out of that when it has no `/proc/self/fd` to ask.
+      return {
+        mode: 0o020620n,
+        nlink: 1n,
+        size: 0n,
+        ino: BigInt(entry.desc.id + 1),
+        dev: 0n,
+        rdev: BigInt(entry.end === "slave" ? (136 << 8) + entry.desc.id : (5 << 8) + 2),
+        blksize: 4096n,
+      };
     }
     if (entry.kind === "epoll") {
       // An anon inode: a regular file to `fstat`, which is all a program reads it for.

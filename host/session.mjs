@@ -389,8 +389,12 @@ export class Session {
   /// with the signal, which is what its parent's wait status reports.
   faulted(proc, thread, fault) {
     if (process.env.ARMJIT_TRACE_PROCESSES) {
+      const img = proc.kernel.space.imageOf(fault.at);
+      const where = img
+        ? `${img.host.split("/").pop()}+0x${(fault.at - img.base).toString(16)}`
+        : "no image";
       console.error(
-        `fault: ${proc.pid} ${fault.what} at 0x${fault.addr.toString(16)} from 0x${fault.at.toString(16)}`,
+        `fault: ${proc.pid} ${fault.what} at 0x${fault.addr.toString(16)} from 0x${fault.at.toString(16)} (${where})`,
       );
     }
     proc.fault = { signal: fault.signal, addr: fault.addr, at: fault.at };
