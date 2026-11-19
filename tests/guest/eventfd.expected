@@ -1,0 +1,20 @@
+ok   eventfd2 makes a descriptor
+ok   an empty one has nothing to read
+ok   and poll says so
+ok   a write of eight bytes is a count
+ok   poll sees the count
+ok   a read takes the whole of it
+ok   and clears it
+ok   a semaphore one
+ok   takes one of its two
+ok   takes the other
+ok   and then there is nothing left
+ok   a write shorter than eight bytes is EINVAL
+ok   a read of fewer than eight is too
+ok   one without EFD_NONBLOCK
+ok   fork
+ok   fork
+ok   another process's write answers a blocking read
+ok   the writer exited with zero
+ok   close all three
+eventfd: all checks passed

@@ -456,6 +456,7 @@ export class Files {
       return entry.desc.tty.readable() || entry.desc.master === 0;
     }
     if (this.consoleEntry(entry)) return !terminal.live || terminal.readable();
+    if (entry.kind === "eventfd") return entry.desc.value !== 0n;
     if (entry.kind !== "pipe") return true;
     return entry.desc.data.length > 0 || entry.desc.writers === 0;
   }
@@ -768,6 +769,22 @@ export class Files {
     if (entry.kind === "null") return Buffer.alloc(0);
     if (entry.kind === "zero" || entry.kind === "full") return Buffer.alloc(len);
     if (entry.kind === "random") return this.randomBytes(len);
+    if (entry.kind === "eventfd") {
+      // A counter: a plain read takes the whole value and clears it, and a semaphore one takes 1
+      // and answers 1, which is how a queue of work is counted rather than a flag being cleared.
+      if (len < 8) return -EINVAL;
+      const desc = entry.desc;
+      if (desc.value === 0n) return desc.nonblock ? -EAGAIN : WOULD_BLOCK;
+      const out = Buffer.alloc(8);
+      if (desc.semaphore) {
+        out.writeBigUInt64LE(1n, 0);
+        desc.value -= 1n;
+      } else {
+        out.writeBigUInt64LE(desc.value, 0);
+        desc.value = 0n;
+      }
+      return out;
+    }
     if (entry.kind === "pipe") {
       if (entry.end !== "read") return -EBADF;
       const desc = entry.desc;
@@ -893,6 +910,16 @@ export class Files {
         console.error(`  pipe ${desc.id}: +${data.length} bytes ${JSON.stringify(head)}`);
       }
       return data.length;
+    }
+    if (entry.kind === "eventfd") {
+      if (data.length !== 8) return -EINVAL;
+      const desc = entry.desc;
+      const add = data.readBigUInt64LE(0);
+      // A write blocks while the counter is near its ceiling, which nothing that adds a wakeup at a
+      // time ever reaches.
+      if (add > 0xffffffffffffffffn - desc.value) return -EAGAIN;
+      desc.value += add;
+      return 8;
     }
     // A pty is one terminal: what the master is given is what the slave reads, and what the slave
     // writes is what the master reads, with the output flags applied on the way.

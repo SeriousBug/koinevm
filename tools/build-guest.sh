@@ -111,6 +111,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/dns.c -o tests/guest/dns.o
 python3 tools/minilink.py tests/guest/dns.o tests/guest/dns.elf guest_main
 
+echo "== guest: eventfd (a counted wakeup, and a read another process answers) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
+    -c tests/guest/eventfd.c -o tests/guest/eventfd.o
+python3 tools/minilink.py tests/guest/eventfd.o tests/guest/eventfd.elf _start
+
 echo "== guest: files (openat/read/pread/stat/readlinkat) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/files.c -o tests/guest/files.o

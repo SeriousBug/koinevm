@@ -833,6 +833,24 @@ export class Kernel {
       return [BigInt(got.length), 0];
     });
 
+    // `eventfd2` and the older `eventfd`: a counter one thread adds to so that another one waiting
+    // in `poll` sees it. libuv starts an `uv_async_t` with one, and without it fails the handle in
+    // a way the caller ignores, which is how a thread ends up sending on one never initialised.
+    const eventfd = (k, initial, flags) => {
+      const fd = k.files.add({
+        kind: "eventfd",
+        desc: {
+          value: BigInt.asUintN(64, BigInt(initial)),
+          semaphore: (Number(flags) & 1) !== 0,
+          nonblock: (Number(flags) & 0x800) !== 0,
+        },
+        cloexec: (Number(flags) & 0x80000) !== 0,
+      });
+      return [BigInt(fd), 0];
+    };
+    this.on(19, (k, initial, flags) => eventfd(k, initial, flags));
+    this.on(290, (k, initial, flags) => eventfd(k, initial, flags));
+
     this.on(59, (k, fds, flags) => {
       const cloexec = (Number(flags) & 0x80000) !== 0;
       const [read, write] = k.files.pipe(cloexec);
@@ -1437,6 +1455,10 @@ export class Kernel {
     }
     if (entry.kind === "signalfd") {
       return { read: this.signalWaiting(entry.desc), write: false, err: false, hup: false };
+    }
+    if (entry.kind === "eventfd") {
+      const desc = entry.desc;
+      return { read: desc.value !== 0n, write: desc.value <= 0xfffffffffffffffen, err: false, hup: false };
     }
     if (entry.kind === "pty") {
       const read = this.files.readReady(fd);
