@@ -87,11 +87,12 @@ imports it: a shared object built and `dlopen`ed inside the guest.
 
 `python3-numpy` is the last one, and it is what the floating point work is checked against now. It
 imports, builds its dispatch tables and runs `dot`, `matmul`, `fft`, `exp`, `sin` and the float32
-reductions, and prints what the same numpy 1.24.2 prints natively. Two bugs came out of it: `import numpy` hung because `fcvtzu`/`fcvtas` and the other roundings were decoded
-as `fsqrt`, which made `_Py_HashDouble` loop forever, and `sin` was about 1e-6 off everywhere
-between 0.126 and 0.855 because `fmsub` took the accumulator from the wrong side. A cast of an array
-to `float32` wanted `fcvtn`, a table row without it traps, and every value a script like that prints
-now matches the same numpy on a real kernel, down to the last bit of a 16-point `fft`.
+reductions, and prints what the same numpy 1.24.2 prints natively, down to the last bit of a
+16-point `fft` and of a 100x100 product. Three bugs came out of it. `import numpy` hung because
+`fcvtzu`/`fcvtas` and the other roundings were decoded as `fsqrt`, which made `_Py_HashDouble` loop
+forever. `sin` was about 1e-6 off between 0.126 and 0.855 because `fmsub` took the accumulator from
+the wrong side. A cast of an array to `float32` runs numpy's `fcvtn` loop, which was not translated
+and trapped.
 
 ## Performance
 
