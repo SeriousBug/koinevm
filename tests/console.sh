@@ -35,6 +35,8 @@ for mode in $MODES; do
         feed 'read x'
         feed 'hello there'
         feed 'echo "read:$x"'
+        feed 'read -u 2 y; echo "e:$y"'
+        feed 'stderr there'
         feed '[ -t 0 ] && echo console-0 || echo pipe-0'
         feed '[ -t 1 ] && echo console-1 || echo pipe-1'
         feed 'printf x | { read -r y; [ -t 0 ] || echo not-a-tty; }'

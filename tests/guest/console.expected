@@ -3,6 +3,8 @@ one
 root@armjit:/# read x
 root@armjit:/# echo "read:$x"
 read:hello there
+root@armjit:/# read -u 2 y; echo "e:$y"
+e:stderr there
 root@armjit:/# [ -t 0 ] && echo console-0 || echo pipe-0
 console-0
 root@armjit:/# [ -t 1 ] && echo console-1 || echo pipe-1

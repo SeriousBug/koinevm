@@ -1314,11 +1314,11 @@ export class Kernel {
       const read = entry.end === "read" && (entry.desc.data.length > 0 || entry.desc.writers === 0);
       return { read, write: entry.end === "write", err: false, hup: read && entry.desc.writers === 0 };
     }
-    if (entry.kind === "stdin") {
+    if (this.files.consoleEntry(entry)) {
       // A console is readable when there is something to read or when it has ended, which is what
       // a shell that waits for input and a program that waits for the end of it both ask.
       const read = this.files.readReady(fd);
-      return { read, write: false, err: false, hup: false };
+      return { read, write: true, err: false, hup: false };
     }
     // A file, a device or a directory: the host never makes one wait.
     return { read: true, write: entry.kind !== "dir" && entry.desc?.writable !== false, err: false, hup: false };

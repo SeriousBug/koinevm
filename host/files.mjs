@@ -411,7 +411,7 @@ export class Files {
   readReady(fd) {
     const entry = this.map.get(fd);
     if (!entry) return true;
-    if (entry.kind === "stdin") return !terminal.live || terminal.readable();
+    if (this.consoleEntry(entry)) return !terminal.live || terminal.readable();
     if (entry.kind !== "pipe") return true;
     return entry.desc.data.length > 0 || entry.desc.writers === 0;
   }
@@ -572,11 +572,21 @@ export class Files {
     return buf.subarray(0, n);
   }
 
+  /// Whether this descriptor is the console. A terminal is one device, opened on all three standard
+  /// descriptors, so each of them reads and writes the same one: `less` takes its keys from whichever
+  /// it was handed, and here that is stderr, because there is no `/dev/tty` to open. A run with no
+  /// console has a pipe or a file on those numbers instead, and reading one of them is not a read of
+  /// the terminal.
+  consoleEntry(entry) {
+    if (entry.kind === "stdin") return true;
+    return terminal.live && (entry.kind === "stdout" || entry.kind === "stderr");
+  }
+
   read(fd, len) {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
     if (entry.kind === "dir") return -EISDIR;
-    if (entry.kind === "stdin") {
+    if (this.consoleEntry(entry)) {
       // A console the host is not reading is an empty one: the guest sees end of file, which is
       // what a program run from a test expects of its input.
       if (!terminal.live) return Buffer.alloc(0);
@@ -592,6 +602,8 @@ export class Files {
       // the read, the way a pipe's writer answers one.
       return WOULD_BLOCK;
     }
+    // The host's own output, when there is no console: there is nothing here to read out of it.
+    if (entry.kind === "stdout" || entry.kind === "stderr") return -EBADF;
     if (entry.kind === "null") return Buffer.alloc(0);
     if (entry.kind === "zero" || entry.kind === "full") return Buffer.alloc(len);
     if (entry.kind === "random") return this.randomBytes(len);

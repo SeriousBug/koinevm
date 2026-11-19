@@ -1043,7 +1043,7 @@ export class Session {
     const got = proc.kernel.files.read(request.fd, request.len);
     if (got === WOULD_BLOCK) {
       const entry = proc.kernel.files.get(request.fd);
-      this.block(thread, 0, entry?.kind === "stdin" ? "stdin" : "pipe");
+      this.block(thread, 0, entry && proc.kernel.files.consoleEntry(entry) ? "stdin" : "pipe");
       thread.pending = request;
       return 0;
     }
