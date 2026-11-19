@@ -81,6 +81,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/signals.c -o tests/guest/signals.o
 python3 tools/minilink.py tests/guest/signals.o tests/guest/signals.elf _start
 
+echo "== guest: faults (a store to a read-only page, a load from an unmapped one, a call into data) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
+    -c tests/guest/faults.c -o tests/guest/faults.o
+python3 tools/minilink.py tests/guest/faults.o tests/guest/faults.elf _start
+
 echo "== guest: tcp (connect/accept/listen/shutdown, and a child that connects) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/tcp.c -o tests/guest/tcp.o

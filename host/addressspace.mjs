@@ -8,10 +8,12 @@
 export const PAGE = 4096;
 
 export const PTE = {
+  /// There is a mapping on the page, whatever it allows: `PROT_NONE` is mapped and nothing else.
   MAPPED: 1,
   WRITABLE: 2,
   EXECUTABLE: 4,
   TRANSLATED: 8,
+  READABLE: 16,
 };
 
 export const PROT = { READ: 1, WRITE: 2, EXEC: 4 };
@@ -48,6 +50,7 @@ export class AddressSpace {
 
   protBits(prot) {
     let bits = PTE.MAPPED;
+    if (prot & PROT.READ) bits |= PTE.READABLE;
     if (prot & PROT.WRITE) bits |= PTE.WRITABLE;
     if (prot & PROT.EXEC) bits |= PTE.EXECUTABLE;
     return bits;
@@ -207,7 +210,7 @@ export class AddressSpace {
     if (want === 0) return this.brk;
     if (want < this.brkBase || want > this.brkLimit) return this.brk;
     const old = this.brk;
-    if (want > old) this.setPtes(old, want, PTE.MAPPED | PTE.WRITABLE);
+    if (want > old) this.setPtes(old, want, PTE.MAPPED | PTE.READABLE | PTE.WRITABLE);
     else if (want < old) this.clearPtes(want, old);
     this.brk = want;
     return want;

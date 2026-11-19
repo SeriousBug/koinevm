@@ -66,10 +66,11 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Seventeen more have no native oracle and assert the ABI themselves: the loader
-handoff (`tests/dyn.sh`), the memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`,
-which makes two names that differ only in case and checks they stay two files), and the socket,
-epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all 97.
+checks on and off. Eighteen more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`, which makes two names that
+differ only in case and checks they stay two files), the pages a guest may not touch
+(`tests/faults.sh`), and the socket, epoll, signal and resolver paths, each in both address-check
+modes. `bash tests/run.sh` runs all 99.
 
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
@@ -151,8 +152,12 @@ Two things follow.
   are unreachable from the entries the translator finds report `undecoded instruction`, up to 116
   words in one page. They are where the `-mgeneral-regs-only` gap and the crypto/atomics gap would
   show up in real code rather than in a fixture.
-- **Page permissions.** The page table records them and `mprotect` maintains them, but a translated
-  store does not consult them: a write to a read-only page lands instead of faulting.
+- **Page permissions.** Every translated load and store consults the page table, which is what says
+  a page is mapped, readable, writable and executable; the check is always emitted, because a
+  program's correctness depends on the fault rather than on its speed. A store to a read-only page,
+  a load from an unmapped one and a call into a page without execute all end the process with
+  `SIGSEGV`, which `tests/faults.sh` compares against a real kernel. What is still missing is the
+  handler: a synchronous fault cannot be caught yet, so a program with a `SIGSEGV` handler dies.
 - **Self-modifying code and guest JITs.** Nothing invalidates a translation. Adding a page module is
   already dynamic, so invalidation has somewhere to live, but it is not implemented.
 - **Signals.** A trap kills the run instead of being delivered to a guest handler.

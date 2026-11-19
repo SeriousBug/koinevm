@@ -108,11 +108,34 @@ pub const INTERP_BASE: u64 = 0x1000_0000;
 pub const MMAP_BASE: u64 = 0x4000_0000;
 
 pub mod pte {
+    /// There is a mapping on the page, whatever it allows: `PROT_NONE` is mapped and nothing else.
     pub const MAPPED: u8 = 1;
     pub const WRITABLE: u8 = 2;
     pub const EXECUTABLE: u8 = 4;
     /// The page holds at least one translated block, so `mprotect` or a write has something to drop.
     pub const TRANSLATED: u8 = 8;
+    pub const READABLE: u8 = 16;
+    /// What a load, a store and an instruction fetch each need a page to allow.
+    pub const LOAD: u8 = MAPPED | READABLE;
+    pub const STORE: u8 = MAPPED | WRITABLE;
+    pub const FETCH: u8 = MAPPED | EXECUTABLE;
+}
+
+/// What a trap was about. A fault is the guest's own doing and names the address it touched, which
+/// is what a kernel's page fault handler answers; a refusal is the translator's, and the run stops
+/// there with the state it was in because there is no instruction to run.
+pub mod trap {
+    /// An address at or above the linear memory: a 64-bit address whose high half wrapped.
+    pub const RANGE: i32 = 1;
+    /// `sp` named a page that is not mapped writable.
+    pub const STACK: i32 = 2;
+    pub const REFUSED: i32 = 3;
+    /// A load from a page the guest has not mapped.
+    pub const READ: i32 = 4;
+    /// A store to a page that is not mapped, or not writable.
+    pub const WRITE: i32 = 5;
+    /// Execution of a page that is not mapped, or not executable.
+    pub const EXEC: i32 = 6;
 }
 
 /// 4 GiB less a page: every guest address is then checked by the engine itself, and an address in
@@ -301,11 +324,10 @@ fn page_table(images: &[&Elf], stack_floor: u64, stack_top: u64) -> Vec<u8> {
             ptes[p] |= bits;
         }
     };
-    set(0, IMAGE_BASE, pte::MAPPED | pte::WRITABLE);
-    set(stack_floor, stack_top, pte::MAPPED | pte::WRITABLE);
+    set(stack_floor, stack_top, pte::LOAD | pte::WRITABLE);
     for image in images {
         for s in &image.segments {
-            let mut bits = pte::MAPPED;
+            let mut bits = pte::LOAD;
             if s.flags & crate::elf::PF_W != 0 {
                 bits |= pte::WRITABLE;
             }
@@ -1823,7 +1845,7 @@ fn region_body(
 /// A region that no amount of retrying can emit becomes a trap that names where it started.
 fn trap_body(ty_region: u32, entry: u64, ids: &Ids) -> Func {
     let mut f = Func::new(ty_region);
-    f.i32c(3);
+    f.i32c(trap::REFUSED);
     f.i64c(entry as i64);
     f.i32c(entry as i32);
     f.call(ids.trap);
@@ -1904,12 +1926,13 @@ impl<'a> RegionEmitter<'a> {
         self.f.wrap_i64();
         self.f.op(I32_ADD);
         self.f.mem(I32_LOAD8_U, 0, 0);
-        self.f.i32c((pte::MAPPED | pte::WRITABLE) as i32);
+        self.f.i32c((pte::LOAD | pte::WRITABLE) as i32);
         self.f.op(I32_AND);
-        self.f.op(I32_EQZ);
+        self.f.i32c((pte::LOAD | pte::WRITABLE) as i32);
+        self.f.op(I32_NE);
         self.f.op(IF);
         self.f.body.push(0x40);
-        self.f.i32c(2);
+        self.f.i32c(trap::STACK);
         self.f.lg(31);
         self.f.i32c(self.region.blocks[0].addr as i32);
         self.f.call(self.ids.trap);
@@ -2460,12 +2483,56 @@ impl<'a> RegionEmitter<'a> {
         self.f.i64c((self.layout.mem_size - size) as i64);
         self.f.op(I64_GT_U);
         self.open_if();
-        self.f.i32c(1);
+        self.f.i32c(trap::RANGE);
         self.f.lg(addr);
         self.f.i32c(self.cur_pc as i32);
         self.f.call(self.ids.trap);
         self.f.op(UNREACHABLE);
         self.close_if();
+    }
+
+    /// Whether the guest is allowed to touch `size` bytes at `addr` at all, which is what a page's
+    /// bits say: a load needs the page mapped and a store needs it writable as well. The check is
+    /// always emitted. A program's correctness depends on the fault rather than on its speed, and
+    /// an access to the engine's own pages - the register shadow, the page table, the dispatch
+    /// table - is a wild pointer that has to stop instead of landing.
+    fn check_access(&mut self, addr: u32, size: u64, write: bool) {
+        self.check_byte(addr, size);
+        // The load of the first page and the load of the last byte are combined rather than
+        // tested one after the other, so an access that stays inside a page costs one branch.
+        self.pte_byte(addr, 0);
+        if size > 1 {
+            self.pte_byte(addr, (size - 1) as i64);
+            self.f.op(I32_AND);
+        }
+        let need = if write { pte::STORE as i32 } else { pte::LOAD as i32 };
+        self.f.i32c(need);
+        self.f.op(I32_AND);
+        // Every bit of `need` has to be there: a page that is mapped but read-only has one of them.
+        self.f.i32c(need);
+        self.f.op(I32_NE);
+        self.open_if();
+        self.f.i32c(if write { trap::WRITE } else { trap::READ });
+        self.f.lg(addr);
+        self.f.i32c(self.cur_pc as i32);
+        self.f.call(self.ids.trap);
+        self.f.op(UNREACHABLE);
+        self.close_if();
+    }
+
+    /// The page table byte of the page `off` bytes past `addr`, on the stack as an i32.
+    fn pte_byte(&mut self, addr: u32, off: i64) {
+        self.f.lg(addr);
+        if off != 0 {
+            self.f.i64c(off);
+            self.f.op(I64_ADD);
+        }
+        self.f.wrap_i64();
+        self.f.i32c(12);
+        self.f.op(I32_SHR_U);
+        self.f.i32c(PTE_BASE as i32);
+        self.f.op(I32_ADD);
+        self.f.mem(I32_LOAD8_U, 0, 0);
     }
 
 
@@ -2722,7 +2789,7 @@ impl<'a> RegionEmitter<'a> {
     /// The same load into a scratch local, for a form whose destination registers are still the
     /// source of the next step.
     fn vload_local(&mut self, width: u32, addr: u32, local: u32) {
-        self.check_byte(addr, width as u64);
+        self.check_access(addr, width as u64, false);
         match width {
             16 | 8 | 4 => {
                 self.f.lg(addr);
@@ -2754,7 +2821,7 @@ impl<'a> RegionEmitter<'a> {
     }
 
     fn vstore_local(&mut self, width: u32, addr: u32, local: u32) {
-        self.check_byte(addr, width as u64);
+        self.check_access(addr, width as u64, true);
         self.f.lg(addr);
         self.f.wrap_i64();
         match width {
@@ -3267,7 +3334,7 @@ impl<'a> RegionEmitter<'a> {
     }
 
     fn emit_load(&mut self, addr: u32, size: u32, opc: u32, rt: u32) {
-        self.check_byte(addr, 1u64 << size);
+        self.check_access(addr, 1u64 << size, false);
         self.f.lg(addr);
         self.f.wrap_i64();
         match (size, opc) {
@@ -3315,7 +3382,7 @@ impl<'a> RegionEmitter<'a> {
     }
 
     fn emit_store(&mut self, addr: u32, size: u32, rt: u32) {
-        self.check_byte(addr, 1u64 << size);
+        self.check_access(addr, 1u64 << size, true);
         self.f.lg(addr);
         self.f.wrap_i64();
         match size {
@@ -3345,7 +3412,7 @@ impl<'a> RegionEmitter<'a> {
         if !self.layout.allow_undefined {
             return Err(why);
         }
-        self.f.i32c(3);
+        self.f.i32c(trap::REFUSED);
         self.f.i64c(self.cur_pc as i64);
         self.f.i32c(self.cur_pc as i32);
         self.f.call(self.ids.trap);
@@ -4110,7 +4177,9 @@ impl<'a> RegionEmitter<'a> {
                 }
             }
             Insn::Brk => {
-                self.f.i32c(3);
+                // A breakpoint is how a guest reaches a debugger, and with none there the trap
+                // report is the debugger.
+                self.f.i32c(trap::REFUSED);
                 self.f.i64c(addr as i64);
                 self.f.i32c(addr as i32);
                 self.f.call(self.ids.trap);
@@ -4302,7 +4371,7 @@ impl<'a> RegionEmitter<'a> {
                         self.f.ls(L_T1);
                     }
                     let r = (rt + i) % 32;
-                    self.check_byte(L_T1, ebytes as u64);
+                    self.check_access(L_T1, ebytes as u64, !is_load);
                     if is_load {
                         self.getv(r);
                         self.f.lg(L_T1);
@@ -4367,7 +4436,7 @@ impl<'a> RegionEmitter<'a> {
                 self.addr_base_off(rn, 0);
                 self.f.lg(L_T1);
                 self.f.ls(L_T2);
-                self.check_byte(L_T1, (bits / 8) as u64);
+                self.check_access(L_T1, (bits / 8) as u64, false);
                 self.f.lg(L_T1);
                 self.f.wrap_i64();
                 let op = match bits {
@@ -5989,7 +6058,7 @@ impl<'a> RegionEmitter<'a> {
     fn emit_load_or_store_pair(&mut self, is_load: bool, width: u32, signed_word: bool, addr: u32, r: u32) {
         if is_load {
             if signed_word {
-                self.check_byte(addr, 4);
+                self.check_access(addr, 4, false);
                 self.f.lg(addr);
                 self.f.wrap_i64();
                 self.f.mem(I64_LOAD32_S, 2, 0);

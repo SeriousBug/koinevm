@@ -1,0 +1,10 @@
+ok   a writable page takes a store
+ok   a read-only page still loads
+ok   a store to a read-only page faults
+ok   a load from an unmapped page faults
+ok   a call into a page that is not executable faults
+ok   a store to the null page faults
+ok   a store to the page table faults
+ok   a store to a PROT_NONE page faults
+ok   a page put back to writable takes the store again
+faults: all checks passed

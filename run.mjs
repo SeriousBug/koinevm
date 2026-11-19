@@ -53,6 +53,29 @@ function ring(n) {
   return pcs;
 }
 
+/// A guest access the pages did not allow, or an address that is not memory at all. It is a fault
+/// and not a report: the process is the one the kernel would have killed, and the state it was in
+/// is worth printing only when the runtime is asked for it.
+class GuestFault {
+  constructor(kind, addr, at) {
+    this.kind = kind;
+    this.addr = Number(BigInt.asUintN(64, addr));
+    this.at = at >>> 0;
+  }
+}
+
+/// The signal a fault raises, and what to call it in a report.
+function faultOf(kind) {
+  switch (kind) {
+    case 1: return { signal: 11, what: "an address past the end of memory" };
+    case 2: return { signal: 11, what: "a stack pointer outside its mapping" };
+    case 4: return { signal: 11, what: "a load from a page that is not mapped" };
+    case 5: return { signal: 11, what: "a store to a page that is not writable" };
+    case 6: return { signal: 11, what: "execution of a page that is not executable" };
+    default: return null;
+  }
+}
+
 function trap(kind, addr, at) {
   // The address is a 64-bit guest address: a load whose base went wrong carries the high half, and
   // truncating it to 32 bits reports an address that is inside the image.
@@ -340,7 +363,11 @@ function makeImports(proc) {
     },
     trap: (kind, addr, at) => {
       enter(proc);
-      trap(kind, addr, at);
+      const fault = faultOf(Number(kind));
+      if (!fault) trap(kind, addr, at);
+      const f = new GuestFault(Number(kind), addr, at);
+      Object.assign(f, fault);
+      throw f;
     },
     trace2: (pc, sp) => {
       enter(proc);

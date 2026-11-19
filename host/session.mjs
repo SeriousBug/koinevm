@@ -17,6 +17,7 @@ import { WOULD_BLOCK, ENOENT, EACCES, ELOOP } from "./files.mjs";
 import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
 import { Mach } from "./pages.mjs";
+import { PTE } from "./addressspace.mjs";
 
 const SHADOW = 0x0;
 const SHADOW_PC = 0x108;
@@ -155,7 +156,7 @@ export class Session {
     const after = process.env.ARMJIT_WATCHDOG ? Number(process.env.ARMJIT_WATCHDOG) * 1000 : 0;
     const startedAt = Date.now();
     for (;;) {
-      if (this.root.state === "exited") return this.root.code;
+      if (this.root.state === "exited") return this.root.signal ? 128 + this.root.signal : this.root.code;
       const pick = this.pick();
       if (!pick) {
         // Nothing can run, but a packet still can arrive: the host's event loop only turns while
@@ -223,19 +224,37 @@ export class Session {
       return this.answer(proc, thread, request);
     }
     let status;
-    if (thread.entry) {
-      thread.entry = false;
-      status = proc.instance.exports.run(proc.meta.entry, BigInt(proc.meta.sp), 0);
-    } else {
-      status = proc.instance.exports.run(0, 0n, 1);
-    }
-    while (status === 2) {
-      const pc = proc.mach.view.getUint32(SHADOW_PC, true) >>> 0;
-      if (!proc.kernel.space.imageOf(pc)) {
-        console.error(`armjit: pid ${proc.pid} jumped to untranslated address 0x${pc.toString(16)}`);
-        return 1;
+    try {
+      if (thread.entry) {
+        thread.entry = false;
+        status = proc.instance.exports.run(proc.meta.entry, BigInt(proc.meta.sp), 0);
+      } else {
+        status = proc.instance.exports.run(0, 0n, 1);
       }
-      status = await proc.mach.translateAndResume(pc);
+      while (status === 2) {
+        const pc = proc.mach.view.getUint32(SHADOW_PC, true) >>> 0;
+        // A jump into a page the guest did not map executable is a fault rather than a request to
+        // translate: running data is how a program finds out it has a wild function pointer.
+        if ((proc.kernel.space.ptes[pc >>> 12] & (PTE.MAPPED | PTE.EXECUTABLE)) !== (PTE.MAPPED | PTE.EXECUTABLE)) {
+          return this.faulted(proc, thread, {
+            kind: 6,
+            signal: 11,
+            addr: pc,
+            at: pc,
+            what: "execution of a page that is not executable",
+          });
+        }
+        if (!proc.kernel.space.imageOf(pc)) {
+          console.error(`armjit: pid ${proc.pid} jumped to untranslated address 0x${pc.toString(16)}`);
+          return 1;
+        }
+        status = await proc.mach.translateAndResume(pc);
+      }
+    } catch (e) {
+      // A fault unwinds the wasm call it happened in, which is how the guest leaves the region it
+      // was in: the process is over either way, and the address is the one a kernel would report.
+      if (e && e.kind !== undefined && e.signal) return this.faulted(proc, thread, e);
+      throw e;
     }
     if (status === 1) return this.serve(proc, thread);
     if (status === 0) return this.exitedBySyscall(proc, thread, proc.kernel.exited ?? 0);
@@ -310,6 +329,19 @@ export class Session {
         console.error(`armjit: pid ${proc.pid} asked for an unknown host action ${request.kind}`);
         return 1;
     }
+  }
+
+  /// An access the pages did not allow. It is synchronous, so it belongs to the instruction that
+  /// made it, and the process ends the way a kernel ends one whose page fault it cannot answer:
+  /// with the signal, which is what its parent's wait status reports.
+  faulted(proc, thread, fault) {
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(
+        `fault: ${proc.pid} ${fault.what} at 0x${fault.addr.toString(16)} from 0x${fault.at.toString(16)}`,
+      );
+    }
+    proc.fault = { signal: fault.signal, addr: fault.addr, at: fault.at };
+    return this.exit(proc, 0, fault.signal);
   }
 
   /// A signal from one process to another. There is no handler to run, so what a signal does is
@@ -601,12 +633,18 @@ export class Session {
     return 0;
   }
 
-  /// The whole of the parent's memory that exists: the engine area, which holds the page and
-  /// dispatch tables, and every page the page table says is mapped. Rest is zero in both.
+  /// The whole of the parent's memory that exists: the engine area, which holds the control block
+  /// and the page table, and every page the page table says is mapped. Rest is zero in both.
+  ///
+  /// The engine area is copied first and by hand, because it is not mapped for the guest: the child
+  /// resumes from the shadow the parent left, and a page the parent mapped at run time is one the
+  /// child's own copy of the table has to say is there.
   copyMemory(from, to) {
     const src = new Uint8Array(from.memory.buffer);
     const dst = new Uint8Array(to.memory.buffer);
-    const ptes = new Uint8Array(from.memory.buffer, from.meta.pte_base, 1 << 20);
+    const pteBase = from.meta.pte_base;
+    dst.set(src.subarray(0, pteBase + (1 << 20)), 0);
+    const ptes = new Uint8Array(from.memory.buffer, pteBase, 1 << 20);
     let i = 0;
     while (i < ptes.length) {
       if (ptes[i] === 0) {
