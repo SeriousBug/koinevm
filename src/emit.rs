@@ -2995,7 +2995,7 @@ impl<'a> RegionEmitter<'a> {
         self.f.ls(L_TI);
     }
 
-    /// Whether the nearest f32 of `L_F0` is above it (`up`) or below it.
+    /// Whether the nearest f32 in `L_S0` is above the source in `L_F0` (`up`) or below it.
     fn narrow_beyond(&mut self, up: bool) {
         self.f.lg(L_S0);
         self.f.op(F64_PROMOTE_F32);
@@ -3092,8 +3092,8 @@ impl<'a> RegionEmitter<'a> {
         self.f.lg(L_T4);
         self.f.op(I64_SUB);
         self.f.ls(L_T1);
-        // Upwards is what rounding away from zero by a power of two means, and which way that is
-        // depends on the sign: towards +inf above zero, towards -inf below it.
+        // The magnitude steps up when the mode rounds away from zero on that side of it, which is
+        // towards +inf above zero and towards -inf below.
         self.f.lg(L_T4);
         self.f.op(I64_EQZ);
         self.f.op(I32_EQZ);
