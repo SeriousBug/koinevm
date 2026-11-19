@@ -88,16 +88,33 @@ function recentTail(n) {
 // ARMJIT_TRACE_PRINT prints the state *before* each instruction, which is what the translator wrote
 // to the shadow: pc, packed NZCV and the registers named in ARMJIT_TRACE_REGS.
 const traceRegs = (process.env.ARMJIT_TRACE_REGS || "8").split(",").map(Number);
-// ARMJIT_WATCH_PC=0xADDR[:SKIP],... ARMJIT_WATCH_DUMP=0xADDR:LEN,... or xN+0xNN:LEN reads guest memory the time
-// that instruction runs, once the first SKIP hits have gone by. Each hit also reports the call chain
-// the frame pointers describe, because the caller is what says which call this is.
+// ARMJIT_WATCH_PC=0xADDR[:SKIP[:MAX]],... ARMJIT_WATCH_DUMP=0xADDR:LEN,... or xN+0xNN:LEN reads guest memory
+// the time that instruction runs, once the first SKIP hits have gone by, MAX of them at most. Each hit
+// also reports the call chain the frame pointers describe, because the caller is what says which call
+// this is. An address is absolute, or `image+0xNN` for an offset inside the image whose path holds
+// `image`, which is how a shared object's own code gets named before the load address of the run is
+// known.
 const watches = (process.env.ARMJIT_WATCH_PC || "")
   .split(",")
   .filter(Boolean)
   .map((s) => {
-    const [at, skip] = s.split(":");
-    return { pc: parseInt(at, 16), skip: skip ? parseInt(skip, 10) : 0, hits: 0 };
+    const [at, skip, max] = s.split(":");
+    const img = /^(.+)\+0x([0-9a-f]+)$/.exec(at);
+    return {
+      image: img ? img[1] : null,
+      at: img ? parseInt(img[2], 16) : parseInt(at, 16),
+      pc: img ? null : parseInt(at, 16),
+      skip: skip ? parseInt(skip, 10) : 0,
+      max: max ? parseInt(max, 10) : Infinity,
+      hits: 0,
+    };
   });
+function watchAddress(w) {
+  if (w.pc !== null) return w.pc;
+  for (const m of ranges) if (m.host.includes(w.image)) return (w.pc = m.base + w.at);
+  return NaN;
+}
+const watchVecRegs = (process.env.ARMJIT_WATCH_VREGS || "0,1").split(",").filter(Boolean).map(Number);
 // A dump address is absolute, `sp+0xNN`, or a register plus an offset, because the frame a value
 // lives in is only known once the run is there.
 const watchRanges = (process.env.ARMJIT_WATCH_DUMP || "")
@@ -134,8 +151,9 @@ function watchWrite(pc) {
 function watch(pc) {
   if (watchMem !== null) watchWrite(pc);
   for (const w of watches) {
-    if (w.pc !== pc) continue;
+    if (watchAddress(w) !== pc) continue;
     if (w.hits++ < w.skip) continue;
+    if (w.hits > w.skip + w.max) continue;
     report(pc);
   }
 }
@@ -233,6 +251,16 @@ function report(pc) {
     console.error(`  mem 0x${from.toString(16)}: ${hex} ${JSON.stringify(text)}`);
   }
   console.error(state());
+  // The FP argument and result of a conversion is what a report of the integer registers leaves out.
+  const vecs = [];
+  for (const r of watchVecRegs) {
+    const off = 0x600 + r * 16;
+    vecs.push(
+      `v${r}=[${view.getFloat64(off, true)}, ${view.getFloat32(off, true)}f32]` +
+        ` 0x${view.getBigUint64(off, true).toString(16)}:${view.getBigUint64(off + 8, true).toString(16)}`,
+    );
+  }
+  console.error(`  ${vecs.join(" ")}`);
   console.error(backtrace());
   console.error(`  ring ${ring(40).map(where).join(" -> ")}`);
   console.error(`  last ${recentTail(ARM_RING).map(where).join(" -> ")}`);
@@ -270,9 +298,10 @@ function trace2(pc, sp) {
   if (heartbeat && (++ticks & 0xfff) === 0 && Date.now() - beat > heartbeat) {
     beat = Date.now();
     console.error(
-      `heartbeat ${((beat - startedAt) / 1000).toFixed(0)}s at ${where(at)}` +
+      `heartbeat ${((beat - startedAt) / 1000).toFixed(0)}s at ${where(at)} 0x${at.toString(16)}` +
         `\n  trail ${recentTail(16).map(where).join(" -> ")}` +
         "\n" + backtrace() +
+        "\n" + state() +
         "\n  hot " + hot(4096),
     );
   }
