@@ -281,6 +281,8 @@ static void setup(void) {
     X(xtn_8b, "xtn 8b", "xtn v2.8b, v0.8h")                                                     \
     X(xtn_4h, "xtn 4h", "xtn v2.4h, v0.4s")                                                     \
     X(xtn_2s, "xtn 2s", "xtn v2.2s, v0.2d")                                                     \
+    X(fcvtn_2s, "fcvtn 2s", "fcvtn v2.2s, v0.2d")                                               \
+    X(fcvtl_2d, "fcvtl 2d", "fcvtl v2.2d, v0.2s")                                              \
     X(shrn_8b, "shrn 8b #3", "shrn v2.8b, v0.8h, #3")                                           \
     X(shrn_4h, "shrn 4h #7", "shrn v2.4h, v0.4s, #7")                                           \
     X(shrn_2s, "shrn 2s #13", "shrn v2.2s, v0.2d, #13")                                         \
@@ -452,6 +454,8 @@ static void setup(void) {
     X(xtn2_16b, "xtn2 16b", "mov v2.16b, v3.16b\n xtn2 v2.16b, v0.8h")                          \
     X(xtn2_8h, "xtn2 8h", "mov v2.16b, v3.16b\n xtn2 v2.8h, v0.4s")                             \
     X(xtn2_4s, "xtn2 4s", "mov v2.16b, v3.16b\n xtn2 v2.4s, v0.2d")                             \
+    X(fcvtn2_4s, "fcvtn2 4s", "mov v2.16b, v3.16b\n fcvtn2 v2.4s, v0.2d")                       \
+    X(fcvtl2_2d, "fcvtl2 2d", "fcvtl2 v2.2d, v0.4s")                                           \
     X(addhn_8b, "addhn 8b", "addhn v2.8b, v0.8h, v1.8h")                                        \
     X(addhn_4h, "addhn 4h", "addhn v2.4h, v0.4s, v1.4s")                                        \
     X(addhn_2s, "addhn 2s", "addhn v2.2s, v0.2d, v1.2d")                                        \

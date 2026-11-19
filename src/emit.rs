@@ -204,15 +204,15 @@ fn narrows_to_low_half(i: &Insn) -> bool {
         | Insn::VecStruct { q, .. }
         | Insn::VecLd1r { q, .. }
         | Insn::VecThreeSame { q, .. }
-        | Insn::VecTwoMisc { q, u: false, .. }
         | Insn::VecAcross { q, .. }
         | Insn::VecModImm { q, .. }
         | Insn::VecPermute { q, .. }
         | Insn::VecExt { q, .. }
         | Insn::VecTbl { q, .. } => !q,
         // `shll` widens into the whole register, so the q bit picks which half of the source it
-        // reads rather than how much it writes.
-        Insn::VecTwoMisc { q, op, .. } => !q && op != 0b10011,
+        // reads rather than how much it writes, and the narrowing and widening float conversions
+        // write all of the destination whichever half they take.
+        Insn::VecTwoMisc { q, op, .. } => !q && !matches!(op, 0b10011 | 0b10110 | 0b10111),
         // The long multiplies write the whole destination even with the q bit clear, and so do
         // sshll and ushll: q picks which half of the sources widen, not how much is written.
         Insn::VecThreeDiff { q, op, .. } => {
@@ -4694,6 +4694,33 @@ impl<'a> RegionEmitter<'a> {
             }
             Insn::VecTwoMisc { q, u, size, op, rn, rd } => {
                 match (u, size, op) {
+                    (false, 1, 0b10110) => {
+                        // fcvtn / fcvtn2: two doubles narrowed to two singles, in the low half or
+                        // above the ones the destination keeps. Half precision is the size 0 form.
+                        self.getv(rn);
+                        self.f.simd(simd::F32X4_DEMOTE_F64X2_ZERO);
+                        if q {
+                            self.f.ls(L_V1);
+                            self.getv(rd);
+                            self.f.lg(L_V1);
+                            self.f.simd(simd::I8X16_SHUFFLE);
+                            self.f.body.extend_from_slice(&[
+                                0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23,
+                            ]);
+                        }
+                        self.setv(rd);
+                    }
+                    (false, 1, 0b10111) => {
+                        // fcvtl / fcvtl2: two singles widened to two doubles, from the low half of
+                        // the source or from the high one. The whole destination is written.
+                        self.getv(rn);
+                        if q {
+                            self.f.ls(L_V1);
+                            self.shuffle(L_V1, L_V1, swap_halves_mask());
+                        }
+                        self.f.simd(simd::F64X2_PROMOTE_LOW_F32X4);
+                        self.setv(rd);
+                    }
                     (false, _, 0b10010) => {
                         // xtn / xtn2
                         self.getv(rn);

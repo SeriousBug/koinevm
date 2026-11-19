@@ -60,7 +60,7 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `hello` | string setup, a loop, integer division by magic multiply, `umulh`, `strb`, exit code | exact |
 | `call` | recursion (`fib(20)`), a function pointer table called through `blr`, `stp`/`ldp` frames, signed division, printing | exact, exit 7 |
 | `flags` | `tst`/`ccmp` chains, `adcs`/`sbc` multi-word arithmetic, `csel`/`cset` over a matrix, `b.hi` | exact |
-| `simd` | load/store widths, three-same, two-misc, across, three-different, shifts by immediate, copy/permute/`tbl`/`tbx`/`ext`, every conversion between general and FP registers, and the one-lane scalar forms | exact |
+| `simd` | load/store widths, three-same, two-misc, across, three-different, shifts by immediate, copy/permute/`tbl`/`tbx`/`ext`, every conversion between general and FP registers and every rounding on the way back, the vector rounding family, the minimums and maximums, the narrowing and widening float conversions, and the one-lane scalar forms | exact |
 | `bits` | `rbit`, `clz`, `cls`, `rev`, `rev32`, `rev16` over 76 patterns, and the `rbit; clz; lsr #2` sequence glibc finds a byte with | exact |
 | `stack` | frames sized at run time: `sub sp, sp, xN` in the shifted and extended forms, `and sp, xn, #-16`, `alloca` with calls while the frame is open, recursion with a buffer per level | exact |
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
@@ -74,7 +74,7 @@ epoll, signal and resolver paths, each in both address-check modes. `bash tests/
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
 a container and records the oracle there) through the translated `ld-linux` and `libc.so.6`, in both
-address-check modes. `bash tests/shell.sh` runs Debian's own `dash` under 53 `-c` scripts, translated
+address-check modes. `bash tests/shell.sh` runs Debian's own `dash` under 50 `-c` scripts, translated
 and inside `chroot` on a container's kernel, and compares stdout, stderr and exit status of each.
 
 The toolchain is the other test, because it is the thing that exercises every instruction the way
@@ -84,6 +84,14 @@ compiles a C file to assembly that is byte for byte what the same gcc 12.2 emits
 pass of `-fdump-tree-all` and `-fdump-rtl-all` matching apart from the addresses the compiler's own
 allocator landed on. `pip install --no-binary :all: msgpack` compiles a C extension with that gcc and
 imports it: a shared object built and `dlopen`ed inside the guest.
+
+`python3-numpy` is the last one, and it is what the floating point work is checked against now. It
+imports, builds its dispatch tables and runs `dot`, `matmul`, `fft`, `exp`, `sin` and the float32
+reductions, and prints what the same numpy 1.24.2 prints natively. Two bugs came out of it: `import numpy` hung because `fcvtzu`/`fcvtas` and the other roundings were decoded
+as `fsqrt`, which made `_Py_HashDouble` loop forever, and `sin` was about 1e-6 off everywhere
+between 0.126 and 0.855 because `fmsub` took the accumulator from the wrong side. A cast of an array
+to `float32` wanted `fcvtn`, a table row without it traps, and every value a script like that prints
+now matches the same numpy on a real kernel, down to the last bit of a 16-point `fft`.
 
 ## Performance
 
@@ -125,7 +133,7 @@ Two things follow.
   `dash: 1: nosuchcommand: not found` and exits 127, `-c ':;exit 7'` exits 7, all matching the same
   binary on a real kernel.
 - **Variable expansion and control flow.** Parameters, substrings, defaults, assignments,
-  arithmetic, quotes, `if`/`while`/`for`/`case`, functions and `printf` all behave: 53 `-c` scripts
+  arithmetic, quotes, `if`/`while`/`for`/`case`, functions and `printf` all behave: 50 `-c` scripts
   print what the same binary prints on a real kernel and exit the same way. Pipes, command
   substitution, subshells, background jobs with `wait` and external commands are in that set. A pipe
   is two processes over one descriptor table, which is what `fork` and `execve` are here.
