@@ -11,6 +11,7 @@
 // syscall. A guest that blocks on a pipe its child has yet to write is therefore fine as long as
 // the child can run, and a deadlock is reported as one instead of hanging.
 
+import { randomFillSync } from "node:crypto";
 import fs from "node:fs";
 import { Kernel, ECHILD, EBADF, EFAULT, ESRCH, EINTR } from "./syscall.mjs";
 import { ENOENT, EACCES, ELOOP } from "./files.mjs";
@@ -81,6 +82,7 @@ export class Session {
       current: null,
     };
     this.instantiate(proc);
+    this.seedRandom(proc);
     proc.threads.push(this.newThread(proc, proc.pid, { entry: true }));
     proc.current = proc.threads[0];
     this.processes.push(proc);
@@ -161,6 +163,29 @@ export class Session {
       imports,
     });
     return proc;
+  }
+
+  /// Fill the 16 bytes AT_RANDOM points at with fresh ones: the translation is cached and the run
+  /// is not, so a canary or a hash seed has to come from this run rather than the one that wrote
+  /// the module. A fork copies its parent's memory and keeps the same blob.
+  seedRandom(proc) {
+    const view = new DataView(proc.memory.buffer);
+    const sp = Number(proc.meta.sp);
+    const argc = Number(view.getBigUint64(sp, true));
+    let at = sp + 8 + argc * 8;
+    // `argv` and `envp` are lists of addresses, each ended by a null pointer.
+    while (view.getBigUint64(at, true) !== 0n) at += 8;
+    at += 8;
+    while (view.getBigUint64(at, true) !== 0n) at += 8;
+    at += 8;
+    for (;; at += 16) {
+      const type = Number(view.getBigUint64(at, true));
+      if (type === 0) return;
+      if (type !== 25) continue;
+      const address = Number(view.getBigUint64(at + 8, true));
+      randomFillSync(new Uint8Array(proc.memory.buffer, address, 16));
+      return;
+    }
   }
 
   /// Run until the process that started the session exits.
@@ -997,6 +1022,7 @@ export class Session {
     // A caught signal is back to its default after an exec, and an ignored one stays ignored.
     const ignored = new Map([...proc.kernel.signals].filter(([, how]) => how === "ignore"));
     this.instantiate(proc, files);
+    this.seedRandom(proc);
     proc.kernel.ids = ids;
     proc.kernel.signals = ignored;
     // An exec leaves one thread behind: the one that called it, with the others gone with the

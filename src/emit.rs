@@ -934,7 +934,8 @@ pub fn build_initial_stack(
         argv_addrs.push(sb.bytes(&cstr(a)));
     }
     let platform_addr = sb.bytes(b"aarch64\0");
-    // Fixed AT_RANDOM: runs reproduce, at the cost of every run being identical.
+    // A placeholder: the host fills these 16 bytes with fresh ones before it starts the guest,
+    // because a translation is cached and a run is not.
     let random_addr = sb.bytes(&[
         0x4a, 0x9f, 0x11, 0x2c, 0x77, 0x03, 0xd5, 0x6e, 0x21, 0xb8, 0x64, 0x9a, 0x0f, 0x33, 0xc7, 0x58,
     ]);

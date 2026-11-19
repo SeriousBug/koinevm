@@ -4,6 +4,7 @@
 // tree: the host does the I/O, this class keeps the descriptor table and the guest's idea of them
 // straight. Descriptors 0..2 are the process's own streams.
 
+import { randomFillSync } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -240,8 +241,6 @@ export class Files {
     this.map = new Map();
     this.next = 3;
     this.seed = 1;
-    /// The bytes `/dev/urandom` and `getrandom` hand out: one stream, so a run twice is a run twice.
-    this.random = 1n;
     this.cwd = "/";
     this.umask = 0o022;
     /// What each host directory holds, by the directory's own timestamp: the exact spelling of a
@@ -461,16 +460,11 @@ export class Files {
     return entry.desc.data.length > 0 || entry.desc.writers === 0;
   }
 
-  /// Bytes from a generator that starts from a fixed point, so a run reproduces.
+  /// The host's CSPRNG answers for `/dev/random`, `/dev/urandom` and `getrandom`: the kernel this
+  /// emulates has no entropy pool of its own, and a program that asks for bytes has to get fresh
+  /// ones rather than the same sequence every run.
   randomBytes(len) {
-    // Deterministic, and 64 bits wide: the step's product does not fit in a double, and the low
-    // bytes of a rounded one are always zero.
-    const out = Buffer.alloc(len);
-    for (let i = 0; i < len; i++) {
-      this.random = (this.random * 6364136223846793005n + 1442695040888963407n) & 0xffffffffffffffffn;
-      out[i] = Number((this.random >> 33n) & 0xffn);
-    }
-    return out;
+    return randomFillSync(Buffer.alloc(len));
   }
 
   /// fcntl's F_DUPFD: another descriptor on the same open file description.

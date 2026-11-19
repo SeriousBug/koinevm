@@ -4,6 +4,7 @@
 // syscall that ends the process answers `stop = 1`; one this kernel does not implement answers
 // -ENOSYS rather than trapping, so a run gets as far as it can and says what it was missing.
 
+import { randomFillSync } from "node:crypto";
 import fs from "node:fs";
 import { AddressSpace, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
 import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK, O_WRONLY, O_RDWR, terminal } from "./files.mjs";
@@ -157,7 +158,6 @@ export class Kernel {
     /// a package manager's own sandbox work rather than argue with it.
     this.ids = { uid: 0, euid: 0, gid: 0, egid: 0, groups: [0] };
     this.table = new Map();
-    this.random = 0n;
     // What a syscall that cannot finish inside the guest's wasm call leaves for the host: the run
     // returns, this is served, and the process is resumed with x0 as the answer.
     this.pending = null;
@@ -397,7 +397,6 @@ export class Kernel {
       fds: new Map([...this.files.map].map(([fd, entry]) => [fd, this.files.copyEntry(entry)])),
       nextFd: this.files.next,
       cwd: this.files.cwd,
-      random: this.random,
       ids: { ...this.ids, groups: [...this.ids.groups] },
       signals: new Map(this.signals),
       sigblock: this.sigblock,
@@ -415,7 +414,6 @@ export class Kernel {
     this.files.map = state.fds;
     this.files.next = state.nextFd;
     this.files.cwd = state.cwd;
-    this.random = state.random;
     this.ids = state.ids;
     this.signals = state.signals;
     this.sigblock = state.sigblock;
@@ -1972,16 +1970,10 @@ export class Kernel {
     });
 
     this.on(278, (k, buf, len) => {
-      // Deterministic, not random: the same run twice has to produce the same bytes. The state is
-      // 64 bits wide and held as one, because the product of the step does not fit in a double and
-      // a name built from a zeroed generator is a name that is always taken.
+      // The host's CSPRNG, the same source `/dev/urandom` reads: there is no entropy pool here to
+      // run dry, so the answer never waits.
       const n = Number(len);
-      const bytes = Buffer.alloc(n);
-      for (let i = 0; i < n; i++) {
-        k.random = (k.random * 6364136223846793005n + 1442695040888963407n) & 0xffffffffffffffffn;
-        bytes[i] = Number((k.random >> 33n) & 0xffn);
-      }
-      if (!k.put(buf, bytes)) return k.fail(EFAULT);
+      if (!k.put(buf, randomFillSync(Buffer.alloc(n)))) return k.fail(EFAULT);
       return [BigInt(n), 0];
     });
 

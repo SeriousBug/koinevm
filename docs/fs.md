@@ -39,7 +39,7 @@ attribute names mean nothing, and a program that asks is ready for exactly these
 
 Character devices are provided rather than found: `/dev/null`, `/dev/zero`, `/dev/full`,
 `/dev/random` and `/dev/urandom` are in the table whether or not the rootfs has a `/dev` at all, and
-`random` is one deterministic stream, so a run twice is a run twice.
+a read of either random device answers bytes from the host's CSPRNG, as `getrandom` does.
 
 Changing the tree - `rename`, `link`, `mkdir`, `rmdir`, `unlink`, `symlink` - is the host's own
 operation on the rootfs, and a failure comes back as the errno a program branches on rather than as

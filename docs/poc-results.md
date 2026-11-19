@@ -47,8 +47,8 @@ so a library the loader maps while it runs executes without being known in advan
   `pread64`, `readv`, `preadv`, `write`, `writev`, `lseek`, `fstat`, `newfstatat`, `readlinkat`,
   `faccessat`, `getcwd`, `ioctl`, resolved inside a root filesystem directory. Waiting and counting:
   `pipe2`, `eventfd`/`eventfd2`, `signalfd4`, `ppoll`, `epoll_*`, `futex`. Start-up:
-  `set_tid_address`, `set_robust_list`, `uname`, `clock_gettime`, `clock_getres`, `getrandom`
-  (deterministic), `prlimit64`, `sched_getaffinity`, `getuid` family, `rt_sigaction`,
+  `set_tid_address`, `set_robust_list`, `uname`, `clock_gettime`, `clock_getres`, `getrandom`,
+  `prlimit64`, `sched_getaffinity`, `getuid` family, `rt_sigaction`,
   `rt_sigprocmask`, `madvise`, `membarrier`, `sched_yield`.
 
 ## Correctness
