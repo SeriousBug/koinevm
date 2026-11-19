@@ -1829,10 +1829,6 @@ fn region_body(
     let mut first = Vec::new();
     match RegionEmitter::new(region, layout, ids, &mut first).emit() {
         Ok(body) => {
-            if std::env::var("ARMJIT_DUMP_BODY").is_ok() {
-                let name = format!("/tmp/body_{:x}.bin", region.blocks[0].addr);
-                std::fs::write(name, &body.body).unwrap();
-            }
             unsupported.extend(first);
             Ok(body)
         }
