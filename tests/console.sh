@@ -38,6 +38,7 @@ for mode in $MODES; do
         feed '[ -t 0 ] && echo console-0 || echo pipe-0'
         feed '[ -t 1 ] && echo console-1 || echo pipe-1'
         feed 'printf x | { read -r y; [ -t 0 ] || echo not-a-tty; }'
+        feed 'dd iflag=nonblock bs=1 count=1 2>&1 | head -1'
         feed 'printf "%s\n" a b c | wc -l'
         feed 'nosuchcommand 2>/dev/null || echo "status:$?"'
         feed 'exit'

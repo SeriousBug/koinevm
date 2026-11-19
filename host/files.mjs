@@ -187,6 +187,14 @@ export const terminal = {
     this.data = this.data.subarray(out.length);
     return Buffer.from(out);
   },
+  /// Whether a read would hand bytes over now. A line discipline holds a partial line until its
+  /// newline, so bytes that have arrived are not the same thing as a read that returns: a caller
+  /// told yes that then gets nothing asks again at once, and a program in a poll loop spins.
+  readable() {
+    if (this.eof || this.closed) return true;
+    if (!this.data.length) return false;
+    return this.raw || this.data.includes(0x0a);
+  },
 };
 
 export class Files {
@@ -207,9 +215,12 @@ export class Files {
     /// What each host directory holds, by the directory's own timestamp: the exact spelling of a
     /// name is only visible in a listing.
     this.names = new Map();
-    this.map.set(0, { kind: "stdin" });
-    this.map.set(1, { kind: "stdout" });
-    this.map.set(2, { kind: "stderr" });
+    // A description of their own, so that `O_NONBLOCK` sticks to them: `apt` empties the terminal
+    // before it starts `dpkg`, by setting stdin non-blocking and reading until a read fails, and a
+    // console that ignored the setting would hold that read until the next line was typed.
+    this.map.set(0, { kind: "stdin", desc: { nonblock: false } });
+    this.map.set(1, { kind: "stdout", desc: { nonblock: false } });
+    this.map.set(2, { kind: "stderr", desc: { nonblock: false } });
   }
 
   /// The path the guest named, as its own absolute path, with the components left as they are: a
@@ -400,7 +411,7 @@ export class Files {
   readReady(fd) {
     const entry = this.map.get(fd);
     if (!entry) return true;
-    if (entry.kind === "stdin") return !terminal.live || terminal.data.length > 0 || terminal.closed;
+    if (entry.kind === "stdin") return !terminal.live || terminal.readable();
     if (entry.kind !== "pipe") return true;
     return entry.desc.data.length > 0 || entry.desc.writers === 0;
   }

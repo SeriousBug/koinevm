@@ -9,6 +9,8 @@ root@armjit:/# [ -t 1 ] && echo console-1 || echo pipe-1
 console-1
 root@armjit:/# printf x | { read -r y; [ -t 0 ] || echo not-a-tty; }
 not-a-tty
+root@armjit:/# dd iflag=nonblock bs=1 count=1 2>&1 | head -1
+dd: error reading 'standard input': Resource temporarily unavailable
 root@armjit:/# printf "%s\n" a b c | wc -l
 3
 root@armjit:/# nosuchcommand 2>/dev/null || echo "status:$?"
