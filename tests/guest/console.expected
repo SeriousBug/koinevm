@@ -17,5 +17,15 @@ root@armjit:/# printf "%s\n" a b c | wc -l
 3
 root@armjit:/# nosuchcommand 2>/dev/null || echo "status:$?"
 status:127
+root@armjit:/# sleep 30
+
+
+root@armjit:/# echo "status:$?"
+status:130
+root@armjit:/# dash -c 'trap "echo caught" INT; sleep 30'
+caught
+
+root@armjit:/# echo "status:$?"
+status:130
 root@armjit:/# exit
 exit
