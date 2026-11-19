@@ -91,6 +91,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/sighandler.c -o tests/guest/sighandler.o
 python3 tools/minilink.py tests/guest/sighandler.o tests/guest/sighandler.elf _start
 
+echo "== guest: poll (a signal that arrives mid-loop, and a spinner that gives a turn) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
+    -c tests/guest/poll.c -o tests/guest/poll.o
+python3 tools/minilink.py tests/guest/poll.o tests/guest/poll.elf _start
+
 echo "== guest: tcp (connect/accept/listen/shutdown, and a child that connects) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/tcp.c -o tests/guest/tcp.o

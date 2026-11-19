@@ -1867,32 +1867,13 @@ export class Kernel {
       return [0n, 0];
     });
     // `rt_sigreturn`: what the restorer at the end of a handler calls. The frame the kernel put on
-    // the stack says what the machine was doing when the signal arrived, so this puts the
-    // registers, the stack and the pc back; the answer it returns is the x0 the frame remembers,
-    // which the host writes for it.
+    // the stack says what the machine was doing when the signal arrived, so the host puts it back -
+    // not this call, whose own return would write the shadow from the registers the restorer is
+    // still holding. All that is left to do here is say where the frame is.
     this.on(139, (k) => {
-      const view = new DataView(k.memory.buffer);
-      const at = Number(view.getBigUint64(SHADOW_SP, true));
-      if (!k.inBounds(at, SIGFRAME.FPSIMD + 16 + 32 * 16)) return k.fail(EFAULT);
-      for (let i = 0; i < 31; i++) {
-        view.setBigUint64(i * 8, view.getBigUint64(at + SIGFRAME.SC_REGS + i * 8, true), true);
-      }
-      view.setBigUint64(SHADOW_SP, view.getBigUint64(at + SIGFRAME.SC_SP, true), true);
-      k.sigblock = view.getBigUint64(at + SIGFRAME.UC_SIGMASK, true);
-      view.setBigUint64(SHADOW_FPSR, BigInt(view.getUint32(at + SIGFRAME.FPSIMD + 8, true)), true);
-      view.setBigUint64(SHADOW_FPCR, BigInt(view.getUint32(at + SIGFRAME.FPSIMD + 12, true)), true);
-      for (let i = 0; i < 32; i++) {
-        const from = at + SIGFRAME.FPSIMD + 16 + i * 16;
-        new Uint8Array(k.memory.buffer, SHADOW_V0 + i * 16, 16).set(
-          new Uint8Array(k.memory.buffer, from, 16),
-        );
-      }
-      // Where the signal interrupted is where execution goes back to, and the host resumes at the
-      // address this leaves behind rather than after the `svc` that got here.
-      view.setUint32(SHADOW_RESUME, view.getUint32(at + SIGFRAME.SC_PC, true), true);
-      // The guest does not go on after this `svc`: it goes wherever the frame says it was, so the
-      // host is the one that resumes it, with the x0 the frame remembers as the answer.
-      return k.ask({ kind: "sigreturn", answer: view.getBigUint64(at + SIGFRAME.SC_REGS, true) });
+      const at = k.u64(SHADOW_SP);
+      if (!k.inBounds(k.addr(at), SIGFRAME.FPSIMD + 16 + 32 * 16)) return k.fail(EFAULT);
+      return k.ask({ kind: "sigreturn", frame: k.addr(at) });
     });
     this.on(98, (k, uaddr, op, val) => {
       // The private flag and the realtime clock are bits above the command, and the bitset forms

@@ -48,6 +48,8 @@ export class Session {
     this.rootfs = rootfs;
     this.makeImports = makeImports;
     this.processes = [];
+    /// Where the last `pick` stopped, so the scheduler is round robin rather than first come.
+    this.nextPick = 0;
     this.nextPid = 1;
     this.root = null;
     /// The host's name service, behind the address the guest's own resolver file names.
@@ -198,11 +200,20 @@ export class Session {
 
   /// The next thread to run, and the process it belongs to. Threads are what a scheduler picks:
   /// a process whose threads are all waiting is waiting, and one with a runnable thread runs it.
+  /// The next thread to run, from where the last pick left off: a guest that gives the CPU back at
+  /// a poll has to come out behind the one that was waiting for it, or two runnable threads in a
+  /// loop of their own would starve each other exactly as they did before there was a poll.
   pick() {
-    for (const proc of this.processes) {
+    const n = this.processes.length;
+    for (let k = 0; k < n; k++) {
+      const i = (this.nextPick + k) % n;
+      const proc = this.processes[i];
       if (proc.state === "exited") continue;
       const thread = proc.threads.find((t) => t.state === "runnable");
-      if (thread) return { proc, thread };
+      if (thread) {
+        this.nextPick = i + 1;
+        return { proc, thread };
+      }
     }
     return null;
   }
@@ -281,6 +292,10 @@ export class Session {
   /// A syscall gave up the wasm call: do what it asked, then answer it.
   serve(proc, thread) {
     const kernel = proc.kernel;
+    if (kernel.parked) {
+      kernel.parked = false;
+      return this.resumeAt(proc, thread);
+    }
     const request = kernel.pending;
     kernel.pending = null;
     if (kernel.exited !== null) return this.exitedBySyscall(proc, thread, kernel.exited);
@@ -344,7 +359,7 @@ export class Session {
       case "deliver":
         return this.deliverRequest(proc, thread, request);
       case "sigreturn":
-        return this.resume(proc, thread, request.answer);
+        return this.sigreturn(proc, thread, request);
       default:
         console.error(`armjit: pid ${proc.pid} asked for an unknown host action ${request.kind}`);
         return 1;
@@ -432,6 +447,63 @@ export class Session {
       console.error(`signal: ${proc.pid} runs the handler for ${entry.sig} at 0x${handler.toString(16)}`);
     }
     return true;
+  }
+
+  /// The host's side of a backward branch whose counter ran out. Answering 1 gives the CPU back,
+  /// which is how a pending signal is taken and how another thread gets a turn; answering 0 lets
+  /// the loop go on.
+  pollPoint(proc) {
+    if (proc.state === "exited") return 0;
+    this.poll();
+    if (proc.kernel.deliverable()) {
+      proc.kernel.parked = true;
+      return 1;
+    }
+    // A deadline is a thing a spinning guest cannot see: a sleep that is due has to be answered by
+    // the host, so the loop gives it the chance the same way.
+    if (this.waiting()) {
+      proc.kernel.parked = true;
+      return 1;
+    }
+    const waiting = this.processes.some((p) =>
+      p === proc
+        ? p.threads.some((t) => t !== p.current && t.state === "runnable")
+        : p.state !== "exited" && p.threads.some((t) => t.state === "runnable"),
+    );
+    if (waiting) proc.kernel.parked = true;
+    return waiting ? 1 : 0;
+  }
+
+  /// Continue where a poll left off, which is the loop the guest was about to go round: nothing it
+  /// had in a register has changed, so only the pc has to be put back.
+  resumeAt(proc, thread) {
+    const view = proc.mach.view;
+    view.setUint32(SHADOW_PC, view.getUint32(SHADOW_RESUME, true), true);
+    thread.state = "runnable";
+    return 0;
+  }
+
+  /// Put the machine back the way the frame says it was, and continue where the signal interrupted.
+  /// The registers are written here rather than in the syscall itself because the run's own exit
+  /// path writes the shadow from the registers the restorer still holds, and would undo it.
+  sigreturn(proc, thread, request) {
+    const view = proc.mach.view;
+    const at = Number(request.frame);
+    for (let i = 0; i < 31; i++) {
+      view.setBigUint64(i * 8, view.getBigUint64(at + SIGFRAME.SC_REGS + i * 8, true), true);
+    }
+    view.setBigUint64(0xf8, view.getBigUint64(at + SIGFRAME.SC_SP, true), true);
+    proc.kernel.sigblock = view.getBigUint64(at + SIGFRAME.UC_SIGMASK, true);
+    view.setBigUint64(0x128, BigInt(view.getUint32(at + SIGFRAME.FPSIMD + 8, true)), true);
+    view.setBigUint64(0x120, BigInt(view.getUint32(at + SIGFRAME.FPSIMD + 12, true)), true);
+    for (let i = 0; i < 32; i++) {
+      const from = at + SIGFRAME.FPSIMD + 16 + i * 16;
+      new Uint8Array(proc.memory.buffer, 0x600 + i * 16, 16).set(
+        new Uint8Array(proc.memory.buffer, from, 16),
+      );
+    }
+    view.setUint32(0x118, view.getUint32(at + SIGFRAME.SC_PC, true), true);
+    return this.resume(proc, thread, view.getBigUint64(at + SIGFRAME.SC_REGS, true));
   }
 
   /// A signal this process raised on itself, taken before the syscall's answer reaches the guest:
@@ -961,6 +1033,10 @@ export class Session {
         if (thread.state !== "blocked") continue;
         if (thread.waitingFor === "socket" || thread.waitingFor === "epoll") thread.state = "runnable";
         else if (thread.waitingFor === "pipe" && proc.kernel.files.readReady(thread.pending.fd)) {
+          thread.state = "runnable";
+        } else if (thread.waitingFor === "sleep" && Date.now() >= thread.pending.deadline) {
+          // A sleep cannot be a `setTimeout` alone: the host's event loop does not turn while a
+          // guest is spinning, and a poll at a backward branch is the only thing that asks.
           thread.state = "runnable";
         }
       }

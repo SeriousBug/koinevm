@@ -45,6 +45,9 @@ pub const L_V4: u32 = L_V3 + 1;
 /// temporary in the middle of a floating point operation.
 pub const L_F0: u32 = L_V4 + 1;
 pub const L_F1: u32 = L_F0 + 1;
+/// The poll's budget while a region runs: a local, because a backward branch decrements it and a
+/// mutable global would have to be written through to memory every iteration.
+pub const L_POLL: u32 = L_F1 + 1;
 /// Where the trace writes the vector file, one 16-byte value per register.
 pub const SHADOW_V0: u64 = 0x600;
 
@@ -516,6 +519,10 @@ fn prelude(m: &mut Module, cfg: &Config) -> Prelude {
 
     m.imports.push(Import { module: "env".into(), name: "syscall".into(), ty: ty_syscall });
     m.imports.push(Import { module: "env".into(), name: "trap".into(), ty: ty_trap });
+    let ty_poll = m.ty(vec![], vec![I32]);
+    let poll = m.n_imports();
+    m.imports.push(Import { module: "env".into(), name: "poll".into(), ty: ty_poll });
+    let poll_counter = m.global(I32, POLL_QUANTUM as i64);
     let trace_idx = if cfg.trace || cfg.trace_loops {
         let ty = m.ty(vec![I32, I64], vec![]);
         m.imports.push(Import { module: "env".into(), name: "trace2".into(), ty });
@@ -537,6 +544,8 @@ fn prelude(m: &mut Module, cfg: &Config) -> Prelude {
         bswap64: emit_bswap(m, ty_i_i64, 64),
         bswap32: emit_bswap(m, ty_i_i64, 32),
         rbit64: emit_rbit(m, ty_i_i64),
+        poll,
+        poll_counter,
         ty_region,
     };
     Prelude { ids, ty_region }
@@ -740,8 +749,19 @@ struct Ids {
     bswap64: u32,
     bswap32: u32,
     rbit64: u32,
+    /// The host's preemption point, called from a backward branch when the counter runs out.
+    poll: u32,
+    /// The counter itself, a mutable global so a loop iteration costs a decrement rather than a
+    /// memory round trip. It starts and refills at the quantum.
+    poll_counter: u32,
     ty_region: u32,
 }
+
+/// How many backward branches a region runs before it asks the host whether to give up the CPU. A
+/// loop iteration is a few nanoseconds, so this is a fraction of a millisecond: long enough that the
+/// poll is not a measurable share of the loop, short enough that a signal or another thread is not
+/// left waiting on a guest that is busy.
+const POLL_QUANTUM: i32 = 1 << 16;
 
 /// How many guest blocks one emitted function may hold. The body of a region nests one wasm block
 /// per guest block for its jump table, and the engine's bookkeeping for a function grows with the
@@ -1907,7 +1927,9 @@ impl<'a> RegionEmitter<'a> {
         unsupported: &'a mut Vec<(u64, String)>,
     ) -> Self {
         let mut f = Func::new(ids.ty_region);
-        f.locals = vec![I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128, V128, F64, F64];
+        f.locals = vec![
+            I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128, V128, F64, F64, I32,
+        ];
         RegionEmitter { f, region, layout, ids, unsupported, open: 0, cur_pc: 0, narrow: false }
     }
 
@@ -1915,6 +1937,9 @@ impl<'a> RegionEmitter<'a> {
         let n = self.region.blocks.len();
         self.f.lg(P_ENTRY);
         self.f.ls(L_PC);
+        // The budget a loop draws on, which the region before this one left in the global.
+        self.f.gg(self.ids.poll_counter);
+        self.f.ls(L_POLL);
         // The stack pointer has to name a page the guest mapped writable, which is what a kernel's
         // guard page answers and what holds for a thread's own stack as much as for the process's.
         // A stack that ran off the end of its mapping traps here, at region entry, which every
@@ -2137,10 +2162,46 @@ impl<'a> RegionEmitter<'a> {
         self.open -= 1;
     }
 
+    /// Give the host a chance to take the CPU back. Only a backward branch can be reached; the jump
+    /// target it names is where the host resumes, and it is a block start because a branch is where
+    /// the control flow graph splits. Leaving by returning a pc is the same exit a syscall takes, so
+    /// the host answers it with a pc of its own choosing.
+    fn poll(&mut self, target: u64) {
+        self.f.lg(L_POLL);
+        self.f.i32c(1);
+        self.f.op(I32_SUB);
+        self.f.ls(L_POLL);
+        self.f.lg(L_POLL);
+        self.f.op(I32_EQZ);
+        self.open_if();
+        // Refilled before the call, so a region the host resumes after this one starts with a
+        // budget of its own rather than an exhausted one.
+        self.f.i32c(POLL_QUANTUM);
+        self.f.ls(L_POLL);
+        self.f.i32c(POLL_QUANTUM);
+        self.f.gs(self.ids.poll_counter);
+        self.f.call(self.ids.poll);
+        self.open_if();
+        // The run stops here, and the host resumes at the target: a pc of zero is what says the
+        // guest is not simply jumping there, and the resume address is where it goes either way.
+        self.f.i32c(SHADOW_RESUME as i32);
+        self.f.i32c(target as i32);
+        self.f.mem(I32_STORE, 2, 0);
+        self.begin_return();
+        self.f.i32c(0);
+        self.end_return();
+        self.close_if();
+        self.close_if();
+    }
+
     fn emit_term(&mut self, addr: u64, insn: Insn) -> Result<(), String> {
         match insn {
             Insn::B { offset } => {
-                self.emit_jump((addr as i64 + offset) as u64)
+                let t = (addr as i64 + offset) as u64;
+                if t <= addr {
+                    self.poll(t);
+                }
+                self.emit_jump(t)
             }
             Insn::Bl { offset } => {
                 let t = (addr as i64 + offset) as u64;
@@ -2152,6 +2213,9 @@ impl<'a> RegionEmitter<'a> {
                 let t = (addr as i64 + offset) as u64;
                 self.push_cond(cond);
                 self.open_if();
+                if t <= addr {
+                    self.poll(t);
+                }
                 self.emit_jump(t);
                 self.close_if();
             }
@@ -2163,6 +2227,9 @@ impl<'a> RegionEmitter<'a> {
                     self.f.op(I32_EQZ);
                 }
                 self.open_if();
+                if t <= addr {
+                    self.poll(t);
+                }
                 self.emit_jump(t);
                 self.close_if();
             }
@@ -2179,6 +2246,9 @@ impl<'a> RegionEmitter<'a> {
                     self.f.op(I32_EQZ);
                 }
                 self.open_if();
+                if t <= addr {
+                    self.poll(t);
+                }
                 self.emit_jump(t);
                 self.close_if();
             }

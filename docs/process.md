@@ -40,9 +40,9 @@ root. The setters move them, the getters report them, `fork` copies them, and `e
 
 `rt_sigprocmask` blocks and unblocks, `sigaltstack` is remembered, and `SA_ONSTACK`, `SA_SIGINFO`
 and the mask a handler runs under are honoured; a signal sent while one of the same number is
-already pending is coalesced, as a kernel does everything below the realtime range. What is missing
-is the point in the middle of a computation: a signal is taken at a syscall, so a guest that never
-calls one keeps running, which is the poll below. A `SIGPIPE` is not raised when a guest writes to a
+already pending is coalesced, as a kernel does everything below the realtime range. A signal is
+taken at a syscall and at the poll below, and nowhere else, so a guest in a straight-line computation
+sees it late. A `SIGPIPE` is not raised when a guest writes to a
 pipe nobody reads: the write answers `EPIPE` instead, which is what a program that had ignored
 `SIGPIPE` would see. A fault cannot be caught yet either: `SIGSEGV` ends the process, because the
 registers a fault would have to save are the ones the wasm call it unwinds is holding.

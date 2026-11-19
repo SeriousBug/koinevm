@@ -144,6 +144,8 @@ pub mod op {
     pub const I32_POPCNT: u8 = 0x69;
     pub const I32_EXTEND8_S: u8 = 0xc0;
     pub const I32_EXTEND16_S: u8 = 0xc1;
+    pub const GLOBAL_GET: u8 = 0x23;
+    pub const GLOBAL_SET: u8 = 0x24;
     pub const I32_ADD: u8 = 0x6a;
     pub const I32_SUB: u8 = 0x6b;
     pub const I32_MUL: u8 = 0x6c;
@@ -473,6 +475,12 @@ impl Func {
     pub fn lg(&mut self, i: u32) -> &mut Self {
         self.idx(op::LOCAL_GET, i)
     }
+    pub fn gg(&mut self, i: u32) -> &mut Self {
+        self.idx(op::GLOBAL_GET, i)
+    }
+    pub fn gs(&mut self, i: u32) -> &mut Self {
+        self.idx(op::GLOBAL_SET, i)
+    }
     pub fn ls(&mut self, i: u32) -> &mut Self {
         self.idx(op::LOCAL_SET, i)
     }
@@ -590,6 +598,10 @@ pub struct Module {
     /// defining one, so both see the same bytes.
     pub mem_import: Option<(String, String)>,
     pub data: Vec<(u64, Vec<u8>)>,
+    /// Module-internal mutable globals, as `(type, initial value)`: the one thing a translated
+    /// region can keep between instructions without a memory round trip, which is what a
+    /// preemption counter needs.
+    pub globals: Vec<(u8, i64)>,
 }
 
 impl Module {
@@ -605,7 +617,13 @@ impl Module {
             mem_pages: 0,
             mem_import: None,
             data: Vec::new(),
+            globals: Vec::new(),
         }
+    }
+    /// Declares a mutable global and returns its index.
+    pub fn global(&mut self, ty: u8, init: i64) -> u32 {
+        self.globals.push((ty, init));
+        (self.globals.len() - 1) as u32
     }
     pub fn ty(&mut self, params: Vec<u8>, results: Vec<u8>) -> u32 {
         if let Some(i) = self.types.iter().position(|t| t.0 == params && t.1 == results) {
@@ -705,6 +723,27 @@ impl Module {
             s.push(0x00);
             uleb(&mut s, self.mem_pages as u64);
             Self::section(&mut out, 5, &s);
+        }
+
+        if !self.globals.is_empty() {
+            let mut s = Vec::new();
+            uleb(&mut s, self.globals.len() as u64);
+            for (ty, init) in &self.globals {
+                s.push(*ty);
+                s.push(0x01); // mutable
+                match ty {
+                    0x7f => s.push(0x41), // i32.const
+                    0x7e => s.push(0x42), // i64.const
+                    _ => s.push(0x41),
+                }
+                if *ty == 0x7e {
+                    sleb(&mut s, *init);
+                } else {
+                    sleb(&mut s, *init);
+                }
+                s.push(0x0b);
+            }
+            Self::section(&mut out, 6, &s);
         }
 
         if !self.exports.is_empty() {

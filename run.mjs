@@ -361,6 +361,10 @@ function makeImports(proc) {
       kernel.pending = answer.host;
       return [0n, 1];
     },
+    poll: () => {
+      enter(proc);
+      return session.pollPoint(proc);
+    },
     trap: (kind, addr, at) => {
       enter(proc);
       const fault = faultOf(Number(kind));

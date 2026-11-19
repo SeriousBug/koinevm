@@ -1,0 +1,13 @@
+ok   a handler for a signal that has to arrive mid-loop
+ok   fork
+ok   fork
+ok   the handler ran while the guest was spinning
+ok   and the loop went on afterwards
+ok   the child is reaped
+ok   and exited with zero
+ok   fork
+ok   fork
+ok   the parent runs, so it can kill the spinner
+ok   the spinner is reaped
+ok   by the signal that ended it
+poll: all checks passed
