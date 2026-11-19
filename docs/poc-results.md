@@ -158,10 +158,10 @@ Two things follow.
   result that lands in the denormal range can be a step out. One known inexactness: wasm has no
   fused multiply-add, so `fmadd` and its siblings round twice and can differ from the instruction in
   the last bit.
-- **Instruction coverage of a big library.** Threads of libc build (a page of `strlen` variants) that
-  are unreachable from the entries the translator finds report `undecoded instruction`, up to 116
-  words in one page. They are where the `-mgeneral-regs-only` gap and the crypto/atomics gap would
-  show up in real code rather than in a fixture.
+- **Instruction coverage of a big library.** The parts of libc that nothing reaches (a page of
+  `strlen` variants, the MTE paths in `malloc`) report `undecoded instruction`, and the words are SVE
+  and MTE: the loader does not pick them because `ID_AA64PFR0` and `ID_AA64ISAR0` are a baseline
+  model. `docs/gaps.md` is that measurement over the whole tree.
 - **Page permissions.** Every translated load and store consults the page table, which is what says
   a page is mapped, readable, writable and executable; the check is always emitted, because a
   program's correctness depends on the fault rather than on its speed. A store to a read-only page,
@@ -197,6 +197,10 @@ Two things follow.
 - **Instruction coverage is compiler output, not the ISA.** Hand-written or obfuscated code that uses
   `rmif`, `setf*`, `ldraa`, pointer authentication, `mrs` of anything else, the LSE atomics, or `SVE`
   is refused rather than mistranslated. That is the right failure mode but it is not coverage.
+  `docs/gaps.md` counts it: 14843 refused words in 1278 encodings across 71 of the tree's 913 ELFs,
+  nearly all of them in code the guest's HWCAP keeps it out of. The real ones, ranked: the vector
+  float compares, the two families of vector float-to-integer conversions, the by-element
+  arithmetic, `cntd`, the saturating forms and the pairwise ones.
 - **Untranslated indirect targets.** A jump into an image is translated on demand now, so an entry
   the ahead-of-time scan misses costs a page translation instead of stopping the run. The ahead-of-time
   pass still decides what a region is, so a wrong guess about where code starts costs a page: the

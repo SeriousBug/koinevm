@@ -240,13 +240,25 @@ export class Mach {
       }
       page = { module, regions: answer.regions, unsupported: answer.unsupported };
       if (!patched) pageModules.set(key, page);
+      // A refusal costs an instruction, so a guest that meets one traps there and the run stops.
+      // What the log is for is knowing which are met at all: `ARMJIT_LOG_GAPS=1` leaves the pages
+      // out and prints the refusals alone.
+      if (page.unsupported.length && process.env.ARMJIT_LOG_GAPS && !process.env.ARMJIT_TRACE_PAGES) {
+        for (const [at, word, why] of page.unsupported) {
+          const file = image.host.split("/").pop();
+          console.error(`gap at ${file}+0x${at.toString(16)} (${word}): ${why}`);
+        }
+      }
       if (process.env.ARMJIT_TRACE_PAGES) {
         const where = `${image.host.split("/").pop()}+0x${(pc - image.base).toString(16)}`;
         console.error(
           `page ${where}: ${page.regions.length} regions, ${answer.wasm.length / 2} bytes wasm` +
             (page.unsupported.length ? `, ${page.unsupported.length} gaps` : ""),
         );
-        for (const [at, why] of page.unsupported) console.error(`  gap at 0x${at.toString(16)}: ${why}`);
+        for (const [at, word, why] of page.unsupported) {
+          const file = image.host.split("/").pop();
+          console.error(`  gap at ${file}+0x${at.toString(16)} (${word}): ${why}`);
+        }
         if (process.env.ARMJIT_TRACE_REGIONS) {
           for (const region of page.regions) {
             const blocks = region.blocks.map((b) => b.toString(16)).join(" ");

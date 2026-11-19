@@ -121,6 +121,9 @@ pub enum Insn {
     VecThreeDiff { q: bool, u: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
     /// Shift by immediate: `ushr`, `sshr`, `shl`, `sli`, `sri`, `shrn`, `sshll`, ...
     VecShiftImm { q: bool, u: bool, immh: u32, immb: u32, op: u32, rn: u32, rd: u32 },
+    /// `fmul v0.2d, v0.2d, v2.d[0]` and the rest of the arithmetic a vector lane feeds: the same bits
+    /// 28:24 as the shifts, told apart by bit 23 and by bit 10.
+    VecByElement { q: bool, u: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
     /// `dup`, `ins`, `umov`, `smov`: moves between the vector file and the general registers.
     VecCopy { q: bool, op: bool, imm5: u32, imm4: u32, rn: u32, rd: u32 },
     /// The scalar `dup Sd, Vn.T[index]`, which `mov d1, v0.d[1]` is: one lane of the source, and
@@ -200,6 +203,10 @@ pub enum Insn {
     MrsTpidr { rd: u32 },
     MsrTpidr { rn: u32 },
     Hint,
+    /// The crypto extensions: `sha1`/`sha256`/`aes` and friends. Nothing here advertises them, so
+    /// the guest never reaches one, but a translator that calls them a floating point operation
+    /// sends whoever reads the gap log looking in the wrong place.
+    Crypto,
     Undefined,
 }
 
@@ -284,6 +291,9 @@ fn sys_reg(o0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> SysReg {
 }
 
 pub fn decode(w: u32) -> Insn {
+    if let Some(c) = crypto(w) {
+        return c;
+    }
     let sf = w >> 31 != 0;
     let rd = w & 31;
     let rn = (w >> 5) & 31;
@@ -867,6 +877,12 @@ fn decode_simd_dp(w: u32) -> Insn {
 
     // `movi`/`mvni` and the shift-by-immediate group share bits 28:24, told apart by whether an
     // element width is present.
+    // Bits 28:24 are 01111 for both groups, and bit 10 is what separates them: a shift by
+    // immediate sets it, and the by-element forms have it clear, with `size` where the shifts put
+    // the top bit of their `immh` and `Rm` where they put the rest.
+    if (w >> 24) & 0x1f == 0b01111 && bit10 == 0 {
+        return Insn::VecByElement { q, u, size, op: (w >> 12) & 0xf, rn, rm, rd };
+    }
     if (w >> 24) & 0x1f == 0b01111 {
         if (w >> 19) & 0xf != 0 {
             return Insn::VecShiftImm {
@@ -913,6 +929,37 @@ fn decode_simd_dp(w: u32) -> Insn {
 
 /// Scalar floating point: the one- and two-source arithmetic, comparisons, selects, conversions and
 /// the immediate form.
+/// `aese`/`sha1`/`sha256`: the three-register-same and two-register groups whose words the scalar
+/// floating point space otherwise claims, because bits 31:24 of a `sha256h` are `0101 1110` and its
+/// bit 21 is clear where every scalar FP data-processing word has it set.
+fn crypto(w: u32) -> Option<Insn> {
+    let three = [
+        0x5e000000, // sha1c
+        0x5e001000, // sha1p
+        0x5e002000, // sha1m
+        0x5e003000, // sha1su0
+        0x5e004000, // sha256h
+        0x5e005000, // sha256h2
+        0x5e006000, // sha256su1
+    ];
+    if (w & 0xffe0_fc00) & 0xffe0_0000 == 0x5e00_0000 && three.contains(&(w & 0xffe0_fc00)) {
+        return Some(Insn::Crypto);
+    }
+    let two = [
+        0x5e28_0800, // sha1h
+        0x5e28_1800, // sha1su1
+        0x5e28_2800, // sha256su0
+        0x4e28_4800, // aese
+        0x4e28_5800, // aesd
+        0x4e28_6800, // aesmc
+        0x4e28_7800, // aesimc
+    ];
+    if two.contains(&(w & 0xffff_fc00)) {
+        return Some(Insn::Crypto);
+    }
+    None
+}
+
 fn decode_scalar_fp(w: u32) -> Insn {
     // The scalar shift by immediate, which shares the vector shifts' encoding with bit 28 set. The
     // opcode is bits 15:10 and the count is seven bits at 22:16, counted from twice the lane width
@@ -1181,6 +1228,11 @@ fn decode_scalar_fp(w: u32) -> Insn {
         return Insn::VecAcross { q: true, u: (w >> 29) & 1 != 0, size, op: (w >> 12) & 0x1f, rn, rd };
     }
 
-    // One source: bits 20:15 name the operation and bits 15:10 are the marker `10000`.
+    // One source: bits 20:15 name the operation and bits 15:10 are the marker `10000`. Bit 21 is
+    // set in every word of the group, and a word without it is a crypto or SVE instruction that
+    // shares bits 31:24 with it; naming it a floating point operation would be a wrong answer.
+    if (w >> 21) & 1 == 0 {
+        return Insn::Undefined;
+    }
     Insn::FpOneSource { size, opcode: (w >> 15) & 0x3f, rn, rd }
 }

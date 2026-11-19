@@ -1940,6 +1940,15 @@ fn emit_regions(
     (bodies, failed)
 }
 
+/// The address an instruction sits at is the key its refusal is recorded under, so the message
+/// does not repeat it: a sweep adds messages up, and they have to match.
+fn unaddressed(why: &str) -> &str {
+    match why.rfind(" at 0x") {
+        Some(i) => &why[..i],
+        None => why,
+    }
+}
+
 struct RegionEmitter<'a> {
     f: Func,
     region: &'a Region,
@@ -2036,7 +2045,14 @@ impl<'a> RegionEmitter<'a> {
                 }
                 break;
             }
-            self.emit_insn(addr, insn)?;
+            // An instruction the emitter cannot finish costs that instruction, not the region
+            // around it: with `allow_undefined` the rest of the block still translates, and the
+            // gap is recorded at the address it was raised for.
+            match self.emit_insn(addr, insn) {
+                Ok(()) => {}
+                Err(e) if self.layout.allow_undefined => self.refuse_at(addr, e)?,
+                Err(e) => return Err(e),
+            }
         }
         let n = self.region.blocks.len();
         let falls = i + 1 < n && self.region.blocks[i + 1].addr == next;
@@ -4098,13 +4114,20 @@ impl<'a> RegionEmitter<'a> {
     /// An instruction the translator cannot emit. With `allow_undefined` it becomes a trap at the
     /// instruction instead of a refusal, so one run reports every gap rather than the first.
     fn refuse(&mut self, why: String) -> Result<(), String> {
-        self.unsupported.push((self.cur_pc, why.clone()));
+        self.refuse_at(self.cur_pc, why)
+    }
+
+    /// The same, for a failure raised somewhere the instruction's own address is not in scope: a
+    /// helper returns the error and the block knows which instruction asked for it.
+    fn refuse_at(&mut self, pc: u64, why: String) -> Result<(), String> {
+        let why = unaddressed(&why).to_string();
+        self.unsupported.push((pc, why.clone()));
         if !self.layout.allow_undefined {
             return Err(why);
         }
         self.f.i32c(trap::REFUSED);
-        self.f.i64c(self.cur_pc as i64);
-        self.f.i32c(self.cur_pc as i32);
+        self.f.i64c(pc as i64);
+        self.f.i32c(pc as i32);
         self.f.call(self.ids.trap);
         self.f.op(UNREACHABLE);
         Ok(())
@@ -4149,6 +4172,12 @@ impl<'a> RegionEmitter<'a> {
             // The terminator table handles a syscall: it ends the block it is in.
             Insn::Svc => return Err(format!("syscall at 0x{addr:x} is not a block end")),
             Insn::Undefined => return self.refuse(format!("undecoded instruction at 0x{addr:x}")),
+            Insn::VecByElement { .. } => {
+                return self.refuse(format!("the by-element forms are not translated at 0x{addr:x}"))
+            }
+            Insn::Crypto => {
+                return self.refuse(format!("the crypto extensions are not translated at 0x{addr:x}"))
+            }
             Insn::Adr { rd, imm } => {
                 if rd != 31 {
                     self.f.i64c((addr as i64).wrapping_add(imm));
@@ -4857,7 +4886,7 @@ impl<'a> RegionEmitter<'a> {
                         self.f.i64c(ID_AA64ISAR0_VALUE as i64);
                     }
                     SysReg::Unknown => {
-                        let why = format!("mrs of an unknown system register at 0x{addr:x}");
+                        let why = "mrs of an unknown system register".to_string();
                         self.unsupported.push((addr, why.clone()));
                         if !self.layout.allow_undefined {
                             return Err(why);
@@ -5924,7 +5953,7 @@ impl<'a> RegionEmitter<'a> {
                             self.lanes_op(src_size, [simd::I8X16_SHR_S, simd::I16X8_SHR_S, simd::I32X4_SHR_S, simd::I64X2_SHR_S])
                         };
                         let add_wide = self.lanes_op(src_size, [simd::I8X16_ADD, simd::I16X8_ADD, simd::I32X4_ADD, simd::I64X2_ADD]);
-                        let o = o.ok_or_else(|| format!("bad narowing shift at 0x{addr:x}"))?;
+                        let o = o.ok_or_else(|| format!("bad narrowing shift at 0x{addr:x}"))?;
                         self.getv(rn);
                         if op == 0b10001 {
                             let round = 1u64 << (rshift - 1);
@@ -6664,6 +6693,11 @@ impl<'a> RegionEmitter<'a> {
                     0b001001 => Some(if double { F64_CEIL } else { F32_CEIL }),
                     0b001010 => Some(if double { F64_FLOOR } else { F32_FLOOR }),
                     0b001011 => Some(if double { F64_TRUNC } else { F32_TRUNC }),
+                    // The conversions between the float widths are the fp16 ones, and nothing here
+                    // advertises fp16.
+                    0b000100..=0b000111 => {
+                        return self.refuse(format!("half precision floating point at 0x{addr:x}"))
+                    }
                     _ => return self.refuse(format!("floating point opcode {opcode} at 0x{addr:x}")),
                 };
                 if let Some(op) = op {

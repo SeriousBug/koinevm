@@ -21,7 +21,8 @@ fn usage() -> String {
     "usage: armjit translate <elf> -o <out.wasm> [--bounds=check|trust] [--mem-pages=N] [--trace]\n       \
      [--argv=a,b] [--env=k=v,...] [--rootfs=<dir>] [--interp=<elf>] [--interp-base=0xADDR]\n       \
      armjit page      (a request per line on stdin, a module back on stdout)\n       \
-     armjit gaps <elf> [--rootfs=<dir>]\n       \
+     armjit gaps <elf> [--rootfs=<dir>] [--tsv]\n       \
+     armjit decode <hex word>...\n       \
      armjit dump <elf>".into()
 }
 
@@ -395,10 +396,10 @@ fn run(args: &[String]) -> Result<(), String> {
                                 patch_page(&mut image, at, hex)?;
                                 fresh = Some(image);
                             }
-                            let res = match &fresh {
+                            let (res, image) = match &fresh {
                                 Some(image) => {
                                     let site = emit::sites(&[image]);
-                                    emit::translate_page(image, &site, at, &cfg)?
+                                    (emit::translate_page(image, &site, at, &cfg)?, image)
                                 }
                                 None => {
                                     if !cache.contains_key(&(path.clone(), base)) {
@@ -407,9 +408,10 @@ fn run(args: &[String]) -> Result<(), String> {
                                         cache.insert((path.clone(), base), (image, site));
                                     }
                                     let (image, site) = &cache[&(path.clone(), base)];
-                                    emit::translate_page(image, site, at, &cfg)?
+                                    (emit::translate_page(image, site, at, &cfg)?, image)
                                 }
                             };
+                            let bias = image.bias;
                             let regions: Vec<String> = res
                                 .regions
                                 .iter()
@@ -419,10 +421,18 @@ fn run(args: &[String]) -> Result<(), String> {
                                     format!("{{\"entry\":{},\"blocks\":[{}]}}", r.entry, blocks.join(","))
                                 })
                                 .collect();
+                            // The host logs a gap against the file it is in, so the address is the
+                            // image's own: the load base means nothing outside this process.
                             let gaps: Vec<String> = res
                                 .unsupported
                                 .iter()
-                                .map(|(a, why)| format!("[{a},{}]", json_str(why)))
+                                .map(|(a, why)| {
+                                    let word = match image.vaddr_bytes(*a, 4) {
+                                        Some(b) => u32::from_le_bytes(b.try_into().unwrap()),
+                                        None => 0,
+                                    };
+                                    format!("[{},\"{word:08x}\",{}]", a - bias, json_str(why))
+                                })
                                 .collect();
                             Ok(format!(
                                 "{{\"ok\":true,\"wasm\":\"{}\",\"regions\":[{}],\"unsupported\":[{}]}}",
@@ -480,9 +490,12 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut rootfs: Option<String> = None;
             let mut interp_path: Option<String> = None;
             let mut interp_base = emit::INTERP_BASE;
+            let mut tsv = false;
             for a in &args[2..] {
                 if let Some(v) = a.strip_prefix("--rootfs=") {
                     rootfs = Some(v.to_string());
+                } else if a == "--tsv" {
+                    tsv = true;
                 } else if let Some(v) = a.strip_prefix("--interp=") {
                     interp_path = Some(v.to_string());
                 } else if let Some(v) = a.strip_prefix("--interp-base=") {
@@ -492,7 +505,20 @@ fn run(args: &[String]) -> Result<(), String> {
                     return Err(format!("unknown argument {a}"));
                 }
             }
-            let main = load_image(&under_root(rootfs.as_ref(), path), None)?;
+            let mut main = load_image(&under_root(rootfs.as_ref(), path), None)?;
+            // A library has no entry point, and the sweep wants its refusals whether or not the
+            // image is a program: the first word that decodes stands in for the entry, because
+            // nothing here runs.
+            if !main.instruction_ranges().iter().any(|&(lo, hi)| (lo..hi).contains(&main.entry)) {
+                let stand_in = main.instruction_ranges().into_iter().find_map(|(lo, hi)| {
+                    (lo..hi).step_by(4).find(|&a| {
+                        main.vaddr_bytes(a, 4)
+                            .is_some_and(|b| decode::decode(u32::from_le_bytes(b.try_into().unwrap()))
+                                != decode::Insn::Undefined)
+                    })
+                });
+                main.entry = stand_in.ok_or_else(|| format!("{path}: no code"))?;
+            }
             let interp = match &main.interp {
                 None => None,
                 Some(want) => {
@@ -520,31 +546,65 @@ fn run(args: &[String]) -> Result<(), String> {
                 &[],
             )?;
             let images = [Some(&main), interp.as_ref()];
-            let mut grouped: std::collections::BTreeMap<u32, (usize, u64)> =
+            // One row per (image, word, reason), so that a sweep can add paths up by encoding or by
+            // what the translator said about it. The address is the image's own, because the file
+            // is what names where the gap is: alongside it the load base means nothing.
+            let mut rows: std::collections::BTreeMap<(u8, u32, String), (usize, u64)> =
                 std::collections::BTreeMap::new();
-            for (addr, _) in &res.unsupported {
-                let word = images
-                    .iter()
-                    .flatten()
-                    .find_map(|i| i.vaddr_bytes(*addr, 4))
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-                    .unwrap_or(0);
-                let e = grouped.entry(word).or_insert((0, *addr));
+            for (addr, why) in &res.unsupported {
+                let found = images.iter().enumerate().find_map(|(i, image)| {
+                    let image = image.as_ref()?;
+                    let bytes = image.vaddr_bytes(*addr, 4)?;
+                    Some((i as u8, u32::from_le_bytes(bytes.try_into().unwrap()), addr - image.bias))
+                });
+                let (which, word, at) = found.unwrap_or((0, 0, *addr));
+                let e = rows.entry((which, word, why.clone())).or_insert((0, at));
                 e.0 += 1;
             }
-            let mut rows: Vec<(u32, usize, u64)> =
-                grouped.into_iter().map(|(w, (n, at))| (w, n, at)).collect();
-            rows.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut rows: Vec<(u8, u32, String, usize, u64)> = rows
+                .into_iter()
+                .map(|((which, w, why), (n, at))| (which, w, why, n, at))
+                .collect();
+            rows.sort_by(|a, b| b.3.cmp(&a.3).then(a.1.cmp(&b.1)));
+            let encodings = {
+                let mut words: Vec<u32> = rows.iter().map(|r| r.1).collect();
+                words.dedup();
+                words.len()
+            };
+            let tag = |which: u8| if which == 1 { "interp+" } else { "" };
+            if tsv {
+                for (which, word, why, n, at) in &rows {
+                    println!(
+                        "{word:08x}\t{n}\t{at:x}\t{why}\t{:?}\t{}",
+                        decode::decode(*word),
+                        tag(*which)
+                    );
+                }
+                return Ok(());
+            }
             println!(
-                "{} instructions translated, {} unreachable/dead, {} undecoded in {} encodings, {:?}",
+                "{} instructions translated, {} refusals of {} encodings, {:?}",
                 res.stats.instructions,
                 res.unsupported.len(),
-                res.unsupported.len(),
-                rows.len(),
+                encodings,
                 started.elapsed()
             );
-            for (word, n, at) in &rows {
-                println!("  {n:5}  {word:08x}  first at 0x{at:x}");
+            for (which, word, why, n, at) in &rows {
+                println!(
+                    "  {n:5}  {word:08x}  {:<44} {}{:08x}  {why}",
+                    format!("{:?}", decode::decode(*word)),
+                    tag(*which),
+                    at
+                );
+            }
+            Ok(())
+        }
+        "decode" => {
+            // What a word is, for the words a gap log names: `armjit decode 5e104020`.
+            for hex in &args[1..] {
+                let w = u32::from_str_radix(hex.trim_start_matches("0x"), 16)
+                    .map_err(|_| format!("bad word {hex}"))?;
+                println!("{w:08x}  {:?}", decode::decode(w));
             }
             Ok(())
         }
