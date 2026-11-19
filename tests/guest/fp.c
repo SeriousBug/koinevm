@@ -604,9 +604,17 @@ static void fcvtn_bits(unsigned long lo, unsigned long hi, unsigned long fpcr, i
     }
 }
 
+/* One value per lane of a register read back from memory, at the width of the lanes. */
+static void lanes_of(unsigned char *buf, unsigned long *out, int wide) {
+    for (int i = 0; i < (wide ? 2 : 4); i++) {
+        out[i] = 0;
+        for (int k = 0; k < (wide ? 8 : 4); k++) out[i] |= (unsigned long)buf[i * (wide ? 8 : 4) + k] << (8 * k);
+    }
+}
+
 /* The vector rounding family under FPCR's mode, which is the same question the scalar one asks. */
 static void frint_vector(unsigned long lo, unsigned long hi, unsigned long fpcr, int insn,
-                         unsigned long fpcr2, unsigned long *out) {
+                         unsigned long *out) {
     unsigned char buf[16];
     if (insn == 0) {
         __asm__ volatile("fmov d0, %1\n"
@@ -629,22 +637,11 @@ static void frint_vector(unsigned long lo, unsigned long hi, unsigned long fpcr,
                          : "r"(buf), "r"(lo), "r"(hi), "r"(fpcr)
                          : "v0", "v1", "memory");
     }
-    (void)fpcr2;
-    for (int i = 0; i < 2; i++) {
-        out[i] = 0;
-        for (int k = 0; k < 8; k++) out[i] |= (unsigned long)buf[8 * i + k] << (8 * k);
-    }
+    lanes_of(buf, out, 1);
 }
 
 /* The vector forms take FZ and DN lane by lane too. Lane 0 is the operation on the two values
  * and lane 1 is spare, so a section of pairs is what shows what each bit did. */
-static void lanes_of(unsigned char *buf, unsigned long *out, int wide) {
-    for (int i = 0; i < (wide ? 2 : 4); i++) {
-        out[i] = 0;
-        for (int k = 0; k < (wide ? 8 : 4); k++) out[i] |= (unsigned long)buf[i * (wide ? 8 : 4) + k] << (8 * k);
-    }
-}
-
 #define VFP2_D(name, insn)                                                                    \
     static void name(unsigned long a, unsigned long b, unsigned long fpcr,                     \
                      unsigned long *out) {                                                    \
@@ -765,8 +762,6 @@ static const unsigned long vp_s[][2] = {
 
 static void vector_flush(void) {
     static const unsigned long bits[] = {0, FPCR_FZ, FPCR_DN, FPCR_FZ | FPCR_DN};
-    static const char *const *names = 0;
-    (void)names;
     for (unsigned long b = 0; b < sizeof bits / sizeof bits[0]; b++) {
         unsigned long f = bits[b];
         unsigned long out[4];
@@ -956,7 +951,7 @@ static void fpcr_rounding(void) {
         for (int insn = 0; insn < 2; insn++)
             for (unsigned long i = 0; i + 1 < sizeof rm_d / sizeof rm_d[0]; i += 2) {
                 unsigned long out[2];
-                frint_vector(rm_d[i], rm_d[i + 1], FPCR_RM(m), insn, 0, out);
+                frint_vector(rm_d[i], rm_d[i + 1], FPCR_RM(m), insn, out);
                 put_bits(out[0]);
                 put_bits(out[1]);
             }
