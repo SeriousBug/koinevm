@@ -44,11 +44,12 @@ so a library the loader maps while it runs executes without being known in advan
   x0, unknown numbers answer `-ENOSYS` and say so once on stderr with `ARMJIT_SYSCALLS=1`. Memory:
   `brk`, `mmap` (anonymous and file-backed, `MAP_FIXED`), `munmap`, `mprotect`, with a free-span
   allocator and the page table maintained in guest memory. Files: `openat`, `close`, `read`,
-  `pread64`, `write`, `writev`, `lseek`, `fstat`, `newfstatat`, `readlinkat`, `faccessat`, `getcwd`,
-  `ioctl`, resolved inside a root filesystem directory. Start-up: `set_tid_address`,
-  `set_robust_list`, `uname`, `clock_gettime`, `getrandom` (deterministic), `prlimit64`,
-  `sched_getaffinity`, `getuid` family, `rt_sigaction`, `rt_sigprocmask`, `futex`, `madvise`,
-  `membarrier`, `sched_yield`.
+  `pread64`, `readv`, `preadv`, `write`, `writev`, `lseek`, `fstat`, `newfstatat`, `readlinkat`,
+  `faccessat`, `getcwd`, `ioctl`, resolved inside a root filesystem directory. Waiting and counting:
+  `pipe2`, `eventfd`/`eventfd2`, `signalfd4`, `ppoll`, `epoll_*`, `futex`. Start-up:
+  `set_tid_address`, `set_robust_list`, `uname`, `clock_gettime`, `clock_getres`, `getrandom`
+  (deterministic), `prlimit64`, `sched_getaffinity`, `getuid` family, `rt_sigaction`,
+  `rt_sigprocmask`, `madvise`, `membarrier`, `sched_yield`.
 
 ## Correctness
 
@@ -66,14 +67,15 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Twenty-nine more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+checks on and off. Thirty-one more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
 memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`, which makes two names that
 differ only in case and checks they stay two files), the pages a guest may not touch
 (`tests/faults.sh`), the handler a caught signal runs (`tests/sighandler.sh`), a signal and another
 process reaching a spinning guest (`tests/poll.sh`), a guest patching its own code (`tests/smc.sh`),
 the console an interactive shell reads (`tests/console.sh`), a pseudo-terminal a program makes for a
-child of its own (`tests/pty.sh`), and the socket, epoll, signal and resolver paths, each in both
-address-check modes. `bash tests/run.sh` runs all 109.
+child of its own (`tests/pty.sh`), a counted wakeup one process writes and another reads
+(`tests/eventfd.sh`), and the socket, epoll, signal and resolver paths, each in both address-check
+modes. `bash tests/run.sh` runs all 111.
 
 The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
@@ -122,6 +124,15 @@ wakes its parent, so `script` sees the command it ran finish and exits on its ow
 other half of an interactive install: with `whiptail` in the tree its Dialog frontend draws the
 question on the console (the image ships neither it nor `Term::ReadLine`, so it had fallen back to
 the Teletype frontend, whose yes/no prompt wants the word, not the letter).
+
+An editor is the biggest libuv program in the tree, and it runs: `nvim` draws its screen at the
+console, takes `ihello there`, writes the file with `:wq` and exits with zero, and the ShaDa file it
+leaves behind is one it reads back. What it was missing was three syscalls, and the shape of the
+failure is the lesson. `eventfd` is what libuv starts an async handle with; without it the handle is
+left half-built, the caller ignores the error, and the first `uv_async_send` from a thread loads
+through a null `loop` - a crash nowhere near the syscall that was missing. `readv` is how the ShaDa
+file is read, and `clock_getres` left `errno` at `ENOSYS`, which made the next failure the program
+reported name the wrong thing entirely.
 
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
@@ -207,13 +218,6 @@ Two things follow.
   result that lands in the denormal range can be a step out. One known inexactness: wasm has no
   fused multiply-add, so `fmadd` and its siblings round twice and can differ from the instruction in
   the last bit.
-- **An editor.** `nvim` is the biggest libuv program here and it does not run yet. Two faults, both
-  inside libuv. On a terminal, a thread calls `uv_async_send` on a handle whose `loop` field is null
-  and dies on the load at `libuv+0xee2c`, so the async handle it was given was never initialised or
-  is not the one that was; with its output on a pipe there is no thread, and instead `uv__io_poll`'s
-  watcher queue never empties - the head still points at a node that has been removed - so the
-  process spins on `epoll_ctl` and never reaches `epoll_wait`. Neither is anywhere a smaller program
-  goes, and a test tree of fixtures cannot see either.
 - **Instruction coverage of a big library.** The parts of libc that nothing reaches (a page of
   `strlen` variants, the MTE paths in `malloc`) report `undecoded instruction`, and the words are SVE
   and MTE: the loader does not pick them because `ID_AA64PFR0` and `ID_AA64ISAR0` are a baseline
