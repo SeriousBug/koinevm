@@ -962,6 +962,13 @@ export class Kernel {
         entry.desc.locked = k.u32(arg) !== 0;
         return [0n, 0];
       }
+      // TIOCGPTPEER: the slave of a master as a descriptor. It is how a program makes a terminal
+      // pair without naming the slave in between, which is a name another opener could take first.
+      if (req === 0x5441) {
+        const entry = k.files.get(Number(fd));
+        if (!entry || entry.kind !== "pty" || entry.end !== "master") return k.fail(ENOTTY);
+        return [BigInt(k.files.open(`/dev/pts/${entry.desc.id}`, Number(arg), 0)), 0];
+      }
       // TIOCSCTTY: a session leader takes the terminal it opened as its controlling one. There is
       // one terminal per run here and one process group, so there is nothing to take.
       if (req === 0x540e) return [0n, 0];

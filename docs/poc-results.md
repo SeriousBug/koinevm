@@ -66,13 +66,14 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Twenty-seven more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+checks on and off. Twenty-nine more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
 memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`, which makes two names that
 differ only in case and checks they stay two files), the pages a guest may not touch
 (`tests/faults.sh`), the handler a caught signal runs (`tests/sighandler.sh`), a signal and another
 process reaching a spinning guest (`tests/poll.sh`), a guest patching its own code (`tests/smc.sh`),
-the console an interactive shell reads (`tests/console.sh`), and the socket, epoll, signal and
-resolver paths, each in both address-check modes. `bash tests/run.sh` runs all 107.
+the console an interactive shell reads (`tests/console.sh`), a pseudo-terminal a program makes for a
+child of its own (`tests/pty.sh`), and the socket, epoll, signal and resolver paths, each in both
+address-check modes. `bash tests/run.sh` runs all 109.
 
 The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
@@ -112,11 +113,15 @@ Terminals beget terminals. `posix_openpt` and `/dev/ptmx` make a pseudo-terminal
 names its slave, and the two ends carry data with the line discipline, the window size and the flags
 between them, so the `E: Can not write log (Is /dev/pts mounted?)` that `apt` used to print while it
 ran `dpkg` is gone: it has a terminal of its own for the package manager now, and the escapes of the
-progress bar come back out of the master. `signalfd` is where `script` waits for its child, and a
-read of one is a `struct signalfd_siginfo`. Debconf is the other half of an interactive install: with
-`whiptail` in the tree its Dialog frontend draws the question on the console (the image ships
-neither it nor `Term::ReadLine`, so it had fallen back to the Teletype frontend, whose yes/no prompt
-wants the word, not the letter).
+progress bar come back out of the master. A terminal also has a name to the program inside it:
+`/proc/self/fd/N` is a link to what N holds, `st_rdev` of a slave says which UNIX98 device it is,
+`/dev/pts` lists the ones that are open, and `TIOCGPTPEER` hands over a slave without a name in
+between, so a program can make a pair without racing another opener for it. `signalfd` is where
+`script` waits for its child, a read of one is a `struct signalfd_siginfo`, and a child that ends
+wakes its parent, so `script` sees the command it ran finish and exits on its own. Debconf is the
+other half of an interactive install: with `whiptail` in the tree its Dialog frontend draws the
+question on the console (the image ships neither it nor `Term::ReadLine`, so it had fallen back to
+the Teletype frontend, whose yes/no prompt wants the word, not the letter).
 
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
@@ -228,13 +233,12 @@ Two things follow.
   gives it, when a syscall is where the signal can be taken; a signal that arrives while the guest is
   in the middle of a computation waits for the next syscall. A fault is still fatal, so a `SIGSEGV`
   handler does not run.
-- **Job control, and a pty of the guest's own.** One console and one process group: `Ctrl-Z`, `fg`,
-  `jobs`, and a window that is resized (`SIGWINCH`) are not there, so a stopped job cannot be
-  resumed. A program that opens a *pty* (`script`, `expect`, `ssh`) gets the console or nothing,
-  because there is no `/dev/ptmx` behind it. And the console's interrupt reaches the processes that
-  take the default action for it: the shell catches it so that it can tidy up after the command it
-  waits for, and with one process group the disposition is what stands in for "the foreground job",
-  so a program that handles `SIGINT` itself - a Python REPL, say - does not see the `Ctrl-C`.
+- **Job control.** One console and one process group: `Ctrl-Z`, `fg`, `jobs`, and a window that is
+  resized (`SIGWINCH`) are not there, so a stopped job cannot be resumed. And the console's interrupt
+  reaches the processes that take the default action for it: the shell catches it so that it can
+  tidy up after the command it waits for, and with one process group the disposition is what stands
+  in for "the foreground job", so a program that handles `SIGINT` itself - a Python REPL, say - does
+  not see the `Ctrl-C`.
 - **Threads are coroutines, and nothing has a disk.** `clone` makes a thread inside one instance with
   its own registers and stack. A guest that spins without a syscall gives the CPU back at a backward
   branch, so it no longer stalls the others, but a thread is switched only there and at a syscall:

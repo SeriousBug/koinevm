@@ -50,6 +50,20 @@ const DEVICES = new Map([
   ["/dev/urandom", { kind: "random", mode: 0o020666, rdev: 0x0109 }],
 ]);
 
+/// What a pseudo-terminal is to `stat`: a character device whose slave is in the UNIX98 range, so
+/// that a libc can read the number `/dev/pts` names it by out of `st_rdev`.
+function ptyStat(end, id) {
+  return {
+    mode: 0o020620n,
+    nlink: 1n,
+    size: 0n,
+    ino: BigInt(id + 1),
+    dev: 0n,
+    rdev: BigInt(end === "slave" ? (136 << 8) + id : (5 << 8) + 2),
+    blksize: 4096n,
+  };
+}
+
 const O_ACCMODE = 3;
 export const O_WRONLY = 1;
 export const O_RDWR = 2;
@@ -494,22 +508,27 @@ export class Files {
   }
 
   open(guestPath, flags, mode, dirfd = AT_FDCWD) {
-    const virtual = this.virtualFile(guestPath);
+    const name = this.guestPath(guestPath);
+    const virtual = this.virtual.get(name) ?? null;
     if (virtual) {
       if ((flags & O_ACCMODE) !== 0 || (flags & O_TRUNC)) return -EROFS;
       return this.add({
         kind: "file",
         host: null,
         virtual,
+        guest: name,
         size: virtual.length,
         desc: { pos: 0, readable: true, writable: false },
         cloexec: (flags & O_CLOEXEC) !== 0,
       });
     }
+    // `/proc/self/fd/N` opens what N has open, which is what a program that finds its own
+    // descriptor by that name gets on a real kernel.
+    const proc = this.procFd(name);
+    if (proc) return this.dup(proc.fd, 0, (flags & O_CLOEXEC) !== 0);
     // A pseudo-terminal. `/dev/ptmx` makes a new one and hands back its master, and the name the
     // slave has is what `ptsname` asks for: a program that needs a child to have a terminal opens
     // the slave, and everything the child writes comes back out of the master.
-    const name = this.guestPath(guestPath);
     if (name === "/dev/ptmx") {
       const pty = this.pty();
       pty.master++;
@@ -565,6 +584,7 @@ export class Files {
       if (st.isDirectory()) {
         if (entry.desc.writable) return -EISDIR;
         entry.kind = "dir";
+        entry.guest = this.guestPath(guestPath);
         entry.size = st.size;
         return this.add(entry);
       }
@@ -629,6 +649,33 @@ export class Files {
     const buf = Buffer.alloc(len);
     const n = fs.readSync(this.handleOf(entry), buf, 0, len, off);
     return buf.subarray(0, n);
+  }
+
+  /// The name a descriptor is known by, which is what `/proc/self/fd/N` is a link to. A terminal is
+  /// named by its device, a pipe and a socket by their description, and a file by the path the guest
+  /// gave it - the shapes a libc reads to decide what it has been handed.
+  fdName(entry) {
+    if (entry.kind === "pty") return entry.end === "master" ? "/dev/ptmx" : `/dev/pts/${entry.desc.id}`;
+    if (entry.kind === "stdin" || entry.kind === "stdout" || entry.kind === "stderr") return "/dev/console";
+    if (entry.kind === "pipe") return `pipe:[${entry.desc.id}]`;
+    if (entry.kind === "socket") return `socket:[${entry.desc.id ?? 0}]`;
+    if (entry.kind === "null") return "/dev/null";
+    if (entry.kind === "zero") return "/dev/zero";
+    if (entry.kind === "full") return "/dev/full";
+    if (entry.kind === "random") return "/dev/urandom";
+    if (entry.virtual) return entry.guest;
+    if (entry.host) return this.guestName(entry.host);
+    return `anon_inode:[${entry.kind}]`;
+  }
+
+  /// `/proc/self/fd/N` names a descriptor of this process, and `/proc/<its own pid>/fd/N` names one
+  /// too. Anything else under `/proc` is not here, and the tree's own directory answers for it.
+  procFd(guestPath) {
+    const m = /^\/proc\/(self|\d+)\/fd\/(\d+)$/.exec(this.guestPath(guestPath));
+    if (!m) return null;
+    const fd = Number(m[2]);
+    const entry = this.map.get(fd);
+    return entry ? { fd, entry } : null;
   }
 
   /// The pseudo-terminal a number names, or null: `/dev/ptmx` hands out a new one, and everything
@@ -753,6 +800,18 @@ export class Files {
   dirEntries(entry) {
     if (entry.entries) return entry.entries;
     const out = [];
+    // `/dev/pts` holds the pseudo-terminals of the run, which the tree's own directory does not
+    // know about. A libc that has no `/proc/self/fd` to ask reads a terminal's name out of a scan of
+    // this, comparing `st_rdev`.
+    if (entry.guest === "/dev/pts") {
+      out.push({ name: ".", ino: 1n, type: DT.dir }, { name: "..", ino: 1n, type: DT.dir });
+      for (const [id, pty] of ptys) {
+        if (pty.slave === 0 && pty.master === 0) continue;
+        out.push({ name: String(id), ino: BigInt(id + 1), type: DT.chr });
+      }
+      entry.entries = out;
+      return out;
+    }
     const add = (name, host) => {
       let st = null;
       try {
@@ -904,6 +963,14 @@ export class Files {
   statFile(guestPath, dirfd = AT_FDCWD) {
     const virtual = this.virtualStat(guestPath);
     if (virtual) return virtual;
+    const proc = this.procFd(guestPath);
+    if (proc) return this.statFd(proc.fd);
+    const name = this.guestPath(guestPath);
+    if (name === "/dev/ptmx") return ptyStat("master", 0);
+    if (name.startsWith("/dev/pts/")) {
+      const pty = ptys.get(Number(name.slice("/dev/pts/".length)));
+      return pty ? ptyStat("slave", pty.id) : -ENOENT;
+    }
     const host = this.resolveAt(guestPath, dirfd);
     if (host < 0) return host;
     try {
@@ -929,20 +996,7 @@ export class Files {
     if (entry.kind === "socket") {
       return { mode: 0o140777n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
     }
-    if (entry.kind === "pty") {
-      // A character device, which is what a program that fstats a terminal reads it for: a slave of
-      // the UNIX98 range, `major 136`, whose minor is the number `/dev/pts` names it by. A libc
-      // reads the name of a terminal out of that when it has no `/proc/self/fd` to ask.
-      return {
-        mode: 0o020620n,
-        nlink: 1n,
-        size: 0n,
-        ino: BigInt(entry.desc.id + 1),
-        dev: 0n,
-        rdev: BigInt(entry.end === "slave" ? (136 << 8) + entry.desc.id : (5 << 8) + 2),
-        blksize: 4096n,
-      };
-    }
+    if (entry.kind === "pty") return ptyStat(entry.end, entry.desc.id);
     if (entry.kind === "epoll") {
       // An anon inode: a regular file to `fstat`, which is all a program reads it for.
       return { mode: 0o100600n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
@@ -970,6 +1024,8 @@ export class Files {
   }
 
   readlink(guestPath, dirfd = AT_FDCWD) {
+    const proc = this.procFd(guestPath);
+    if (proc) return this.fdName(proc.entry);
     const host = this.resolveAt(guestPath, dirfd, false);
     if (host < 0) return host;
     try {
