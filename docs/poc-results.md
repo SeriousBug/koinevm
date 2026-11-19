@@ -67,15 +67,16 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Thirty-one more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+checks on and off. Thirty-three more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
 memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`, which makes two names that
 differ only in case and checks they stay two files), the pages a guest may not touch
 (`tests/faults.sh`), the handler a caught signal runs (`tests/sighandler.sh`), a signal and another
 process reaching a spinning guest (`tests/poll.sh`), a guest patching its own code (`tests/smc.sh`),
 the console an interactive shell reads (`tests/console.sh`), a pseudo-terminal a program makes for a
 child of its own (`tests/pty.sh`), a counted wakeup one process writes and another reads
-(`tests/eventfd.sh`), and the socket, epoll, signal and resolver paths, each in both address-check
-modes. `bash tests/run.sh` runs all 111.
+(`tests/eventfd.sh`), an editor on top of the whole stack (`tests/nvim.sh`), and the socket,
+epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all
+113.
 
 The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
