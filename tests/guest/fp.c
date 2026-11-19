@@ -636,6 +636,225 @@ static void frint_vector(unsigned long lo, unsigned long hi, unsigned long fpcr,
     }
 }
 
+/* The vector forms take FZ and DN lane by lane too. Lane 0 is the operation on the two values
+ * and lane 1 is spare, so a section of pairs is what shows what each bit did. */
+static void lanes_of(unsigned char *buf, unsigned long *out, int wide) {
+    for (int i = 0; i < (wide ? 2 : 4); i++) {
+        out[i] = 0;
+        for (int k = 0; k < (wide ? 8 : 4); k++) out[i] |= (unsigned long)buf[i * (wide ? 8 : 4) + k] << (8 * k);
+    }
+}
+
+#define VFP2_D(name, insn)                                                                    \
+    static void name(unsigned long a, unsigned long b, unsigned long fpcr,                     \
+                     unsigned long *out) {                                                    \
+        unsigned char buf[16];                                                                \
+        __asm__ volatile("movi v1.16b, #0\n"                                                   \
+                         "movi v2.16b, #0\n"                                                   \
+                         "fmov d1, %1\n"                                                      \
+                         "fmov d2, %2\n"                                                       \
+                         "msr fpcr, %3\n" insn " v0.2d, v1.2d, v2.2d\n"                        \
+                         "msr fpcr, xzr\n"                                                     \
+                         "str q0, [%0]"                                                        \
+                         :                                                                     \
+                         : "r"(buf), "r"(a), "r"(b), "r"(fpcr)                                 \
+                         : "v0", "v1", "v2", "memory");                                        \
+        lanes_of(buf, out, 1);                                                                 \
+    }
+VFP2_D(v_d_fadd, "fadd")
+VFP2_D(v_d_fsub, "fsub")
+VFP2_D(v_d_fmul, "fmul")
+VFP2_D(v_d_fdiv, "fdiv")
+
+#define VFP1_D(name, insn)                                                                    \
+    static void name(unsigned long a, unsigned long fpcr, unsigned long *out) {                \
+        unsigned char buf[16];                                                                \
+        __asm__ volatile("movi v1.16b, #0\n"                                                    \
+                         "fmov d1, %1\n"                                                       \
+                         "msr fpcr, %2\n" insn " v0.2d, v1.2d\n"                               \
+                         "msr fpcr, xzr\n"                                                      \
+                         "str q0, [%0]"                                                         \
+                         :                                                                      \
+                         : "r"(buf), "r"(a), "r"(fpcr)                                          \
+                         : "v0", "v1", "memory");                                               \
+        lanes_of(buf, out, 1);                                                                  \
+    }
+VFP1_D(v_d_fsqrt, "fsqrt")
+
+#define VFP2_S(name, insn)                                                                    \
+    static void name(unsigned long a, unsigned long b, unsigned long fpcr,                     \
+                     unsigned long *out) {                                                    \
+        unsigned char buf[16];                                                                \
+        __asm__ volatile("movi v1.16b, #0\n"                                                   \
+                         "movi v2.16b, #0\n"                                                   \
+                         "fmov s1, %w1\n"                                                     \
+                         "fmov s2, %w2\n"                                                      \
+                         "msr fpcr, %3\n" insn " v0.4s, v1.4s, v2.4s\n"                        \
+                         "msr fpcr, xzr\n"                                                     \
+                         "str q0, [%0]"                                                        \
+                         :                                                                     \
+                         : "r"(buf), "r"((unsigned int)a), "r"((unsigned int)b), "r"(fpcr)     \
+                         : "v0", "v1", "v2", "memory");                                        \
+        lanes_of(buf, out, 0);                                                                 \
+    }
+VFP2_D(v_d_fmax, "fmax")
+VFP2_D(v_d_fmin, "fmin")
+
+#define VFP3_D(name, insn)                                                                    \
+    static void name(unsigned long a, unsigned long b, unsigned long c, unsigned long fpcr,     \
+                     unsigned long *out) {                                                     \
+        unsigned char buf[16];                                                                 \
+        __asm__ volatile("movi v0.16b, #0\n"                                                   \
+                         "movi v1.16b, #0\n"                                                   \
+                         "movi v2.16b, #0\n"                                                   \
+                         "fmov d0, %1\n"                                                      \
+                         "fmov d1, %2\n"                                                       \
+                         "fmov d2, %3\n"                                                       \
+                         "msr fpcr, %4\n" insn " v0.2d, v1.2d, v2.2d\n"                        \
+                         "msr fpcr, xzr\n"                                                     \
+                         "str q0, [%0]"                                                        \
+                         :                                                                     \
+                         : "r"(buf), "r"(a), "r"(b), "r"(c), "r"(fpcr)                         \
+                         : "v0", "v1", "v2", "memory");                                        \
+        lanes_of(buf, out, 1);                                                                 \
+    }
+VFP3_D(v_d_fmla, "fmla")
+VFP3_D(v_d_fmls, "fmls")
+
+VFP2_S(v_s_fadd, "fadd")
+VFP2_S(v_s_fmul, "fmul")
+VFP2_S(v_s_fdiv, "fdiv")
+
+#define VFP1_S(name, insn)                                                                    \
+    static void name(unsigned long a, unsigned long fpcr, unsigned long *out) {                \
+        unsigned char buf[16];                                                                \
+        __asm__ volatile("movi v1.16b, #0\n"                                                    \
+                         "fmov s1, %w1\n"                                                      \
+                         "msr fpcr, %2\n" insn " v0.4s, v1.4s\n"                               \
+                         "msr fpcr, xzr\n"                                                      \
+                         "str q0, [%0]"                                                         \
+                         :                                                                      \
+                         : "r"(buf), "r"((unsigned int)a), "r"(fpcr)                            \
+                         : "v0", "v1", "memory");                                               \
+        lanes_of(buf, out, 0);                                                                  \
+    }
+VFP1_S(v_s_fsqrt, "fsqrt")
+
+/* Pairs that a flush or a default NaN separates: denormals on their own, a denormal against an
+ * ordinary number whose product or quotient leaves the denormal range, and NaNs to quieten. */
+static const unsigned long vp_d[][2] = {
+    {0x0000000000000001UL, 0x0000000000000001UL},
+    {0x0000000000000003UL, 0x3fe0000000000000UL},
+    {0x000fffffffffffffUL, 0x4000000000000000UL},
+    {0x0010000000000000UL, 0x3fe0000000000000UL},
+    {0x0000000000000001UL, 0x4000000000000000UL},
+    {0x7ff8000000000001UL, 0x3ff0000000000000UL},
+    {0x7ff0000000000001UL, 0x3ff0000000000000UL},
+    {0x7ff0000000000000UL, 0x7ff0000000000000UL},
+};
+static const unsigned long vp_s[][2] = {
+    {0x00000001UL, 0x00000001UL},
+    {0x00000003UL, 0x3f000000UL},
+    {0x007fffffUL, 0x40000000UL},
+    {0x00800000UL, 0x3f000000UL},
+    {0x00000001UL, 0x40000000UL},
+    {0x7fc00001UL, 0x3f800000UL},
+    {0x7f800001UL, 0x3f800000UL},
+    {0x7f800000UL, 0x7f800000UL},
+};
+
+static void vector_flush(void) {
+    static const unsigned long bits[] = {0, FPCR_FZ, FPCR_DN, FPCR_FZ | FPCR_DN};
+    static const char *const *names = 0;
+    (void)names;
+    for (unsigned long b = 0; b < sizeof bits / sizeof bits[0]; b++) {
+        unsigned long f = bits[b];
+        unsigned long out[4];
+        unsigned long n = sizeof vp_d / sizeof vp_d[0];
+
+        put_name("v d add");
+        for (unsigned long i = 0; i < n; i++) {
+            v_d_fadd(vp_d[i][0], vp_d[i][1], f, out);
+            put_bits(out[0]);
+            put_bits(out[1]);
+        }
+        put_name("v d sub");
+        for (unsigned long i = 0; i < n; i++) {
+            v_d_fsub(vp_d[i][0], vp_d[i][1], f, out);
+            put_bits(out[0]);
+            put_bits(out[1]);
+        }
+        put_name("v d mul");
+        for (unsigned long i = 0; i < n; i++) {
+            v_d_fmul(vp_d[i][0], vp_d[i][1], f, out);
+            put_bits(out[0]);
+            put_bits(out[1]);
+        }
+        put_name("v d div");
+        for (unsigned long i = 0; i < n; i++) {
+            v_d_fdiv(vp_d[i][0], vp_d[i][1], f, out);
+            put_bits(out[0]);
+            put_bits(out[1]);
+        }
+        put_name("v d sqrt");
+        for (unsigned long i = 0; i < n; i++) {
+            v_d_fsqrt(vp_d[i][0], f, out);
+            put_bits(out[0]);
+            put_bits(out[1]);
+        }
+        put_name("v d max");
+        for (unsigned long i = 0; i < n; i++) {
+            v_d_fmax(vp_d[i][0], vp_d[i][1], f, out);
+            put_bits(out[0]);
+            put_bits(out[1]);
+        }
+        put_name("v d min");
+        for (unsigned long i = 0; i < n; i++) {
+            v_d_fmin(vp_d[i][0], vp_d[i][1], f, out);
+            put_bits(out[0]);
+            put_bits(out[1]);
+        }
+        // The fused forms are here for FZ alone: which NaN a multiply-add hands back is the
+        // engine's choice, and `simd` is the fixture that pins that down.
+        put_name("v d fmla");
+        for (unsigned long i = 0; i < 5; i++) {
+            v_d_fmla(vp_d[i][1], vp_d[i][0], vp_d[i][0], f, out);
+            put_bits(out[0]);
+            put_bits(out[1]);
+        }
+        put_name("v d fmls");
+        for (unsigned long i = 0; i < 5; i++) {
+            v_d_fmls(vp_d[i][1], vp_d[i][0], vp_d[i][0], f, out);
+            put_bits(out[0]);
+            put_bits(out[1]);
+        }
+        put_name("v s add");
+        for (unsigned long i = 0; i < n; i++) {
+            v_s_fadd(vp_s[i][0], vp_s[i][1], f, out);
+            put_bits32((unsigned int)out[0]);
+            put_bits32((unsigned int)out[3]);
+        }
+        put_name("v s mul");
+        for (unsigned long i = 0; i < n; i++) {
+            v_s_fmul(vp_s[i][0], vp_s[i][1], f, out);
+            put_bits32((unsigned int)out[0]);
+            put_bits32((unsigned int)out[3]);
+        }
+        put_name("v s div");
+        for (unsigned long i = 0; i < n; i++) {
+            v_s_fdiv(vp_s[i][0], vp_s[i][1], f, out);
+            put_bits32((unsigned int)out[0]);
+            put_bits32((unsigned int)out[3]);
+        }
+        put_name("v s sqrt");
+        for (unsigned long i = 0; i < n; i++) {
+            v_s_fsqrt(vp_s[i][0], f, out);
+            put_bits32((unsigned int)out[0]);
+            put_bits32((unsigned int)out[3]);
+        }
+    }
+}
+
 /* Values that only a rounding mode can tell apart: a mantissa that ends in the middle of a step,
  * halfway cases in both signs, and values whose step is the whole number. */
 static const long rm_i64[] = {
@@ -1027,6 +1246,7 @@ __attribute__((used)) void GUEST_ENTRY(void) {
     fpcr_rounding();
     fpcr_flush_denormals();
     fpcr_default_nan();
+    vector_flush();
 
     fcvt_same_register();
 

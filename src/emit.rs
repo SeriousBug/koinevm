@@ -1452,6 +1452,24 @@ fn sign_mask(double: bool) -> [u8; 16] {
     m
 }
 
+/// The smallest normal of a width, which is where FZ starts flushing.
+fn min_normal(double: bool) -> u64 {
+    if double {
+        0x0010_0000_0000_0000
+    } else {
+        0x0080_0000
+    }
+}
+
+/// The quiet NaN with no payload that DN puts in place of every NaN result.
+fn default_nan(double: bool) -> u64 {
+    if double {
+        0x7ff8_0000_0000_0000
+    } else {
+        0x7fc0_0000
+    }
+}
+
 /// One float spread across every lane of a register, which is how a constant meets a vector op.
 fn lane_repeat(double: bool, wide: u64, narrow: u32) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -1811,6 +1829,10 @@ fn region_body(
     let mut first = Vec::new();
     match RegionEmitter::new(region, layout, ids, &mut first).emit() {
         Ok(body) => {
+            if std::env::var("ARMJIT_DUMP_BODY").is_ok() {
+                let name = format!("/tmp/body_{:x}.bin", region.blocks[0].addr);
+                std::fs::write(name, &body.body).unwrap();
+            }
             unsupported.extend(first);
             Ok(body)
         }
@@ -2603,7 +2625,7 @@ impl<'a> RegionEmitter<'a> {
     fn fp_flush(&mut self, double: bool) {
         let ty = if double { F64 } else { F32 };
         let tmp = if double { L_F0 } else { L_S0 };
-        let min_normal = if double { 0x0010_0000_0000_0000u64 } else { 0x0080_0000u64 };
+        let min_normal = min_normal(double);
         self.f.ls(tmp);
         self.fpcr_flag(FPCR_FZ);
         self.f.op(IF);
@@ -2639,7 +2661,7 @@ impl<'a> RegionEmitter<'a> {
     fn fp_fixup(&mut self, double: bool) {
         let ty = if double { F64 } else { F32 };
         let tmp = if double { L_F0 } else { L_S0 };
-        let default_nan = if double { 0x7ff8_0000_0000_0000u64 } else { 0x7fc0_0000u64 };
+        let default_nan = default_nan(double);
         self.f.ls(tmp);
         self.fpcr_flag(FPCR_FZ | FPCR_DN);
         self.f.op(IF);
@@ -2728,6 +2750,145 @@ impl<'a> RegionEmitter<'a> {
         if flush {
             self.fp_fixup(double);
         }
+    }
+
+    /// FZ and DN applied to a vector of `double`-wide lanes or of singles: a denormal lane becomes
+    /// a zero of its own sign and a NaN lane the default NaN.
+    fn vec_fixup(&mut self, double: bool) {
+        self.f.ls(L_V0);
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(V128);
+        self.vec_denormal(double);
+        self.f.ls(L_V0);
+        self.fpcr_flag(FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(V128);
+        self.vec_default_nan(double);
+        self.f.op(ELSE);
+        self.f.lg(L_V0);
+        self.f.end();
+        self.f.op(ELSE);
+        self.f.lg(L_V0);
+        self.f.end();
+    }
+
+    /// The vector in `L_V0` with a denormal lane turned into a zero of the same sign, if FZ asks.
+    fn vec_denormal(&mut self, double: bool) {
+        self.fpcr_flag(FPCR_FZ);
+        self.f.op(IF);
+        self.f.body.push(V128);
+        self.f.lg(L_V0);
+        self.f.v128c(sign_mask(double));
+        self.f.simd(simd::V128_AND);
+        self.f.lg(L_V0);
+        self.f.lg(L_V0);
+        self.f.simd(if double { simd::F64X2_ABS } else { simd::F32X4_ABS });
+        self.fp_const(min_normal(double), double);
+        self.f.simd(if double { simd::F64X2_SPLAT } else { simd::F32X4_SPLAT });
+        self.f.simd(if double { simd::F64X2_LT } else { simd::F32X4_LT });
+        self.f.simd(simd::V128_BITSELECT);
+        self.f.op(ELSE);
+        self.f.lg(L_V0);
+        self.f.end();
+    }
+
+    /// The vector in `L_V0` with a NaN lane replaced by the default NaN, if DN asks.
+    fn vec_default_nan(&mut self, double: bool) {
+        self.fpcr_flag(FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(V128);
+        self.fp_const(default_nan(double), double);
+        self.f.simd(if double { simd::F64X2_SPLAT } else { simd::F32X4_SPLAT });
+        self.f.lg(L_V0);
+        self.f.lg(L_V0);
+        self.f.lg(L_V0);
+        self.f.simd(if double { simd::F64X2_NE } else { simd::F32X4_NE });
+        self.f.simd(simd::V128_BITSELECT);
+        self.f.op(ELSE);
+        self.f.lg(L_V0);
+        self.f.end();
+    }
+
+    /// One vector FP operation, with the flushing path emitted only where FPCR asks for it.
+    fn vec3_fp(&mut self, rn: u32, rm: u32, rd: u32, double: bool, op: u32, post: &[u32]) {
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.vec_arg(rn, double);
+        self.vec_arg(rm, double);
+        self.f.simd(op);
+        for &p in post {
+            self.f.simd(p);
+        }
+        self.vec_fixup(double);
+        self.setv(rd);
+        self.f.op(ELSE);
+        self.getv(rn);
+        self.getv(rm);
+        self.f.simd(op);
+        for &p in post {
+            self.f.simd(p);
+        }
+        self.setv(rd);
+        self.f.end();
+    }
+
+    /// `fmla` and `fmls`: the destination and the product, with FZ and DN when the guest asks.
+    fn vec_mac_fp(&mut self, rn: u32, rm: u32, rd: u32, double: bool, op: u32) {
+        let mul = if double { simd::F64X2_MUL } else { simd::F32X4_MUL };
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.vec_mac(rn, rm, rd, double, mul, op, true);
+        self.setv(rd);
+        self.f.op(ELSE);
+        self.vec_mac(rn, rm, rd, double, mul, op, false);
+        self.setv(rd);
+        self.f.end();
+    }
+
+    fn vec_mac(&mut self, rn: u32, rm: u32, rd: u32, double: bool, mul: u32, op: u32, flush: bool) {
+        self.vec_arg(rd, double);
+        self.vec_arg(rn, double);
+        self.vec_arg(rm, double);
+        self.f.simd(mul);
+        self.f.simd(op);
+        if flush {
+            self.vec_fixup(double);
+        }
+    }
+
+    /// One unary vector FP operation, on the same terms.
+    fn vec2_fp(&mut self, rn: u32, rd: u32, double: bool, op: u32) {
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.vec_arg(rn, double);
+        self.f.simd(op);
+        self.vec_fixup(double);
+        self.setv(rd);
+        self.f.op(ELSE);
+        self.vec2(rn, rd, op);
+        self.f.end();
+    }
+
+    /// A vector operand of an FP operation, whose denormal lanes FZ flushes.
+    fn vec_arg(&mut self, r: u32, double: bool) {
+        self.getv(r);
+        self.f.ls(L_V0);
+        self.vec_denormal(double);
+    }
+
+    /// The vector result in `r`, having let FZ and DN at it.
+    fn vec_fixup_reg(&mut self, r: u32, double: bool) {
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.getv(r);
+        self.vec_fixup(double);
+        self.setv(r);
+        self.f.end();
     }
 
     /// The result of an FP operation into lane 0 of `r`, having let FZ and DN at it.
@@ -5113,28 +5274,33 @@ impl<'a> RegionEmitter<'a> {
                     // fmax/fmin and their `nm` pair: the larger or the smaller of the two, and the
                     // one that is not a NaN where only one of them is.
                     (false, _, 0b11110) | (false, _, 0b11000) => {
-                        self.vec_minmax(rn, rm, rd, size & 1 == 1, size & 2 == 0, op == 0b11000);
+                        let double = size & 1 == 1;
+                        self.vec_minmax(rn, rm, rd, double, size & 2 == 0, op == 0b11000);
+                        self.vec_fixup_reg(rd, double);
                     }
                     (false, 0 | 1, 0b11010) => {
-                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_ADD } else { simd::F32X4_ADD })
+                        let add = if size & 1 == 1 { simd::F64X2_ADD } else { simd::F32X4_ADD };
+                        self.vec3_fp(rn, rm, rd, size & 1 == 1, add, &[])
                     }
                     (false, 2 | 3, 0b11010) => {
-                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB })
+                        let sub = if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB };
+                        self.vec3_fp(rn, rm, rd, size & 1 == 1, sub, &[])
                     }
                     (true, 2 | 3, 0b11010) => {
                         // fabd: the absolute value of the difference.
-                        self.getv(rn);
-                        self.getv(rm);
-                        self.f.simd(if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB });
-                        self.f.simd(if size & 1 == 1 { simd::F64X2_ABS } else { simd::F32X4_ABS });
-                        self.setv(rd);
+                        let double = size & 1 == 1;
+                        let sub = if double { simd::F64X2_SUB } else { simd::F32X4_SUB };
+                        let abs = if double { simd::F64X2_ABS } else { simd::F32X4_ABS };
+                        self.vec3_fp(rn, rm, rd, double, sub, &[abs]);
                     }
                     (false, 0 | 1, 0b11011) | (true, 0 | 1, 0b11011) => {
                         // fmul and fmulx, which differ only for zero times infinity.
-                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_MUL } else { simd::F32X4_MUL })
+                        let mul = if size & 1 == 1 { simd::F64X2_MUL } else { simd::F32X4_MUL };
+                        self.vec3_fp(rn, rm, rd, size & 1 == 1, mul, &[])
                     }
                     (true, 0 | 1, 0b11111) => {
-                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_DIV } else { simd::F32X4_DIV })
+                        let div = if size & 1 == 1 { simd::F64X2_DIV } else { simd::F32X4_DIV };
+                        self.vec3_fp(rn, rm, rd, size & 1 == 1, div, &[])
                     }
                     (false, 0 | 1, 0b11001) | (false, 2 | 3, 0b11001) => {
                         // fmla and fmls multiply into the destination rather than into a product of
@@ -5150,12 +5316,7 @@ impl<'a> RegionEmitter<'a> {
                         } else {
                             add
                         };
-                        self.getv(rd);
-                        self.getv(rn);
-                        self.getv(rm);
-                        self.f.simd(mul);
-                        self.f.simd(op);
-                        self.setv(rd);
+                        self.vec_mac_fp(rn, rm, rd, size & 1 == 1, op);
                     }
                     _ => return self.refuse(format!("unsupported vector operation {op:05b} u={u} size={size} at 0x{addr:x}")),
                 }
@@ -5165,8 +5326,13 @@ impl<'a> RegionEmitter<'a> {
                     (false, 1, 0b10110) => {
                         // fcvtn / fcvtn2: two doubles narrowed to two singles, in the low half or
                         // above the ones the destination keeps. Half precision is the size 0 form.
+                        // The demote is exactly what the instruction does at the default mode
+                        // with neither bit set; anything else takes the lanes one at a time.
                         self.fpcr_rmode();
                         self.f.op(I32_EQZ);
+                        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+                        self.f.op(I32_EQZ);
+                        self.f.op(I32_AND);
                         self.f.op(IF);
                         self.f.body.push(V128);
                         self.getv(rn);
@@ -5176,8 +5342,10 @@ impl<'a> RegionEmitter<'a> {
                         for lane in 0..2 {
                             self.getv(rn);
                             self.f.simd_lane(simd::F64X2_EXTRACT_LANE, lane);
+                            self.fp_flush(true);
                             self.f.ls(L_F0);
                             self.fp_narrow();
+                            self.fp_fixup(false);
                             self.f.simd_lane(simd::F32X4_REPLACE_LANE, lane);
                         }
                         self.f.end();
@@ -5284,11 +5452,11 @@ impl<'a> RegionEmitter<'a> {
                         self.f.simd(simd::V128_XOR);
                         self.setv(rd);
                     }
-                    (true, 2 | 3, 0b11111) => self.vec2(
-                        rn,
-                        rd,
-                        if size & 1 == 1 { simd::F64X2_SQRT } else { simd::F32X4_SQRT },
-                    ),
+                    (true, 2 | 3, 0b11111) => {
+                        let double = size & 1 == 1;
+                        let sqrt = if double { simd::F64X2_SQRT } else { simd::F32X4_SQRT };
+                        self.vec2_fp(rn, rd, double, sqrt);
+                    }
                     // The rounding family: to integral, in the mode the opcode names. Bit 23 picks
                     // the second of each mode's pair and bit 22 is the lane width, which is why
                     // `frintp` reads as `frintn` one lane width up until both bits are taken.
@@ -5322,6 +5490,7 @@ impl<'a> RegionEmitter<'a> {
                                 },
                             );
                             self.setv(rd);
+                            self.vec_fixup_reg(rd, double);
                         } else {
                             let (narrow, wide) = match (u, op, upper) {
                                 (false, 0b11000, false) => (simd::F32X4_NEAREST, simd::F64X2_NEAREST),
