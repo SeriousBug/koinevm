@@ -5595,18 +5595,21 @@ impl<'a> RegionEmitter<'a> {
                 // There is no fused multiply-add in wasm, so this rounds twice and can differ from
                 // the instruction in the last bit. docs/poc-results.md records that.
                 self.fp_base();
-                self.fp_get(rn, double);
-                self.fp_get(rm, double);
-                self.f.op(if double { F64_MUL } else { F32_MUL });
+                // All four forms are the accumulator plus the product with a sign each: bit 21
+                // negates the accumulator and bit 15 the product, so FMSUB is `Va - Vn*Vm` and
+                // FNMSUB is `-Va + Vn*Vm`. The accumulator goes on the stack first because that is
+                // the NaN a result of two carries, as the hardware reports it.
+                self.fp_get(ra, double);
                 if negate_product {
                     self.f.op(if double { F64_NEG } else { F32_NEG });
                 }
-                self.fp_get(ra, double);
+                self.fp_get(rn, double);
+                self.fp_get(rm, double);
+                self.f.op(if double { F64_MUL } else { F32_MUL });
                 if negate_product != subtract {
-                    self.f.op(if double { F64_SUB } else { F32_SUB });
-                } else {
-                    self.f.op(if double { F64_ADD } else { F32_ADD });
+                    self.f.op(if double { F64_NEG } else { F32_NEG });
                 }
+                self.f.op(if double { F64_ADD } else { F32_ADD });
                 self.fp_put(rd, double);
             }
             Insn::FpCompareZero { double, op, integer, rn, rd } => {

@@ -545,6 +545,23 @@ static void setup(void) {
     X(fabd_s, "fabd s", "fmov s0, %w1\n fmov s1, %w2\n fabd s2, s0, s1\n" S2W)                  \
     X(fmulx_d, "fmulx d", "fmov d0, %3\n fmov d1, %4\n fmulx d2, d0, d1\n" D2X)                \
     X(fmulx_s, "fmulx s", "fmov s0, %w1\n fmov s1, %w2\n fmulx s2, s0, s1\n" S2W)              \
+    /* The four fused forms: bit 15 negates the product and bit 21 the accumulator, so the
+     * accumulator is the minuend and `fmsub` is `Va - Vn*Vm`, not the other way round. */       \
+    X(fmadd_d, "fmadd d", "fmov d2, %4\n fmadd d3, d0, d1, d2\n fmov %0, d3")                   \
+    X(fmsub_d, "fmsub d", "fmov d2, %4\n fmsub d3, d0, d1, d2\n fmov %0, d3")                   \
+    X(fnmadd_d, "fnmadd d", "fmov d2, %4\n fnmadd d3, d0, d1, d2\n fmov %0, d3")                \
+    X(fnmsub_d, "fnmsub d", "fmov d2, %4\n fnmsub d3, d0, d1, d2\n fmov %0, d3")                \
+    X(fmsub_s, "fmsub s", "fmov s2, %w2\n fmsub s3, s0, s1, s2\n fmov w9, s3\n mov %0, x9")      \
+    X(fnmsub_s, "fnmsub s", "fmov s2, %w2\n fnmsub s3, s0, s1, s2\n fmov w9, s3\n mov %0, x9")   \
+    /* The scalar single-source group. `fsqrt` and `fabs` carry the marker bits that a wide
+     * match on the conversions takes, so this is what tells the two groups apart. */           \
+    X(fsqrt_d_s, "fsqrt d", "fsqrt d2, d0\n fmov %0, d2")                                      \
+    X(fsqrt_s_s, "fsqrt s", "fsqrt s2, s0\n fmov w9, s2\n mov %0, x9")                          \
+    X(fabs_d_s, "fabs d", "fabs d2, d0\n fmov %0, d2")                                          \
+    X(fneg_d_s, "fneg d", "fneg d2, d0\n fmov %0, d2")                                          \
+    X(frintn_d_s, "frintn d", "frintn d2, d0\n fmov %0, d2")                                    \
+    X(frinta_d_s, "frinta d", "frinta d2, d0\n fmov %0, d2")                                    \
+    X(frintz_d_s, "frintz d", "frintz d2, d0\n fmov %0, d2")                                    \
     /* A conversion with a fraction-bit count, which scales the integer before it becomes a
      * float: the form a compiler uses for a value held as a fixed-point fraction. */              \
     X(scvtf_d_w_f24, "scvtf d, w, #24", "scvtf d2, %w1, #0x18\n" D2X)                           \
