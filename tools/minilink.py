@@ -234,30 +234,38 @@ def main():
     symtab = next(s for s in secs if s["type"] == 2)
     syms = read_syms(buf, secs, symtab)
 
-    # Lay out allocatable sections: .text in the executable segment, everything else packed after it.
-    # vaddrs and the output blobs must be built in the same pass, or a relocation would be applied
-    # at a different address than the one the code was linked against.
+    # Lay out allocatable sections: every section of code in the executable segment, everything else
+    # packed after it. vaddrs and the output blobs must be built in the same pass, or a relocation
+    # would be applied at a different address than the one the code was linked against.
+    #
+    # A section clang splits out of `.text` - `.text.unlikely`, `.text.hot` - is still code, and it
+    # has to land in the executable segment: laying its bytes into the read-only segment while its
+    # addresses say they are part of the text shifts every string literal by its length, which is a
+    # fixture that prints another fixture's words.
     section_vaddr = {}
-    blobs = {}
-    rodata_blobs = bytearray()
+    blobs = {s["name"]: bytearray(s["data"]) for s in secs if s["flags"] & 0x2}  # SHF_ALLOC
+    code_names = [n for n in blobs if n.startswith(".text")]
+    if ".text" in code_names:
+        code_names.remove(".text")
+        code_names.insert(0, ".text")
+    text, rodata_blobs = bytearray(), bytearray()
+    for name in code_names:
+        section_vaddr[name] = text_vaddr + len(text)
+        text += blobs[name]
     for s in secs:
-        if not (s["flags"] & 0x2):  # SHF_ALLOC
-            continue
-        blobs[s["name"]] = bytearray(s["data"])
-        if s["name"] == ".text":
-            section_vaddr[s["name"]] = text_vaddr
-        elif s["name"].startswith(".text"):
-            section_vaddr[s["name"]] = text_vaddr + len(blobs[".text"])
-        else:
+        if s["flags"] & 0x2 and not s["name"].startswith(".text"):
             section_vaddr[s["name"]] = rodata_vaddr + len(rodata_blobs)
             rodata_blobs += blobs[s["name"]]
             rodata_blobs += b"\0" * ((-len(rodata_blobs)) % 8)
 
-    text = blobs[".text"]
     apply_relocs(secs, blobs, section_vaddr, syms, {})
-    rodata_blobs = bytearray()
+    # The relocations patched the section bytes, so both output blobs are rebuilt from them, in the
+    # order and with the padding the addresses were given.
+    text, rodata_blobs = bytearray(), bytearray()
+    for name in code_names:
+        text += blobs[name]
     for s in secs:
-        if s["name"] in section_vaddr and s["name"] != ".text":
+        if s["flags"] & 0x2 and not s["name"].startswith(".text"):
             rodata_blobs += blobs[s["name"]]
             rodata_blobs += b"\0" * ((-len(rodata_blobs)) % 8)
 
