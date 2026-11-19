@@ -121,6 +121,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/files.c -o tests/guest/files.o
 python3 tools/minilink.py tests/guest/files.o tests/guest/files.elf _start
 
+echo "== guest: randomness (/dev/random, /dev/urandom, getrandom, AT_RANDOM) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
+    -c tests/guest/randomness.c -o tests/guest/randomness.o
+python3 tools/minilink.py tests/guest/randomness.o tests/guest/randomness.elf _start
+
 # The dynamically linked path: a PIE program and a stand-in for ld.so. No native oracle can run
 # these, so tests/dyn.sh asserts the loader's view of the initial stack instead.
 echo "== guest: ld-fake interpreter (ET_DYN) =="

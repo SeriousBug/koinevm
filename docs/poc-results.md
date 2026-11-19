@@ -74,7 +74,8 @@ differ only in case and checks they stay two files), the pages a guest may not t
 process reaching a spinning guest (`tests/poll.sh`), a guest patching its own code (`tests/smc.sh`),
 the console an interactive shell reads (`tests/console.sh`), a pseudo-terminal a program makes for a
 child of its own (`tests/pty.sh`), a counted wakeup one process writes and another reads
-(`tests/eventfd.sh`), an editor on top of the whole stack (`tests/nvim.sh`), and the socket,
+(`tests/eventfd.sh`), the bytes `/dev/random`, `/dev/urandom` and `getrandom` hand out
+(`tests/random.sh`), an editor on top of the whole stack (`tests/nvim.sh`), and the socket,
 epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all
 113; `tests/nvim.sh` skips when the image has no `neovim` in it.
 
