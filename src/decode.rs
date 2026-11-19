@@ -114,7 +114,10 @@ pub enum Insn {
     /// Three-register, same-width integer or FP operation: `add v.4s`, `cmeq`, `umaxp`, ...
     VecThreeSame { q: bool, u: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
     /// Two-register, same-width operation: `not`, `abs`, `cmeq ... #0`, `rev64`, `cnt`, ...
-    VecTwoMisc { q: bool, u: bool, size: u32, op: u32, rn: u32, rd: u32 },
+    /// `marker` is bits 20:17, which are zero for every form of this group and set for the half
+    /// precision one that shares its opcodes: `fcvtns v0.8h` and `fcvtns v0.4s` differ there and
+    /// nowhere else the decoder keeps.
+    VecTwoMisc { q: bool, u: bool, size: u32, op: u32, rn: u32, rd: u32, marker: u32 },
     /// One result across the lanes: `addv`, `smaxv`, `uminv`, `addp` to a scalar.
     VecAcross { q: bool, u: bool, size: u32, op: u32, rn: u32, rd: u32 },
     /// Narrowing and widening between element widths: `xtn`, `addhn`, `saddl`, ...
@@ -908,7 +911,15 @@ fn decode_simd_dp(w: u32) -> Insn {
         if (w >> 11) & 1 == 1 {
             return match (w >> 17) & 0x1f {
                 0b11000 => Insn::VecAcross { q, u, size, op: (w >> 12) & 0x1f, rn, rd },
-                _ => Insn::VecTwoMisc { q, u, size, op: (w >> 12) & 0x1f, rn, rd },
+                _ => Insn::VecTwoMisc {
+                    q,
+                    u,
+                    size,
+                    op: (w >> 12) & 0x1f,
+                    rn,
+                    rd,
+                    marker: (w >> 17) & 0xf,
+                },
             };
         }
         return Insn::VecThreeDiff { q, u, size, op, rn, rm, rd };

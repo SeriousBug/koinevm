@@ -354,7 +354,41 @@ static void setup(void) {
     X(fsqrt_2d, "fsqrt 2d", "fsqrt v2.2d, v0.2d")                                               \
     X(shll_8h, "shll 8h", "shll v2.8h, v0.8b, #8")                                              \
     X(shll_4s, "shll 4s", "shll v2.4s, v0.4h, #16")                                             \
-    X(shll2_2d, "shll2 2d", "shll2 v2.2d, v0.4s, #32")
+    X(shll2_2d, "shll2 2d", "shll2 v2.2d, v0.4s, #32")                                          \
+    /* A float compared with zero, and the vector conversions to integers: the roundings ARM     \
+     * gives them all, at both widths, with the patterns above feeding in NaN, the infinities and \
+     * denormals as well as numbers. */                                                          \
+    X(fcmeqz_4s, "fcmeq 4s #0.0", "fcmeq v2.4s, v0.4s, #0.0")                                   \
+    X(fcmeqz_2s, "fcmeq 2s #0.0", "fcmeq v2.2s, v0.2s, #0.0")                                   \
+    X(fcmeqz_2d, "fcmeq 2d #0.0", "fcmeq v2.2d, v0.2d, #0.0")                                   \
+    X(fcmgtz_4s, "fcmgt 4s #0.0", "fcmgt v2.4s, v0.4s, #0.0")                                   \
+    X(fcmgez_2d, "fcmge 2d #0.0", "fcmge v2.2d, v0.2d, #0.0")                                   \
+    X(fcmlez_2d, "fcmle 2d #0.0", "fcmle v2.2d, v0.2d, #0.0")                                   \
+    X(fcmltz_4s, "fcmlt 4s #0.0", "fcmlt v2.4s, v0.4s, #0.0")                                   \
+    X(fcvtzs_4s, "fcvtzs 4s", "fcvtzs v2.4s, v0.4s")                                            \
+    X(fcvtzs_2s, "fcvtzs 2s", "fcvtzs v2.2s, v0.2s")                                            \
+    X(fcvtzs_2d, "fcvtzs 2d", "fcvtzs v2.2d, v0.2d")                                            \
+    X(fcvtzu_4s, "fcvtzu 4s", "fcvtzu v2.4s, v0.4s")                                            \
+    X(fcvtzu_2d, "fcvtzu 2d", "fcvtzu v2.2d, v0.2d")                                            \
+    X(fcvtns_4s, "fcvtns 4s", "fcvtns v2.4s, v0.4s")                                            \
+    X(fcvtns_2d, "fcvtns 2d", "fcvtns v2.2d, v0.2d")                                            \
+    X(fcvtnu_4s, "fcvtnu 4s", "fcvtnu v2.4s, v0.4s")                                            \
+    X(fcvtms_4s, "fcvtms 4s", "fcvtms v2.4s, v0.4s")                                            \
+    X(fcvtms_2d, "fcvtms 2d", "fcvtms v2.2d, v0.2d")                                            \
+    X(fcvtmu_4s, "fcvtmu 4s", "fcvtmu v2.4s, v0.4s")                                            \
+    X(fcvtps_4s, "fcvtps 4s", "fcvtps v2.4s, v0.4s")                                            \
+    X(fcvtps_2d, "fcvtps 2d", "fcvtps v2.2d, v0.2d")                                            \
+    X(fcvtpu_4s, "fcvtpu 4s", "fcvtpu v2.4s, v0.4s")                                            \
+    /* The integer comparisons against zero, including the pair of U forms nothing had. */       \
+    X(cmeqz_16b, "cmeq 16b #0", "cmeq v2.16b, v0.16b, #0")                                      \
+    X(cmgtz_16b, "cmgt 16b #0", "cmgt v2.16b, v0.16b, #0")                                      \
+    X(cmgez_16b, "cmge 16b #0", "cmge v2.16b, v0.16b, #0")                                      \
+    X(cmlez_16b, "cmle 16b #0", "cmle v2.16b, v0.16b, #0")                                      \
+    X(cmltz_16b, "cmlt 16b #0", "cmlt v2.16b, v0.16b, #0")                                      \
+    X(cmgez_2d, "cmge 2d #0", "cmge v2.2d, v0.2d, #0")                                          \
+    X(cmlez_2d, "cmle 2d #0", "cmle v2.2d, v0.2d, #0")                                          \
+    X(cmltz_2d, "cmlt 2d #0", "cmlt v2.2d, v0.2d, #0")                                          \
+    X(cmlez_8h, "cmle 8h #0", "cmle v2.8h, v0.8h, #0")
 
 #define X_CASES(X)                                                                              \
     X(umov_b3, "umov %w0, b[3]", "umov %w0, v0.b[3]")                                           \
@@ -425,6 +459,18 @@ static void setup(void) {
     X(cmeqz_8b, "cmeq 8b #0", "cmeq v2.8b, v0.8b, #0")                                          \
     X(cmeq_4s, "cmeq 4s", "cmeq v2.4s, v0.4s, v1.4s")                                           \
     X(cmeq_2d, "cmeq 2d", "cmeq v2.2d, v0.2d, v1.2d")                                           \
+    /* The FP comparisons of the same group, which answer a mask of lanes rather than a value. */ \
+    X(fcmeq_4s, "fcmeq 4s", "fcmeq v2.4s, v0.4s, v1.4s")                                        \
+    X(fcmeq_2s, "fcmeq 2s", "fcmeq v2.2s, v0.2s, v1.2s")                                        \
+    X(fcmeq_2d, "fcmeq 2d", "fcmeq v2.2d, v0.2d, v1.2d")                                        \
+    X(fcmge_4s, "fcmge 4s", "fcmge v2.4s, v0.4s, v1.4s")                                        \
+    X(fcmge_2d, "fcmge 2d", "fcmge v2.2d, v0.2d, v1.2d")                                        \
+    X(fcmgt_4s, "fcmgt 4s", "fcmgt v2.4s, v0.4s, v1.4s")                                        \
+    X(fcmgt_2d, "fcmgt 2d", "fcmgt v2.2d, v0.2d, v1.2d")                                        \
+    X(facge_4s, "facge 4s", "facge v2.4s, v0.4s, v1.4s")                                        \
+    X(facge_2d, "facge 2d", "facge v2.2d, v0.2d, v1.2d")                                        \
+    X(facgt_4s, "facgt 4s", "facgt v2.4s, v0.4s, v1.4s")                                        \
+    X(facgt_2d, "facgt 2d", "facgt v2.2d, v0.2d, v1.2d")                                        \
     X(cmhs_16b, "cmhs 16b", "cmhs v2.16b, v0.16b, v1.16b")                                      \
     X(cmhs_4s, "cmhs 4s", "cmhs v2.4s, v0.4s, v1.4s")                                           \
     X(cmhs_2d, "cmhs 2d", "cmhs v2.2d, v0.2d, v1.2d")                                           \

@@ -3022,6 +3022,106 @@ impl<'a> RegionEmitter<'a> {
         self.f.end();
     }
 
+    /// One vector FP comparison. FZ flushes denormal operands, and the answer is a mask of lanes
+    /// rather than a number: nothing flushes it, and DN has no NaN in it to replace.
+    fn vec_cmp_fp(&mut self, rn: u32, rm: u32, rd: u32, double: bool, op: u32, absolute: bool) {
+        let abs = if double { simd::F64X2_ABS } else { simd::F32X4_ABS };
+        self.fpcr_flag(FPCR_FZ);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.vec_arg(rn, double);
+        if absolute {
+            self.f.simd(abs);
+        }
+        self.vec_arg(rm, double);
+        if absolute {
+            self.f.simd(abs);
+        }
+        self.f.simd(op);
+        self.setv(rd);
+        self.f.op(ELSE);
+        self.getv(rn);
+        if absolute {
+            self.f.simd(abs);
+        }
+        self.getv(rm);
+        if absolute {
+            self.f.simd(abs);
+        }
+        self.f.simd(op);
+        self.setv(rd);
+        self.f.end();
+    }
+
+    /// The same against zero, which `fcmeq #0.0` and its siblings compare with: FZ is what makes a
+    /// denormal operand equal to it, and both zeros are one value to a comparison.
+    fn vec_cmp_fp_zero(&mut self, rn: u32, rd: u32, double: bool, op: u32) {
+        self.fpcr_flag(FPCR_FZ);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.vec_arg(rn, double);
+        self.f.v128c([0; 16]);
+        self.f.simd(op);
+        self.setv(rd);
+        self.f.op(ELSE);
+        self.getv(rn);
+        self.f.v128c([0; 16]);
+        self.f.simd(op);
+        self.setv(rd);
+        self.f.end();
+    }
+
+    /// Float to integer, lane by lane. `round` is the step the opcode names, and what follows it is
+    /// the rule ARM gives the conversion: out of range saturates, a NaN becomes zero.
+    fn vec_fp_to_int(
+        &mut self,
+        rn: u32,
+        rd: u32,
+        double: bool,
+        round: Option<u32>,
+        unsigned: bool,
+    ) {
+        self.fpcr_flag(FPCR_FZ);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.vec_arg(rn, double);
+        self.fp_to_int_into(rd, double, round, unsigned);
+        self.f.op(ELSE);
+        self.getv(rn);
+        self.fp_to_int_into(rd, double, round, unsigned);
+        self.f.end();
+    }
+
+    /// The conversion itself, from the vector on the stack.
+    fn fp_to_int_into(&mut self, rd: u32, double: bool, round: Option<u32>, unsigned: bool) {
+        if let Some(r) = round {
+            self.f.simd(r);
+        }
+        if double {
+            // The one wasm instruction that truncates two lanes from f64 makes 32-bit integers of
+            // them, so a 64-bit lane goes through the scalar instruction, one at a time.
+            self.f.ls(L_V1);
+            self.f.v128c([0; 16]);
+            for lane in 0..2 {
+                self.f.lg(L_V1);
+                self.f.simd_lane(simd::F64X2_EXTRACT_LANE, lane);
+                self.f.sat(if unsigned {
+                    sat::I64_TRUNC_SAT_F64_U
+                } else {
+                    sat::I64_TRUNC_SAT_F64_S
+                });
+                self.f.simd_lane(simd::I64X2_REPLACE_LANE, lane);
+            }
+        } else {
+            self.f.simd(if unsigned {
+                simd::I32X4_TRUNC_SAT_F32X4_U
+            } else {
+                simd::I32X4_TRUNC_SAT_F32X4_S
+            });
+        }
+        self.setv(rd);
+    }
+
     /// A vector operand of an FP operation, whose denormal lanes FZ flushes.
     fn vec_arg(&mut self, r: u32, double: bool) {
         self.getv(r);
@@ -5432,6 +5532,25 @@ impl<'a> RegionEmitter<'a> {
                         self.f.lg(L_V2);
                         self.setv(rd);
                     }
+                    // The FP comparisons of this group. Bit 0 of `size` is the lane type and bit 1
+                    // chooses within the pairs, so the opcode and that bit name the comparison: the
+                    // U bit takes fcmeq to fcmge and fcmge to fcmgt. `facge` and `facgt` are the
+                    // same two comparisons of the absolute values, one opcode up.
+                    (false, _, 0b11100) => {
+                        let double = size & 1 == 1;
+                        let eq = if double { simd::F64X2_EQ } else { simd::F32X4_EQ };
+                        self.vec_cmp_fp(rn, rm, rd, double, eq, false);
+                    }
+                    (true, _, 0b11100) | (true, _, 0b11101) => {
+                        let double = size & 1 == 1;
+                        let cmp = match (size & 2 == 0, double) {
+                            (true, false) => simd::F32X4_GE,
+                            (true, true) => simd::F64X2_GE,
+                            (false, false) => simd::F32X4_GT,
+                            (false, true) => simd::F64X2_GT,
+                        };
+                        self.vec_cmp_fp(rn, rm, rd, double, cmp, op == 0b11101);
+                    }
                     // The FP group. Bit 22 is the lane type and bit 23 the low bit of the opcode
                     // where the operation has a pair, so the size field carries both: an odd size
                     // is double, and the pairs (add/sub, mla/mls) take the second when it is set.
@@ -5485,7 +5604,12 @@ impl<'a> RegionEmitter<'a> {
                     _ => return self.refuse(format!("unsupported vector operation {op:05b} u={u} size={size} at 0x{addr:x}")),
                 }
             }
-            Insn::VecTwoMisc { q, u, size, op, rn, rd } => {
+            Insn::VecTwoMisc { q, u, size, op, rn, rd, marker } => {
+                // The half precision group reuses these opcodes with bits 20:17 set. Nothing here
+                // advertises fp16, so its forms are refused rather than read as the wide ones.
+                if marker != 0 {
+                    return self.refuse(format!("half precision floating point at 0x{addr:x}"));
+                }
                 match (u, size, op) {
                     (false, 1, 0b10110) => {
                         // fcvtn / fcvtn2: two doubles narrowed to two singles, in the low half or
@@ -5553,16 +5677,29 @@ impl<'a> RegionEmitter<'a> {
                             self.vec2(rn, rd, o);
                         }
                     }
-                    (false, _, 0b01001) => {
-                        if let Some(o) = self.lanes_op(size, [simd::I8X16_EQ, simd::I16X8_EQ, simd::I32X4_EQ, simd::I64X2_EQ]) {
+                    // The integer comparisons against zero: the U bit takes cmgt to cmge and cmeq to
+                    // cmle, and cmlt has no U form. A lane compares signed with a zero of its own
+                    // width, so cmlt is the strict one - a lane that is zero is not less than it.
+                    (u, _, 0b01000) => {
+                        let ops = if u {
+                            [simd::I8X16_GE_S, simd::I16X8_GE_S, simd::I32X4_GE_S, simd::I64X2_GE_S]
+                        } else {
+                            [simd::I8X16_GT_S, simd::I16X8_GT_S, simd::I32X4_GT_S, simd::I64X2_GT_S]
+                        };
+                        if let Some(o) = self.lanes_op(size, ops) {
                             self.getv(rn);
                             self.f.v128c([0; 16]);
                             self.f.simd(o);
                             self.setv(rd);
                         }
                     }
-                    (false, _, 0b01000) => {
-                        if let Some(o) = self.lanes_op(size, [simd::I8X16_GT_S, simd::I16X8_GT_S, simd::I32X4_GT_S, simd::I64X2_GT_S]) {
+                    (u, _, 0b01001) => {
+                        let ops = if u {
+                            [simd::I8X16_LE_S, simd::I16X8_LE_S, simd::I32X4_LE_S, simd::I64X2_LE_S]
+                        } else {
+                            [simd::I8X16_EQ, simd::I16X8_EQ, simd::I32X4_EQ, simd::I64X2_EQ]
+                        };
+                        if let Some(o) = self.lanes_op(size, ops) {
                             self.getv(rn);
                             self.f.v128c([0; 16]);
                             self.f.simd(o);
@@ -5570,7 +5707,7 @@ impl<'a> RegionEmitter<'a> {
                         }
                     }
                     (false, _, 0b01010) => {
-                        if let Some(o) = self.lanes_op(size, [simd::I8X16_LE_S, simd::I16X8_LE_S, simd::I32X4_LE_S, simd::I32X4_LE_S]) {
+                        if let Some(o) = self.lanes_op(size, [simd::I8X16_LT_S, simd::I16X8_LT_S, simd::I32X4_LT_S, simd::I64X2_LT_S]) {
                             self.getv(rn);
                             self.f.v128c([0; 16]);
                             self.f.simd(o);
@@ -5734,6 +5871,45 @@ impl<'a> RegionEmitter<'a> {
                         self.f.i32c(8 << size);
                         self.f.simd(shl);
                         self.setv(rd);
+                    }
+                    // A float compared against zero, lane by lane: `size` is 2 or 3 here, with bit 0
+                    // the lane type, and the opcode and the U bit name the comparison.
+                    (_, 2 | 3, 0b01100) | (_, 2 | 3, 0b01101) | (false, 2 | 3, 0b01110) => {
+                        let double = size & 1 == 1;
+                        let cmp = match (op, u, double) {
+                            (0b01100, false, false) => simd::F32X4_GT,
+                            (0b01100, false, true) => simd::F64X2_GT,
+                            (0b01100, true, false) => simd::F32X4_GE,
+                            (0b01100, true, true) => simd::F64X2_GE,
+                            (0b01101, false, false) => simd::F32X4_EQ,
+                            (0b01101, false, true) => simd::F64X2_EQ,
+                            (0b01101, true, false) => simd::F32X4_LE,
+                            (0b01101, true, true) => simd::F64X2_LE,
+                            (_, false, false) => simd::F32X4_LT,
+                            (_, false, true) => simd::F64X2_LT,
+                            _ => unreachable!(),
+                        };
+                        self.vec_cmp_fp_zero(rn, rd, double, cmp);
+                    }
+                    // Float to integer, lane by lane. The opcode and bit 1 of `size` name the
+                    // rounding, bit 0 the lane type, and the U bit the range it saturates into.
+                    (u, _, 0b11010) | (u, _, 0b11011) => {
+                        let double = size & 1 == 1;
+                        let round = match (op, size & 2 == 0, double) {
+                            (0b11010, true, false) => Some(simd::F32X4_NEAREST),
+                            (0b11010, true, true) => Some(simd::F64X2_NEAREST),
+                            (0b11010, false, false) => Some(simd::F32X4_CEIL),
+                            (0b11010, false, true) => Some(simd::F64X2_CEIL),
+                            (0b11011, false, _) => None,
+                            (_, _, false) => Some(simd::F32X4_FLOOR),
+                            (_, _, true) => Some(simd::F64X2_FLOOR),
+                        };
+                        self.vec_fp_to_int(rn, rd, double, round, u);
+                    }
+                    (false, 0..=1, 0b11100) => {
+                        // fcvtas: the nearest integer, ties away from zero, which wasm has no
+                        // rounding of.
+                        return self.refuse(format!("rounding away from zero at 0x{addr:x}"));
                     }
                     _ => return self.refuse(format!("unsupported two-register vector op {op:05b} u={u} size={size} at 0x{addr:x}")),
                 }
