@@ -1,0 +1,7 @@
+ok   the function as compiled
+ok   the page is made writable
+ok   the patched function is what runs
+ok   and keeps running
+ok   and the page goes back to read only
+ok   the patched code is still what runs
+smc: all checks passed

@@ -70,8 +70,9 @@ export class Translator {
     );
   }
 
-  page(image, base, at) {
-    return this.ask(`page ${image} ${base.toString(16)} ${at.toString(16)}`);
+  page(image, base, at, bytes = null) {
+    const tail = bytes ? ` ${bytes}` : "";
+    return this.ask(`page ${image} ${base.toString(16)} ${at.toString(16)}${tail}`);
   }
 
   /// A whole image, which is what `execve` needs: the program, its loader, and the stack built for
@@ -108,6 +109,9 @@ export class Mach {
     this.table = instance.exports.tbl;
     this.lineage = new Lineage(this.table.length);
     this.pageInstances = new Map();
+    /// Pages the guest has written to since they were translated: the file no longer says what
+    /// they hold, so the next translation of one is taken from memory instead.
+    this.patched = new Set();
     this.view = new DataView(memory.buffer);
   }
 
@@ -164,6 +168,41 @@ export class Mach {
     }
   }
 
+  /// Drop the translation of a block, so the next jump to it goes through the translator again.
+  clearDispatch(pc) {
+    const { addr, tag, want } = this.probe(pc);
+    if (tag !== want) return;
+    this.view.setUint32(addr, 0, true);
+    this.view.setUint32(addr + 4, 0, true);
+  }
+
+  /// Forget every page whose code lies in `[lo, hi)`: the guest changed what is there, so the
+  /// module that was translated from it is a translation of bytes that no longer exist. The slots
+  /// stay in use - a fork's parent may still be running them - and the next translation of the page
+  /// takes a range of its own.
+  forgetRange(lo, hi) {
+    // Every entry the page could have claimed, since the table is keyed by pc and a block can start
+    // anywhere in it: the probe is what says whether that pc was a block start at all.
+    for (let page = lo & ~0xfff; page < hi; page += 0x1000) {
+      this.patched.add(page);
+      for (let pc = page; pc < page + 0x1000; pc += 4) this.clearDispatch(pc);
+    }
+    for (const key of [...this.lineage.slotOf.keys()]) {
+      const at = key.lastIndexOf(":");
+      const pc = Number(key.slice(at + 1));
+      if (!(pc >= lo && pc < hi)) continue;
+      const page = this.pageInstances.get(key);
+      if (page) {
+        for (const region of page.source.regions) {
+          for (const block of region.blocks) this.clearDispatch(block);
+        }
+        this.pageInstances.delete(key);
+      }
+      this.lineage.slotOf.delete(key);
+      pageModules.delete(key);
+    }
+  }
+
   hasDispatch(pc) {
     const { tag, want } = this.probe(pc);
     return tag === want;
@@ -181,9 +220,16 @@ export class Mach {
 
     const key = `${image.host}:${image.base}:${pc}`;
     T.push(performance.now());
-    let page = pageModules.get(key);
+    // A page the guest wrote to is translated from what it holds now: the file says what the loader
+    // put there, and a guest that patches its own code has moved past that.
+    const from = pc & ~0xfff;
+    const patched = this.patched.has(from);
+    let page = patched ? null : pageModules.get(key);
     if (!page) {
-      const answer = await this.translator.page(image.host, image.base, pc);
+      const bytes = patched
+        ? Buffer.from(new Uint8Array(this.memory.buffer, from, 0x1000)).toString("hex")
+        : null;
+      const answer = await this.translator.page(image.host, image.base, pc, bytes);
       if (!answer.ok) throw new Error(`translating 0x${pc.toString(16)}: ${answer.error}`);
       let module;
       try {
@@ -193,7 +239,7 @@ export class Mach {
         throw new Error(`the page at ${where} does not validate: ${e.message}`);
       }
       page = { module, regions: answer.regions, unsupported: answer.unsupported };
-      pageModules.set(key, page);
+      if (!patched) pageModules.set(key, page);
       if (process.env.ARMJIT_TRACE_PAGES) {
         const where = `${image.host.split("/").pop()}+0x${(pc - image.base).toString(16)}`;
         console.error(

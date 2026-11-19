@@ -66,12 +66,13 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Twenty-two more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+checks on and off. Twenty-four more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
 memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`, which makes two names that
 differ only in case and checks they stay two files), the pages a guest may not touch
 (`tests/faults.sh`), the handler a caught signal runs (`tests/sighandler.sh`), a signal and another
-process reaching a spinning guest (`tests/poll.sh`), and the socket, epoll, signal and resolver
-paths, each in both address-check modes. `bash tests/run.sh` runs all 103.
+process reaching a spinning guest (`tests/poll.sh`), a guest patching its own code (`tests/smc.sh`),
+and the socket, epoll, signal and resolver paths, each in both address-check modes. `bash
+tests/run.sh` runs all 105.
 
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
@@ -159,8 +160,11 @@ Two things follow.
   a load from an unmapped one and a call into a page without execute all end the process with
   `SIGSEGV`, which `tests/faults.sh` compares against a real kernel. What is still missing is the
   handler: a synchronous fault cannot be caught yet, so a program with a `SIGSEGV` handler dies.
-- **Self-modifying code and guest JITs.** Nothing invalidates a translation. Adding a page module is
-  already dynamic, so invalidation has somewhere to live, but it is not implemented.
+- **Self-modifying code.** A `mprotect` that makes a page holding translated code writable drops that
+  page's translations, and the next run of it is translated from the bytes the guest holds rather
+  than from the file, which `tests/smc.sh` checks by patching a function and calling it. A guest JIT
+  is still out of reach: code on a page that is in no image has nothing to translate *from*, so
+  `mmap` + write + execute is refused rather than run.
 - **Signals.** A handler of the guest's own runs, with the frame, the mask and the restorer a kernel
   gives it, when a syscall is where the signal can be taken; a signal that arrives while the guest is
   in the middle of a computation waits for the next syscall. A fault is still fatal, so a `SIGSEGV`

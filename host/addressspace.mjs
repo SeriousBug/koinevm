@@ -42,6 +42,9 @@ export class AddressSpace {
     // Which file each mapping came from. A jump into one of these is a page this machine has not
     // translated yet, and the file is what it has to translate it from.
     this.images = [];
+    /// Called with a range whose bytes or permissions changed, so a translation made from what was
+    /// there before is dropped. The host sets it; nothing here knows what a translation is.
+    this.forget = () => {};
   }
 
   bytes(addr, len) {
@@ -145,6 +148,7 @@ export class AddressSpace {
     if (addr % PAGE !== 0) return -EINVAL;
     len = roundUp(len, PAGE);
     this.forgetImages(addr, addr + len);
+    this.forget(addr, addr + len);
     this.clearPtes(addr, addr + len);
     this.free.push({ lo: addr, hi: addr + len });
     this.free.sort((a, b) => a.lo - b.lo);
@@ -197,10 +201,16 @@ export class AddressSpace {
     for (let p = addr >> 12; p < (addr + len) >> 12; p++) {
       if (!(this.ptes[p] & PTE.MAPPED)) return -ENOMEM;
     }
-    // Translations are not dropped: they are AOT and read-only, so a protection change cannot
-    // invalidate one yet. Self-modifying code is what will need that, and it is not supported.
+    // A page that was executable and is asked to be writable is a guest that means to change its
+    // own code, which is the one thing a translation cannot survive: drop it and translate again
+    // when the page is next run.
+    let writable = false;
     for (let p = addr >> 12; p < (addr + len) >> 12; p++) {
-      this.ptes[p] = (this.ptes[p] & PTE.TRANSLATED) | this.protBits(prot);
+      if (this.ptes[p] & PTE.TRANSLATED) writable = true;
+    }
+    if (writable && prot & PROT.WRITE) this.forget(addr, addr + len);
+    for (let p = addr >> 12; p < (addr + len) >> 12; p++) {
+      this.ptes[p] = this.protBits(prot);
     }
     return 0;
   }

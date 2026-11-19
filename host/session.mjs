@@ -143,6 +143,8 @@ export class Session {
       futexWake: (addr, n) => this.futexWake(proc, addr, n),
     });
     for (const image of proc.meta.images ?? []) proc.kernel.space.images.push(image);
+    // A page the guest changes is a page this process has to translate again.
+    proc.kernel.space.forget = (lo, hi) => proc.mach?.forgetRange(lo, hi);
     proc.mach = new Mach({
       instance,
       memory: proc.memory,

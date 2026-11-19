@@ -94,6 +94,29 @@ fn load_image(path: &str, base: Option<u64>) -> Result<elf::Elf, String> {
     elf.relocated(base).map_err(|e| format!("{path}: {e}"))
 }
 
+/// Put the bytes a guest holds for one page into the image the translation reads from. The file
+/// offset is the segment's, and the page is the one `at` falls on.
+fn patch_page(image: &mut elf::Elf, at: u64, hex: &str) -> Result<(), String> {
+    let page = at & !0xfff;
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| "bad page bytes".to_string())?;
+    for s in &image.segments {
+        if page < s.vaddr || page >= s.end() {
+            continue;
+        }
+        let off = s.file_offset + (page - s.vaddr);
+        let len = bytes.len().min(image.image.len().saturating_sub(off as usize));
+        if off as usize + len > image.image.len() || len == 0 {
+            return Err(format!("page 0x{page:x} is not in the file"));
+        }
+        image.image[off as usize..off as usize + len].copy_from_slice(&bytes[..len]);
+        return Ok(());
+    }
+    Err(format!("page 0x{page:x} is in no segment"))
+}
+
 /// Hex, because the module travels over the same pipe as the request that asked for it.
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -362,13 +385,31 @@ fn run(args: &[String]) -> Result<(), String> {
                                 .map_err(|_| "bad base")?;
                             let at = u64::from_str_radix(req.get(3).ok_or("page needs an address")?, 16)
                                 .map_err(|_| "bad address")?;
-                            if !cache.contains_key(&(path.clone(), base)) {
-                                let image = load_image(&path, Some(base))?;
-                                let site = emit::sites(&[&image]);
-                                cache.insert((path.clone(), base), (image, site));
+                            // A page the guest has written to is translated from the bytes it
+                            // holds now: the file says what the loader put there, and the guest has
+                            // moved past that. Those bytes are not cached, because the next write
+                            // to the page makes them wrong again.
+                            let mut fresh: Option<elf::Elf> = None;
+                            if let Some(hex) = req.get(4) {
+                                let mut image = load_image(&path, Some(base))?;
+                                patch_page(&mut image, at, hex)?;
+                                fresh = Some(image);
                             }
-                            let (image, site) = &cache[&(path.clone(), base)];
-                            let res = emit::translate_page(image, site, at, &cfg)?;
+                            let res = match &fresh {
+                                Some(image) => {
+                                    let site = emit::sites(&[image]);
+                                    emit::translate_page(image, &site, at, &cfg)?
+                                }
+                                None => {
+                                    if !cache.contains_key(&(path.clone(), base)) {
+                                        let image = load_image(&path, Some(base))?;
+                                        let site = emit::sites(&[&image]);
+                                        cache.insert((path.clone(), base), (image, site));
+                                    }
+                                    let (image, site) = &cache[&(path.clone(), base)];
+                                    emit::translate_page(image, site, at, &cfg)?
+                                }
+                            };
                             let regions: Vec<String> = res
                                 .regions
                                 .iter()
