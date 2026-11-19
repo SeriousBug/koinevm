@@ -241,7 +241,7 @@ export class Session {
         thread.state = "runnable";
         thread.blockedOn = 0;
         thread.waitingFor = null;
-        proc.mach.view.setBigInt64(0, -EINTR, true);
+        proc.mach.view.setBigInt64(0, BigInt(-EINTR), true);
       }
       this.deliver(proc, entry);
     }
