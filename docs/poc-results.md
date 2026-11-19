@@ -141,15 +141,23 @@ Two things follow.
   print what the same binary prints on a real kernel and exit the same way. Pipes, command
   substitution, subshells, background jobs with `wait` and external commands are in that set. A pipe
   is two processes over one descriptor table, which is what `fork` and `execve` are here.
-- **Scalar floating point.** Every shape is translated and compared against the oracle: `fadd`,
-  `fsub`, `fmul`, `fdiv`, `fnmul`, `fmax`/`fmin` and their number forms (with the NaN each of them
-  hands back, bit for bit), `fabs`, `fneg`, `fsqrt`, `fmov` with a register and with the eight-bit
-  immediate, `fcvt` both ways, every `frint*`, `fcmp`/`fcmpe` including the zero form and the
-  unordered result, `fcsel` over all sixteen conditions, `fcvtzs`/`fcvtzu` with a fraction-bit count,
-  and the fused multiply-add group. `tests/guest/fp.c` is 5403 values over the two zeros, the
-  infinities, a quiet and a signalling NaN, a denormal and values that only differ in the last bit.
-  One known inexactness: wasm has no fused multiply-add, so `fmadd` and its siblings round twice and
-  can differ from the instruction in the last bit.
+- **Scalar floating point, and the FPCR.** Every shape is translated and compared against the
+  oracle: `fadd`, `fsub`, `fmul`, `fdiv`, `fnmul`, `fmax`/`fmin` and their number forms (with the
+  NaN each of them hands back, bit for bit), `fabs`, `fneg`, `fsqrt`, `fmov` with a register and
+  with the eight-bit immediate, `fcvt` both ways, every `frint*`, `fcmp`/`fcmpe` including the zero
+  form and the unordered result, `fcsel` over all sixteen conditions, `fcvtzs`/`fcvtzu` with a
+  fraction-bit count, and the fused multiply-add group. `tests/guest/fp.c` is 8880 values over the
+  two zeros, the infinities, a quiet and a signalling NaN, a denormal and values that only differ
+  in the last bit. FPCR is honoured: RMode rounds `scvtf`/`ucvtf` (with and without a fraction-bit
+  count), `fcvt` both ways, `frintx`/`frinti` and `fcvtn`/`fcvtn2`, FZ flushes denormal operands
+  and results of the scalar and vector arithmetic and of the conversions, and DN makes every NaN
+  result the default one. What is not: the exception flags in FPSR, which a guest that reads them
+  sees as zeros; the across-lane vector forms, which keep the denormal they were given;
+  `fcvtxn`'s round-to-odd; the float-to-integer conversions, whose denormal input is not flushed;
+  and the fraction-bit conversions, which round the integer rather than the scaled value, so a
+  result that lands in the denormal range can be a step out. One known inexactness: wasm has no
+  fused multiply-add, so `fmadd` and its siblings round twice and can differ from the instruction in
+  the last bit.
 - **Instruction coverage of a big library.** Threads of libc build (a page of `strlen` variants) that
   are unreachable from the entries the translator finds report `undecoded instruction`, up to 116
   words in one page. They are where the `-mgeneral-regs-only` gap and the crypto/atomics gap would

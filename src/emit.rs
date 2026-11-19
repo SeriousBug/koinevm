@@ -45,9 +45,24 @@ pub const L_V4: u32 = L_V3 + 1;
 /// temporary in the middle of a floating point operation.
 pub const L_F0: u32 = L_V4 + 1;
 pub const L_F1: u32 = L_F0 + 1;
+/// Where an f32 waits while FPCR's settings are applied to it.
+pub const L_S0: u32 = L_F1 + 1;
 /// The poll's budget while a region runs: a local, because a backward branch decrements it and a
 /// mutable global would have to be written through to memory every iteration.
-pub const L_POLL: u32 = L_F1 + 1;
+pub const L_POLL: u32 = L_S0 + 1;
+/// The module's one global for floating point: the low half of the FPCR the guest last wrote. A
+/// region prologue here refreshes it from the shadow, and `msr fpcr` writes both, so every FP
+/// instruction reads a register that follows the guest. Reading the shadow at each operation
+/// instead would be a load per operation where this is a global read, and the shadow still decides
+/// what a region sees first: a callee that writes FPCR returns through the dispatcher, and every
+/// image is its own module, whose regions reload the shadow as they start. The poll's counter is
+/// the module's second global, for the same reason.
+pub const G_FPCR: u32 = 0;
+/// The FPCR fields that change what an FP instruction computes. RMode is the rounding, and both
+/// others are single bits: FZ flushes denormals, DN makes every NaN result the default one.
+const FPCR_RMODE_SHIFT: u32 = 22;
+const FPCR_FZ: u32 = 1 << 24;
+const FPCR_DN: u32 = 1 << 25;
 /// Where the trace writes the vector file, one 16-byte value per register.
 pub const SHADOW_V0: u64 = 0x600;
 
@@ -519,6 +534,7 @@ fn prelude(m: &mut Module, cfg: &Config) -> Prelude {
 
     m.imports.push(Import { module: "env".into(), name: "syscall".into(), ty: ty_syscall });
     m.imports.push(Import { module: "env".into(), name: "trap".into(), ty: ty_trap });
+    m.globals.push((I32, true, 0));
     let ty_poll = m.ty(vec![], vec![I32]);
     let poll = m.n_imports();
     m.imports.push(Import { module: "env".into(), name: "poll".into(), ty: ty_poll });
@@ -1479,6 +1495,24 @@ fn sign_mask(double: bool) -> [u8; 16] {
     m
 }
 
+/// The smallest normal of a width, which is where FZ starts flushing.
+fn min_normal(double: bool) -> u64 {
+    if double {
+        0x0010_0000_0000_0000
+    } else {
+        0x0080_0000
+    }
+}
+
+/// The quiet NaN with no payload that DN puts in place of every NaN result.
+fn default_nan(double: bool) -> u64 {
+    if double {
+        0x7ff8_0000_0000_0000
+    } else {
+        0x7fc0_0000
+    }
+}
+
 /// One float spread across every lane of a register, which is how a constant meets a vector op.
 fn lane_repeat(double: bool, wide: u64, narrow: u32) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -1928,7 +1962,7 @@ impl<'a> RegionEmitter<'a> {
     ) -> Self {
         let mut f = Func::new(ids.ty_region);
         f.locals = vec![
-            I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128, V128, F64, F64, I32,
+            I32, I64, I64, I64, I64, I64, I32, V128, V128, V128, V128, V128, F64, F64, F32, I32,
         ];
         RegionEmitter { f, region, layout, ids, unsupported, open: 0, cur_pc: 0, narrow: false }
     }
@@ -1963,6 +1997,12 @@ impl<'a> RegionEmitter<'a> {
         self.f.call(self.ids.trap);
         self.f.op(UNREACHABLE);
         self.f.end();
+
+        // Every region starts from the shadow's FPCR, not from whatever a region that ran before
+        // it left in the global.
+        self.f.i32c(SHADOW_FPCR as i32);
+        self.f.mem(I32_LOAD, 2, 0);
+        self.f.gs(G_FPCR);
 
         self.f.loop_();
         self.open = 1;
@@ -2665,6 +2705,586 @@ impl<'a> RegionEmitter<'a> {
         self.f.ls(32);
     }
 
+    // ---- the FPCR
+
+    /// RMode, numbered the way the architecture numbers it: 0 nearest, 1 towards +inf, 2 towards
+    /// -inf, 3 towards zero.
+    fn fpcr_rmode(&mut self) {
+        self.f.gg(G_FPCR);
+        self.f.i32c(FPCR_RMODE_SHIFT as i32);
+        self.f.op(I32_SHR_U);
+        self.f.i32c(3);
+        self.f.op(I32_AND);
+    }
+
+    /// Whether the FPCR holds any of `mask`'s bits.
+    fn fpcr_flag(&mut self, mask: u32) {
+        self.f.gg(G_FPCR);
+        self.f.i32c(mask as i32);
+        self.f.op(I32_AND);
+    }
+
+    fn round_op(&mut self, simd: bool, op: u32) {
+        if simd {
+            self.f.simd(op);
+        } else {
+            self.f.op(op as u8);
+        }
+    }
+
+    /// The value on the stack, rounded to an integral one in the mode FPCR names. `ops` are the
+    /// wasm operators for nearest, towards +inf, towards -inf and towards zero, in RMode order.
+    fn fpcr_round(&mut self, ty: u8, tmp: u32, simd: bool, ops: [u32; 4]) {
+        self.f.ls(tmp);
+        for m in 1..4 {
+            self.fpcr_rmode();
+            self.f.i32c(m);
+            self.f.op(I32_EQ);
+            self.f.op(IF);
+            self.f.body.push(ty);
+            self.f.lg(tmp);
+            self.round_op(simd, ops[m as usize]);
+            self.f.op(ELSE);
+        }
+        self.f.lg(tmp);
+        self.round_op(simd, ops[0]);
+        for _ in 1..4 {
+            self.f.end();
+        }
+    }
+
+    /// FZ applied to a scalar: a denormal becomes a zero that keeps its sign, which is what the
+    /// arithmetic then adds, multiplies or divides with.
+    fn fp_flush(&mut self, double: bool) {
+        let ty = if double { F64 } else { F32 };
+        let tmp = if double { L_F0 } else { L_S0 };
+        let min_normal = min_normal(double);
+        self.f.ls(tmp);
+        self.fpcr_flag(FPCR_FZ);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.f.lg(tmp);
+        self.f.op(if double { F64_ABS } else { F32_ABS });
+        self.fp_const(min_normal, double);
+        self.f.op(if double { F64_LT } else { F32_LT });
+        self.f.op(IF);
+        self.f.body.push(ty);
+        self.fp_const(0, double);
+        self.f.lg(tmp);
+        self.f.op(if double { F64_COPYSIGN } else { F32_COPYSIGN });
+        self.f.op(ELSE);
+        self.f.lg(tmp);
+        self.f.end();
+        self.f.ls(tmp);
+        self.f.end();
+        self.f.lg(tmp);
+    }
+
+    /// An operand of an FP operation, which FZ may have flushed to zero.
+    fn fp_arg(&mut self, r: u32, double: bool, flush: bool) {
+        self.fp_get(r, double);
+        if flush {
+            self.fp_flush(double);
+        }
+    }
+
+    /// What FZ and DN do to a result: a denormal is flushed and a NaN becomes the default one,
+    /// which is a quiet NaN with no payload. Both tests sit behind one read of the two bits, so a
+    /// guest that leaves FPCR alone pays a compare and a branch per operation rather than a flush.
+    fn fp_fixup(&mut self, double: bool) {
+        let ty = if double { F64 } else { F32 };
+        let tmp = if double { L_F0 } else { L_S0 };
+        let default_nan = default_nan(double);
+        self.f.ls(tmp);
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.f.lg(tmp);
+        self.fp_flush(double);
+        self.f.ls(tmp);
+        self.fpcr_flag(FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.f.lg(tmp);
+        self.f.lg(tmp);
+        self.f.op(if double { F64_NE } else { F32_NE });
+        self.f.op(IF);
+        self.f.body.push(ty);
+        self.fp_const(default_nan, double);
+        self.f.op(ELSE);
+        self.f.lg(tmp);
+        self.f.end();
+        self.f.ls(tmp);
+        self.f.end();
+        self.f.end();
+        self.f.lg(tmp);
+    }
+
+    /// One binary FP operation, with the flushing path emitted only where FPCR asks for it.
+    fn fp_binary(&mut self, rn: u32, rm: u32, double: bool, op: u32, post: &[u32]) {
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(if double { F64 } else { F32 });
+        self.fp_operands(rn, rm, None, double, op, post, true);
+        self.f.op(ELSE);
+        self.fp_operands(rn, rm, None, double, op, post, false);
+        self.f.end();
+    }
+
+    /// All four fused forms are the accumulator plus the product with a sign each: bit 21 negates
+    /// the product, bit 15 subtracts the sum, so FMSUB is `Va - Vn*Vm` and FNMSUB is `-Va + Vn*Vm`.
+    /// The accumulator goes on the stack first because that is the NaN a result of two carries, as
+    /// the hardware reports it.
+    fn fp_fused(
+        &mut self,
+        rn: u32,
+        rm: u32,
+        ra: u32,
+        double: bool,
+        negate_product: bool,
+        subtract: bool,
+        flush: bool,
+    ) {
+        self.fp_arg(ra, double, flush);
+        if negate_product {
+            self.f.op(if double { F64_NEG } else { F32_NEG });
+        }
+        self.fp_arg(rn, double, flush);
+        self.fp_arg(rm, double, flush);
+        self.f.op(if double { F64_MUL } else { F32_MUL });
+        if negate_product != subtract {
+            self.f.op(if double { F64_NEG } else { F32_NEG });
+        }
+        self.f.op(if double { F64_ADD } else { F32_ADD });
+        if flush {
+            self.fp_fixup(double);
+        }
+    }
+
+    fn fp_operands(
+        &mut self,
+        rn: u32,
+        rm: u32,
+        ra: Option<u32>,
+        double: bool,
+        op: u32,
+        post: &[u32],
+        flush: bool,
+    ) {
+        if let Some(ra) = ra {
+            self.fp_arg(ra, double, flush);
+        }
+        self.fp_arg(rn, double, flush);
+        self.fp_arg(rm, double, flush);
+        self.f.op(op as u8);
+        for &p in post {
+            self.f.op(p as u8);
+        }
+        if flush {
+            self.fp_fixup(double);
+        }
+    }
+
+    /// FZ and DN applied to a vector of `double`-wide lanes or of singles: a denormal lane becomes
+    /// a zero of its own sign and a NaN lane the default NaN.
+    fn vec_fixup(&mut self, double: bool) {
+        self.f.ls(L_V0);
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(V128);
+        self.vec_denormal(double);
+        self.f.ls(L_V0);
+        self.fpcr_flag(FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(V128);
+        self.vec_default_nan(double);
+        self.f.op(ELSE);
+        self.f.lg(L_V0);
+        self.f.end();
+        self.f.op(ELSE);
+        self.f.lg(L_V0);
+        self.f.end();
+    }
+
+    /// The vector in `L_V0` with a denormal lane turned into a zero of the same sign, if FZ asks.
+    fn vec_denormal(&mut self, double: bool) {
+        self.fpcr_flag(FPCR_FZ);
+        self.f.op(IF);
+        self.f.body.push(V128);
+        self.f.lg(L_V0);
+        self.f.v128c(sign_mask(double));
+        self.f.simd(simd::V128_AND);
+        self.f.lg(L_V0);
+        self.f.lg(L_V0);
+        self.f.simd(if double { simd::F64X2_ABS } else { simd::F32X4_ABS });
+        self.fp_const(min_normal(double), double);
+        self.f.simd(if double { simd::F64X2_SPLAT } else { simd::F32X4_SPLAT });
+        self.f.simd(if double { simd::F64X2_LT } else { simd::F32X4_LT });
+        self.f.simd(simd::V128_BITSELECT);
+        self.f.op(ELSE);
+        self.f.lg(L_V0);
+        self.f.end();
+    }
+
+    /// The vector in `L_V0` with a NaN lane replaced by the default NaN, if DN asks.
+    fn vec_default_nan(&mut self, double: bool) {
+        self.fpcr_flag(FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(V128);
+        self.fp_const(default_nan(double), double);
+        self.f.simd(if double { simd::F64X2_SPLAT } else { simd::F32X4_SPLAT });
+        self.f.lg(L_V0);
+        self.f.lg(L_V0);
+        self.f.lg(L_V0);
+        self.f.simd(if double { simd::F64X2_NE } else { simd::F32X4_NE });
+        self.f.simd(simd::V128_BITSELECT);
+        self.f.op(ELSE);
+        self.f.lg(L_V0);
+        self.f.end();
+    }
+
+    /// One vector FP operation, with the flushing path emitted only where FPCR asks for it.
+    fn vec3_fp(&mut self, rn: u32, rm: u32, rd: u32, double: bool, op: u32, post: &[u32]) {
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.vec_arg(rn, double);
+        self.vec_arg(rm, double);
+        self.f.simd(op);
+        for &p in post {
+            self.f.simd(p);
+        }
+        self.vec_fixup(double);
+        self.setv(rd);
+        self.f.op(ELSE);
+        self.getv(rn);
+        self.getv(rm);
+        self.f.simd(op);
+        for &p in post {
+            self.f.simd(p);
+        }
+        self.setv(rd);
+        self.f.end();
+    }
+
+    /// `fmla` and `fmls`: the destination and the product, with FZ and DN when the guest asks.
+    fn vec_mac_fp(&mut self, rn: u32, rm: u32, rd: u32, double: bool, op: u32) {
+        let mul = if double { simd::F64X2_MUL } else { simd::F32X4_MUL };
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.vec_mac(rn, rm, rd, double, mul, op, true);
+        self.setv(rd);
+        self.f.op(ELSE);
+        self.vec_mac(rn, rm, rd, double, mul, op, false);
+        self.setv(rd);
+        self.f.end();
+    }
+
+    fn vec_mac(&mut self, rn: u32, rm: u32, rd: u32, double: bool, mul: u32, op: u32, flush: bool) {
+        self.vec_arg(rd, double);
+        self.vec_arg(rn, double);
+        self.vec_arg(rm, double);
+        self.f.simd(mul);
+        self.f.simd(op);
+        if flush {
+            self.vec_fixup(double);
+        }
+    }
+
+    /// One unary vector FP operation, on the same terms.
+    fn vec2_fp(&mut self, rn: u32, rd: u32, double: bool, op: u32) {
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.vec_arg(rn, double);
+        self.f.simd(op);
+        self.vec_fixup(double);
+        self.setv(rd);
+        self.f.op(ELSE);
+        self.vec2(rn, rd, op);
+        self.f.end();
+    }
+
+    /// A vector operand of an FP operation, whose denormal lanes FZ flushes.
+    fn vec_arg(&mut self, r: u32, double: bool) {
+        self.getv(r);
+        self.f.ls(L_V0);
+        self.vec_denormal(double);
+    }
+
+    /// The vector result in `r`, having let FZ and DN at it.
+    fn vec_fixup_reg(&mut self, r: u32, double: bool) {
+        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.getv(r);
+        self.vec_fixup(double);
+        self.setv(r);
+        self.f.end();
+    }
+
+    /// The result of an FP operation into lane 0 of `r`, having let FZ and DN at it.
+    fn fp_out(&mut self, r: u32, double: bool, flush: bool) {
+        if flush {
+            self.fp_fixup(double);
+        }
+        self.fp_put(r, double);
+    }
+
+    /// The f64 in `L_F0` as an f32, rounded in the mode FPCR names. `F32_DEMOTE_F64` is nearest,
+    /// so the other three modes start there and move one ulp: comparing the demoted value with the
+    /// source says which way the answer lies, and a step is one off the f32 pattern.
+    fn fp_narrow(&mut self) {
+        self.fpcr_rmode();
+        self.f.op(I32_EQZ);
+        self.f.op(IF);
+        self.f.body.push(F32);
+        self.f.lg(L_F0);
+        self.f.op(F32_DEMOTE_F64);
+        self.f.op(ELSE);
+        self.f.lg(L_F0);
+        self.f.op(F32_DEMOTE_F64);
+        self.f.ls(L_S0);
+        // Which way the answer lies from the nearest f32, as a step of -1, 0 or 1 on the pattern.
+        // A step there moves the magnitude either way depending on the sign, so towards +inf is
+        // one up above zero and one down below it, and towards zero is always one down.
+        self.f.i32c(0);
+        self.f.ls(L_TI);
+        self.fpcr_rmode();
+        self.f.i32c(1);
+        self.f.op(I32_EQ);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.narrow_beyond(true);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.narrow_step(1, -1);
+        self.f.end();
+        self.f.end();
+        self.fpcr_rmode();
+        self.f.i32c(2);
+        self.f.op(I32_EQ);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.narrow_beyond(false);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.narrow_step(-1, 1);
+        self.f.end();
+        self.f.end();
+        self.fpcr_rmode();
+        self.f.i32c(3);
+        self.f.op(I32_EQ);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.f.lg(L_S0);
+        self.f.op(F64_PROMOTE_F32);
+        self.f.op(F64_ABS);
+        self.f.lg(L_F0);
+        self.f.op(F64_ABS);
+        self.f.op(F64_GT);
+        self.f.op(IF);
+        self.f.body.push(0x40);
+        self.f.i32c(-1);
+        self.f.ls(L_TI);
+        self.f.end();
+        self.f.end();
+        // A step off zero lands on the smallest denormal, whose pattern is not zero minus one.
+        self.f.lg(L_F0);
+        self.fp_const(0, true);
+        self.f.op(F64_LT);
+        self.f.op(IF);
+        self.f.body.push(I32);
+        self.f.i32c(0x8000_0001u32 as i32);
+        self.f.op(ELSE);
+        self.f.i32c(1);
+        self.f.end();
+        self.f.lg(L_S0);
+        self.f.op(I32_REINTERPRET_F32);
+        self.f.lg(L_TI);
+        self.f.op(I32_ADD);
+        self.f.lg(L_S0);
+        self.f.op(I32_REINTERPRET_F32);
+        self.f.i32c(0x7fff_ffff);
+        self.f.op(I32_AND);
+        self.f.op(I32_EQZ);
+        self.f.lg(L_TI);
+        self.f.i32c(0);
+        self.f.op(I32_NE);
+        self.f.op(I32_AND);
+        self.f.op(SELECT);
+        self.f.op(F32_REINTERPRET_I32);
+        self.f.end();
+    }
+
+    /// The pattern step for a source of this sign: `positive` above zero, `negative` below it.
+    fn narrow_step(&mut self, positive: i32, negative: i32) {
+        self.f.lg(L_F0);
+        self.fp_const(0, true);
+        self.f.op(F64_LT);
+        self.f.op(IF);
+        self.f.body.push(I32);
+        self.f.i32c(negative);
+        self.f.op(ELSE);
+        self.f.i32c(positive);
+        self.f.end();
+        self.f.ls(L_TI);
+    }
+
+    /// Whether the nearest f32 in `L_S0` is above the source in `L_F0` (`up`) or below it.
+    fn narrow_beyond(&mut self, up: bool) {
+        self.f.lg(L_S0);
+        self.f.op(F64_PROMOTE_F32);
+        self.f.lg(L_F0);
+        self.f.op(if up { F64_LT } else { F64_GT });
+    }
+
+    /// The integer on the stack as a float, rounded in the mode FPCR names. `sf` and `signed` are
+    /// the guest's register, `double` the width written, and `fbits` the fixed-point form's count,
+    /// which scales by an exact power of two after the one rounding the instruction asks for.
+    fn fp_from_int(&mut self, sf: bool, signed: bool, double: bool, fbits: u32) {
+        let ty = if double { F64 } else { F32 };
+        let tmp = if double { L_F0 } else { L_S0 };
+        let to_float = match (sf, double, signed) {
+            (true, true, false) => F64_CONVERT_I64_U,
+            (true, true, true) => F64_CONVERT_I64_S,
+            (true, false, false) => F32_CONVERT_I64_U,
+            (true, false, true) => F32_CONVERT_I64_S,
+            (false, true, false) => F64_CONVERT_I32_U,
+            (false, true, true) => F64_CONVERT_I32_S,
+            (false, false, false) => F32_CONVERT_I32_U,
+            (false, false, true) => F32_CONVERT_I32_S,
+        };
+        if sf {
+            self.f.ls(L_T0);
+        } else {
+            self.f.ls(L_TI);
+        }
+        self.fpcr_rmode();
+        self.f.op(I32_EQZ);
+        self.f.op(IF);
+        self.f.body.push(ty);
+        self.f.lg(if sf { L_T0 } else { L_TI });
+        self.f.op(to_float);
+        self.fp_scale(fbits, double);
+        self.f.op(ELSE);
+        if !sf {
+            self.f.lg(L_TI);
+            self.f.op(if signed { I64_EXTEND_I32_S } else { I64_EXTEND_I32_U });
+            self.f.ls(L_T0);
+        }
+        // The exact value is the integer itself, so the rounding happens on the integer: drop the
+        // low bits the significand cannot hold, and add the step those bits are worth when the mode
+        // wants the value that dropping them cannot reach. The magnitude is rounded, and the sign
+        // carried separately, because a two's complement integer has no symmetric range.
+        if signed {
+            self.f.lg(L_T0);
+            self.f.i64c(0);
+            self.f.op(I64_LT_S);
+            self.f.ls(L_TI);
+            self.f.lg(L_TI);
+            self.f.op(IF);
+            self.f.body.push(I64);
+            self.f.i64c(0);
+            self.f.lg(L_T0);
+            self.f.op(I64_SUB);
+            self.f.op(ELSE);
+            self.f.lg(L_T0);
+            self.f.end();
+        } else {
+            self.f.i32c(0);
+            self.f.ls(L_TI);
+            self.f.lg(L_T0);
+        }
+        self.f.ls(L_T1);
+        // The shift is how far the significand falls short of the magnitude's own length, and zero
+        // when the whole number fits.
+        self.f.i64c(64);
+        self.f.lg(L_T1);
+        self.f.op(I64_CLZ);
+        self.f.op(I64_SUB);
+        self.f.i64c(if double { 53 } else { 24 });
+        self.f.op(I64_SUB);
+        self.f.ls(L_T2);
+        self.f.lg(L_T2);
+        self.f.lg(L_T2);
+        self.f.i64c(63);
+        self.f.op(I64_SHR_S);
+        self.f.i64c(-1);
+        self.f.op(I64_XOR);
+        self.f.op(I64_AND);
+        self.f.ls(L_T2);
+        self.f.i64c(1);
+        self.f.lg(L_T2);
+        self.f.op(I64_SHL);
+        self.f.ls(L_T3);
+        self.f.lg(L_T1);
+        self.f.lg(L_T3);
+        self.f.i64c(1);
+        self.f.op(I64_SUB);
+        self.f.op(I64_AND);
+        self.f.ls(L_T4);
+        self.f.lg(L_T1);
+        self.f.lg(L_T4);
+        self.f.op(I64_SUB);
+        self.f.ls(L_T1);
+        // The magnitude steps up when the mode rounds away from zero on that side of it, which is
+        // towards +inf above zero and towards -inf below.
+        self.f.lg(L_T4);
+        self.f.op(I64_EQZ);
+        self.f.op(I32_EQZ);
+        self.fpcr_rmode();
+        self.f.i32c(1);
+        self.f.op(I32_EQ);
+        self.f.lg(L_TI);
+        self.f.op(I32_EQZ);
+        self.f.op(I32_AND);
+        self.fpcr_rmode();
+        self.f.i32c(2);
+        self.f.op(I32_EQ);
+        self.f.lg(L_TI);
+        self.f.op(I32_AND);
+        self.f.op(I32_OR);
+        self.f.op(I32_AND);
+        self.f.op(IF);
+        self.f.body.push(ty);
+        self.f.lg(L_T1);
+        self.f.op(if double { F64_CONVERT_I64_U } else { F32_CONVERT_I64_U });
+        self.f.lg(L_T3);
+        self.f.op(if double { F64_CONVERT_I64_U } else { F32_CONVERT_I64_U });
+        self.f.op(if double { F64_ADD } else { F32_ADD });
+        self.f.op(ELSE);
+        self.f.lg(L_T1);
+        self.f.op(if double { F64_CONVERT_I64_U } else { F32_CONVERT_I64_U });
+        self.f.end();
+        self.f.ls(tmp);
+        self.f.lg(L_TI);
+        self.f.op(IF);
+        self.f.body.push(ty);
+        self.f.lg(tmp);
+        self.f.op(if double { F64_NEG } else { F32_NEG });
+        self.f.op(ELSE);
+        self.f.lg(tmp);
+        self.f.end();
+        self.fp_scale(fbits, double);
+        self.f.end();
+    }
+
+    /// The fixed-point form's exact scaling, which only moves the significand unless the result
+    /// lands in the denormal range.
+    fn fp_scale(&mut self, fbits: u32, double: bool) {
+        if fbits > 0 {
+            if double {
+                self.f.f64c(2f64.powi(-(fbits as i32)).to_bits());
+                self.f.op(F64_MUL);
+            } else {
+                self.f.f32c(2f32.powi(-(fbits as i32)).to_bits());
+                self.f.op(F32_MUL);
+            }
+        }
+    }
+
     fn fp_get(&mut self, r: u32, double: bool) {
         self.getv(r);
         self.f.simd_lane(if double { simd::F64X2_EXTRACT_LANE } else { simd::F32X4_EXTRACT_LANE }, 0);
@@ -2787,8 +3407,8 @@ impl<'a> RegionEmitter<'a> {
         self.f.op(I32_EQZ);
         self.f.op(IF);
         self.f.body.push(scalar);
-        self.fp_get(rn, double);
-        self.fp_get(rm, double);
+        self.fp_arg(rn, double, true);
+        self.fp_arg(rm, double, true);
         self.f.op(op);
         self.f.op(ELSE);
         self.fp_is_snan(rn, double);
@@ -4180,8 +4800,8 @@ impl<'a> RegionEmitter<'a> {
                     }
                     self.f.mem(I64_STORE, 3, 0);
                 }
-                // FPCR and FPSR are stored so a read returns what was written; nothing acts on
-                // them yet, which means FP rounding stays at the default.
+                // FPCR and FPSR are stored so a read returns what was written. Only FPCR has a
+                // reader: it is the guest's rounding mode, denormal flushing and default NaN.
                 SysReg::Fpcr | SysReg::Fpsr => {
                     let at = if reg == SysReg::Fpcr { SHADOW_FPCR } else { SHADOW_FPSR };
                     self.f.i32c(at as i32);
@@ -4191,6 +4811,11 @@ impl<'a> RegionEmitter<'a> {
                         self.f.lg(rn);
                     }
                     self.f.mem(I64_STORE, 3, 0);
+                    if reg == SysReg::Fpcr {
+                        self.f.i32c(at as i32);
+                        self.f.mem(I32_LOAD, 2, 0);
+                        self.f.gs(G_FPCR);
+                    }
                 }
                 _ => {}
             },
@@ -4784,28 +5409,33 @@ impl<'a> RegionEmitter<'a> {
                     // fmax/fmin and their `nm` pair: the larger or the smaller of the two, and the
                     // one that is not a NaN where only one of them is.
                     (false, _, 0b11110) | (false, _, 0b11000) => {
-                        self.vec_minmax(rn, rm, rd, size & 1 == 1, size & 2 == 0, op == 0b11000);
+                        let double = size & 1 == 1;
+                        self.vec_minmax(rn, rm, rd, double, size & 2 == 0, op == 0b11000);
+                        self.vec_fixup_reg(rd, double);
                     }
                     (false, 0 | 1, 0b11010) => {
-                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_ADD } else { simd::F32X4_ADD })
+                        let add = if size & 1 == 1 { simd::F64X2_ADD } else { simd::F32X4_ADD };
+                        self.vec3_fp(rn, rm, rd, size & 1 == 1, add, &[])
                     }
                     (false, 2 | 3, 0b11010) => {
-                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB })
+                        let sub = if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB };
+                        self.vec3_fp(rn, rm, rd, size & 1 == 1, sub, &[])
                     }
                     (true, 2 | 3, 0b11010) => {
                         // fabd: the absolute value of the difference.
-                        self.getv(rn);
-                        self.getv(rm);
-                        self.f.simd(if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB });
-                        self.f.simd(if size & 1 == 1 { simd::F64X2_ABS } else { simd::F32X4_ABS });
-                        self.setv(rd);
+                        let double = size & 1 == 1;
+                        let sub = if double { simd::F64X2_SUB } else { simd::F32X4_SUB };
+                        let abs = if double { simd::F64X2_ABS } else { simd::F32X4_ABS };
+                        self.vec3_fp(rn, rm, rd, double, sub, &[abs]);
                     }
                     (false, 0 | 1, 0b11011) | (true, 0 | 1, 0b11011) => {
                         // fmul and fmulx, which differ only for zero times infinity.
-                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_MUL } else { simd::F32X4_MUL })
+                        let mul = if size & 1 == 1 { simd::F64X2_MUL } else { simd::F32X4_MUL };
+                        self.vec3_fp(rn, rm, rd, size & 1 == 1, mul, &[])
                     }
                     (true, 0 | 1, 0b11111) => {
-                        self.vec3(rn, rm, rd, if size & 1 == 1 { simd::F64X2_DIV } else { simd::F32X4_DIV })
+                        let div = if size & 1 == 1 { simd::F64X2_DIV } else { simd::F32X4_DIV };
+                        self.vec3_fp(rn, rm, rd, size & 1 == 1, div, &[])
                     }
                     (false, 0 | 1, 0b11001) | (false, 2 | 3, 0b11001) => {
                         // fmla and fmls multiply into the destination rather than into a product of
@@ -4821,12 +5451,7 @@ impl<'a> RegionEmitter<'a> {
                         } else {
                             add
                         };
-                        self.getv(rd);
-                        self.getv(rn);
-                        self.getv(rm);
-                        self.f.simd(mul);
-                        self.f.simd(op);
-                        self.setv(rd);
+                        self.vec_mac_fp(rn, rm, rd, size & 1 == 1, op);
                     }
                     _ => return self.refuse(format!("unsupported vector operation {op:05b} u={u} size={size} at 0x{addr:x}")),
                 }
@@ -4836,8 +5461,29 @@ impl<'a> RegionEmitter<'a> {
                     (false, 1, 0b10110) => {
                         // fcvtn / fcvtn2: two doubles narrowed to two singles, in the low half or
                         // above the ones the destination keeps. Half precision is the size 0 form.
+                        // The demote is exactly what the instruction does at the default mode
+                        // with neither bit set; anything else takes the lanes one at a time.
+                        self.fpcr_rmode();
+                        self.f.op(I32_EQZ);
+                        self.fpcr_flag(FPCR_FZ | FPCR_DN);
+                        self.f.op(I32_EQZ);
+                        self.f.op(I32_AND);
+                        self.f.op(IF);
+                        self.f.body.push(V128);
                         self.getv(rn);
                         self.f.simd(simd::F32X4_DEMOTE_F64X2_ZERO);
+                        self.f.op(ELSE);
+                        self.f.v128c([0; 16]);
+                        for lane in 0..2 {
+                            self.getv(rn);
+                            self.f.simd_lane(simd::F64X2_EXTRACT_LANE, lane);
+                            self.fp_flush(true);
+                            self.f.ls(L_F0);
+                            self.fp_narrow();
+                            self.fp_fixup(false);
+                            self.f.simd_lane(simd::F32X4_REPLACE_LANE, lane);
+                        }
+                        self.f.end();
                         if q {
                             self.f.ls(L_V1);
                             self.getv(rd);
@@ -4941,11 +5587,11 @@ impl<'a> RegionEmitter<'a> {
                         self.f.simd(simd::V128_XOR);
                         self.setv(rd);
                     }
-                    (true, 2 | 3, 0b11111) => self.vec2(
-                        rn,
-                        rd,
-                        if size & 1 == 1 { simd::F64X2_SQRT } else { simd::F32X4_SQRT },
-                    ),
+                    (true, 2 | 3, 0b11111) => {
+                        let double = size & 1 == 1;
+                        let sqrt = if double { simd::F64X2_SQRT } else { simd::F32X4_SQRT };
+                        self.vec2_fp(rn, rd, double, sqrt);
+                    }
                     // The rounding family: to integral, in the mode the opcode names. Bit 23 picks
                     // the second of each mode's pair and bit 22 is the lane width, which is why
                     // `frintp` reads as `frintn` one lane width up until both bits are taken.
@@ -4955,15 +5601,37 @@ impl<'a> RegionEmitter<'a> {
                         if u && op == 0b11000 && !upper {
                             // frinta: ties away from zero, which wasm has no form of.
                             self.vec_round_away(rn, rd, double);
+                        } else if u && op == 0b11001 {
+                            // frintx and frinti round to an integral value in the mode FPCR holds.
+                            self.getv(rn);
+                            self.fpcr_round(
+                                V128,
+                                L_V0,
+                                true,
+                                if double {
+                                    [
+                                        simd::F64X2_NEAREST,
+                                        simd::F64X2_CEIL,
+                                        simd::F64X2_FLOOR,
+                                        simd::F64X2_TRUNC,
+                                    ]
+                                } else {
+                                    [
+                                        simd::F32X4_NEAREST,
+                                        simd::F32X4_CEIL,
+                                        simd::F32X4_FLOOR,
+                                        simd::F32X4_TRUNC,
+                                    ]
+                                },
+                            );
+                            self.setv(rd);
+                            self.vec_fixup_reg(rd, double);
                         } else {
                             let (narrow, wide) = match (u, op, upper) {
                                 (false, 0b11000, false) => (simd::F32X4_NEAREST, simd::F64X2_NEAREST),
                                 (false, 0b11000, true) => (simd::F32X4_CEIL, simd::F64X2_CEIL),
                                 (false, 0b11001, false) => (simd::F32X4_FLOOR, simd::F64X2_FLOOR),
                                 (false, 0b11001, true) => (simd::F32X4_TRUNC, simd::F64X2_TRUNC),
-                                // frintx and frinti round in the mode FPCR holds; nothing here
-                                // changes the default, so they are the nearest the others are.
-                                (true, 0b11001, _) => (simd::F32X4_NEAREST, simd::F64X2_NEAREST),
                                 _ => {
                                     return self.refuse(format!(
                                         "unsupported rounding u={u} size={size} op={op:05b} at 0x{addr:x}"
@@ -5688,26 +6356,9 @@ impl<'a> RegionEmitter<'a> {
                         self.f.simd_lane(simd::F32X4_REPLACE_LANE, 0);
                     }
                 } else {
-                    // scvtf/ucvtf: an integer converted to FP.
-                    if sf {
-                        self.get(rn, true);
-                        self.f.op(if double {
-                            if signed { F64_CONVERT_I64_S } else { F64_CONVERT_I64_U }
-                        } else if signed {
-                            F32_CONVERT_I64_S
-                        } else {
-                            F32_CONVERT_I64_U
-                        });
-                    } else {
-                        self.get(rn, false);
-                        self.f.op(if double {
-                            if signed { F64_CONVERT_I32_S } else { F64_CONVERT_I32_U }
-                        } else if signed {
-                            F32_CONVERT_I32_S
-                        } else {
-                            F32_CONVERT_I32_U
-                        });
-                    }
+                    // scvtf/ucvtf: an integer converted to FP, rounded in the mode FPCR holds.
+                    self.get(rn, sf);
+                    self.fp_from_int(sf, signed, double, 0);
                     self.f.simd_lane(if double { simd::F64X2_REPLACE_LANE } else { simd::F32X4_REPLACE_LANE }, 0);
                 }
                 self.setv(rd);
@@ -5720,9 +6371,8 @@ impl<'a> RegionEmitter<'a> {
                 self.fp_base();
                 if (4..=7).contains(&opcode) {
                     self.fp_minmax(rn, rm, double, opcode & 1 == 0, opcode >= 6);
+                    self.fp_fixup(double);
                 } else {
-                    self.fp_get(rn, double);
-                    self.fp_get(rm, double);
                     let op = match opcode {
                         0 | 8 => if double { F64_MUL } else { F32_MUL },
                         1 => if double { F64_DIV } else { F32_DIV },
@@ -5730,26 +6380,25 @@ impl<'a> RegionEmitter<'a> {
                         3 => if double { F64_SUB } else { F32_SUB },
                         _ => return self.refuse(format!("floating point opcode {opcode} at 0x{addr:x}")),
                     };
-                    self.f.op(op);
-                    if opcode == 8 {
-                        // fnmul: the product, then the sign flipped.
-                        self.f.op(if double { F64_NEG } else { F32_NEG });
-                    }
+                    // fnmul is the product with the sign flipped, and nothing else differs.
+                    let neg = if double { F64_NEG } else { F32_NEG } as u32;
+                    let post: [u32; 1] = [neg];
+                    self.fp_binary(rn, rm, double, op as u32, if opcode == 8 { &post } else { &[] });
                 }
                 self.fp_put(rd, double);
             }
             Insn::FpScalarSame { double, multiply, rn, rm, rd } => {
                 self.fp_base();
-                self.fp_get(rn, double);
-                self.fp_get(rm, double);
                 if multiply {
                     // `fmulx` differs from a plain multiply only for zero times infinity, which it
                     // answers with 2.0 where a multiply gives a NaN.
-                    self.f.op(if double { F64_MUL } else { F32_MUL });
+                    let mul = if double { F64_MUL } else { F32_MUL } as u32;
+                    self.fp_binary(rn, rm, double, mul, &[]);
                 } else {
                     // `fabd`: the absolute value of the difference.
-                    self.f.op(if double { F64_SUB } else { F32_SUB });
-                    self.f.op(if double { F64_ABS } else { F32_ABS });
+                    let sub = if double { F64_SUB } else { F32_SUB } as u32;
+                    let abs = if double { F64_ABS } else { F32_ABS } as u32;
+                    self.fp_binary(rn, rm, double, sub, &[abs]);
                 }
                 self.fp_put(rd, double);
             }
@@ -5761,21 +6410,13 @@ impl<'a> RegionEmitter<'a> {
                 // There is no fused multiply-add in wasm, so this rounds twice and can differ from
                 // the instruction in the last bit. docs/poc-results.md records that.
                 self.fp_base();
-                // All four forms are the accumulator plus the product with a sign each: bit 21
-                // negates the accumulator and bit 15 the product, so FMSUB is `Va - Vn*Vm` and
-                // FNMSUB is `-Va + Vn*Vm`. The accumulator goes on the stack first because that is
-                // the NaN a result of two carries, as the hardware reports it.
-                self.fp_get(ra, double);
-                if negate_product {
-                    self.f.op(if double { F64_NEG } else { F32_NEG });
-                }
-                self.fp_get(rn, double);
-                self.fp_get(rm, double);
-                self.f.op(if double { F64_MUL } else { F32_MUL });
-                if negate_product != subtract {
-                    self.f.op(if double { F64_NEG } else { F32_NEG });
-                }
-                self.f.op(if double { F64_ADD } else { F32_ADD });
+                self.fpcr_flag(FPCR_FZ | FPCR_DN);
+                self.f.op(IF);
+                self.f.body.push(if double { F64 } else { F32 });
+                self.fp_fused(rn, rm, ra, double, negate_product, subtract, true);
+                self.f.op(ELSE);
+                self.fp_fused(rn, rm, ra, double, negate_product, subtract, false);
+                self.f.end();
                 self.fp_put(rd, double);
             }
             Insn::FpCompareZero { double, op, integer, rn, rd } => {
@@ -5960,17 +6601,20 @@ impl<'a> RegionEmitter<'a> {
                 // fcvt changes the width of the register it writes, so it does not share the tail.
                 match (opcode, double) {
                     (0b000101, false) => {
+                        // Widening is exact, so only FZ and DN reach it: the denormal FZ flushes is
+                        // the source's own, which the promotion would have made an ordinary number.
                         self.fp_base();
-                        self.fp_get(rn, false);
+                        self.fp_arg(rn, false, true);
                         self.f.op(F64_PROMOTE_F32);
-                        self.fp_put(rd, true);
+                        self.fp_out(rd, true, true);
                         return Ok(());
                     }
                     (0b000100, true) => {
                         self.fp_base();
-                        self.fp_get(rn, true);
-                        self.f.op(F32_DEMOTE_F64);
-                        self.fp_put(rd, false);
+                        self.fp_arg(rn, true, true);
+                        self.f.ls(L_F0);
+                        self.fp_narrow();
+                        self.fp_out(rd, false, true);
                         return Ok(());
                     }
                     _ => {}
@@ -5981,20 +6625,45 @@ impl<'a> RegionEmitter<'a> {
                     self.fp_put(rd, double);
                     return Ok(());
                 }
+                if opcode == 0b001110 || opcode == 0b001111 {
+                    // frintx and frinti round to an integral value in the mode FPCR holds.
+                    self.fp_base();
+                    self.fp_get(rn, double);
+                    self.fpcr_round(
+                        if double { F64 } else { F32 },
+                        if double { L_F0 } else { L_S0 },
+                        false,
+                        if double {
+                            let ops = [F64_NEAREST, F64_CEIL, F64_FLOOR, F64_TRUNC];
+                            ops.map(|o| o as u32)
+                        } else {
+                            let ops = [F32_NEAREST, F32_CEIL, F32_FLOOR, F32_TRUNC];
+                            ops.map(|o| o as u32)
+                        },
+                    );
+                    // Rounding a NaN is still a NaN, and DN decides which one.
+                    self.fp_fixup(double);
+                    self.fp_put(rd, double);
+                    return Ok(());
+                }
+                if opcode == 0b000011 {
+                    // fsqrt flushes a denormal operand and a denormal result.
+                    self.fp_base();
+                    self.fp_arg(rn, double, true);
+                    self.f.op(if double { F64_SQRT } else { F32_SQRT });
+                    self.fp_out(rd, double, true);
+                    return Ok(());
+                }
                 self.fp_base();
                 self.fp_get(rn, double);
                 let op = match opcode {
                     0b000000 => None, // fmov: the bits move unchanged
                     0b000001 => Some(if double { F64_ABS } else { F32_ABS }),
                     0b000010 => Some(if double { F64_NEG } else { F32_NEG }),
-                    0b000011 => Some(if double { F64_SQRT } else { F32_SQRT }),
                     0b001000 => Some(if double { F64_NEAREST } else { F32_NEAREST }),
                     0b001001 => Some(if double { F64_CEIL } else { F32_CEIL }),
                     0b001010 => Some(if double { F64_FLOOR } else { F32_FLOOR }),
                     0b001011 => Some(if double { F64_TRUNC } else { F32_TRUNC }),
-                    // frintx and frinti round in the mode the FPCR holds; the default is the same
-                    // nearest-even that frintn asks for, and nothing here changes the mode.
-                    0b001110 | 0b001111 => Some(if double { F64_NEAREST } else { F32_NEAREST }),
                     _ => return self.refuse(format!("floating point opcode {opcode} at 0x{addr:x}")),
                 };
                 if let Some(op) = op {
@@ -6003,49 +6672,25 @@ impl<'a> RegionEmitter<'a> {
                 self.fp_put(rd, double);
             }
             Insn::FpFromInt { double, unsigned, rn, rd } => {
-                // The register holds an integer in its low lane, which becomes a float. The
-                // conversion is exact up to the mantissa, which is what the instruction does.
+                // The register holds an integer in its low lane, which becomes a float rounded in
+                // the mode FPCR holds.
                 self.fp_base();
                 self.getv(rn);
-                if double {
-                    self.f.simd_lane(simd::I64X2_EXTRACT_LANE, 0);
-                    self.f.op(if unsigned { F64_CONVERT_I64_U } else { F64_CONVERT_I64_S });
-                } else if unsigned {
-                    self.f.simd_lane(simd::I32X4_EXTRACT_LANE, 0);
-                    self.f.op(F32_CONVERT_I32_U);
-                } else {
-                    self.f.simd_lane(simd::I32X4_EXTRACT_LANE, 0);
-                    self.f.op(F32_CONVERT_I32_S);
-                }
+                self.f.simd_lane(if double { simd::I64X2_EXTRACT_LANE } else { simd::I32X4_EXTRACT_LANE }, 0);
+                self.fp_from_int(double, !unsigned, double, 0);
                 self.fp_put(rd, double);
             }
             Insn::FpFromIntFixed { sf, unsigned, size, fbits, rn, rd } => {
-                // The integer becomes a float, then scales by a power of two: scaling moves the
-                // significand without changing it, so the one rounding the instruction asks for is
-                // the one that happens.
+                // The integer becomes a float rounded in the mode FPCR holds, then scales by a
+                // power of two: scaling moves the significand without changing it, so the one
+                // rounding the instruction asks for is the one that happens.
                 if size > 1 {
                     return self.refuse(format!("half precision floating point at 0x{addr:x}"));
                 }
                 let double = size == 1;
                 self.fp_base();
                 self.get(rn, sf);
-                self.f.op(match (sf, double, unsigned) {
-                    (true, true, false) => F64_CONVERT_I64_S,
-                    (true, true, true) => F64_CONVERT_I64_U,
-                    (true, false, false) => F32_CONVERT_I64_S,
-                    (true, false, true) => F32_CONVERT_I64_U,
-                    (false, true, false) => F64_CONVERT_I32_S,
-                    (false, true, true) => F64_CONVERT_I32_U,
-                    (false, false, false) => F32_CONVERT_I32_S,
-                    (false, false, true) => F32_CONVERT_I32_U,
-                });
-                if double {
-                    self.f.f64c(2f64.powi(-(fbits as i32)).to_bits());
-                    self.f.op(F64_MUL);
-                } else {
-                    self.f.f32c(2f32.powi(-(fbits as i32)).to_bits());
-                    self.f.op(F32_MUL);
-                }
+                self.fp_from_int(sf, !unsigned, double, fbits);
                 self.fp_put(rd, double);
             }
             Insn::FpToInt { double, unsigned, rmode, rn, rd } => {

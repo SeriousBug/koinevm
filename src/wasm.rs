@@ -49,6 +49,8 @@ pub mod op {
     pub const LOCAL_GET: u8 = 0x20;
     pub const LOCAL_SET: u8 = 0x21;
     pub const LOCAL_TEE: u8 = 0x22;
+    pub const GLOBAL_GET: u8 = 0x23;
+    pub const GLOBAL_SET: u8 = 0x24;
     pub const I32_LOAD: u8 = 0x28;
     pub const I64_LOAD: u8 = 0x29;
     pub const I32_LOAD8_S: u8 = 0x2c;
@@ -144,8 +146,6 @@ pub mod op {
     pub const I32_POPCNT: u8 = 0x69;
     pub const I32_EXTEND8_S: u8 = 0xc0;
     pub const I32_EXTEND16_S: u8 = 0xc1;
-    pub const GLOBAL_GET: u8 = 0x23;
-    pub const GLOBAL_SET: u8 = 0x24;
     pub const I32_ADD: u8 = 0x6a;
     pub const I32_SUB: u8 = 0x6b;
     pub const I32_MUL: u8 = 0x6c;
@@ -597,11 +597,11 @@ pub struct Module {
     /// A module that translates more code for an existing run takes the host's memory instead of
     /// defining one, so both see the same bytes.
     pub mem_import: Option<(String, String)>,
+    /// `(type, mutable, initial value)`, indexed from zero because a module here imports no global.
+    /// A global is the one thing a translated region can keep between instructions without a
+    /// memory round trip, which is what the preemption counter needs.
+    pub globals: Vec<(u8, bool, i64)>,
     pub data: Vec<(u64, Vec<u8>)>,
-    /// Module-internal mutable globals, as `(type, initial value)`: the one thing a translated
-    /// region can keep between instructions without a memory round trip, which is what a
-    /// preemption counter needs.
-    pub globals: Vec<(u8, i64)>,
 }
 
 impl Module {
@@ -616,13 +616,14 @@ impl Module {
             exports: Vec::new(),
             mem_pages: 0,
             mem_import: None,
-            data: Vec::new(),
             globals: Vec::new(),
+            data: Vec::new(),
         }
     }
-    /// Declares a mutable global and returns its index.
+    /// Declares a mutable global and returns its index, which is its position: a module here
+    /// imports no globals.
     pub fn global(&mut self, ty: u8, init: i64) -> u32 {
-        self.globals.push((ty, init));
+        self.globals.push((ty, true, init));
         (self.globals.len() - 1) as u32
     }
     pub fn ty(&mut self, params: Vec<u8>, results: Vec<u8>) -> u32 {
@@ -728,20 +729,12 @@ impl Module {
         if !self.globals.is_empty() {
             let mut s = Vec::new();
             uleb(&mut s, self.globals.len() as u64);
-            for (ty, init) in &self.globals {
-                s.push(*ty);
-                s.push(0x01); // mutable
-                match ty {
-                    0x7f => s.push(0x41), // i32.const
-                    0x7e => s.push(0x42), // i64.const
-                    _ => s.push(0x41),
-                }
-                if *ty == 0x7e {
-                    sleb(&mut s, *init);
-                } else {
-                    sleb(&mut s, *init);
-                }
-                s.push(0x0b);
+            for &(ty, mutable, init) in &self.globals {
+                s.push(ty);
+                s.push(if mutable { 1 } else { 0 });
+                s.push(if ty == I64 { op::I64_CONST } else { op::I32_CONST });
+                sleb(&mut s, init);
+                s.push(op::END);
             }
             Self::section(&mut out, 6, &s);
         }
