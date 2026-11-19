@@ -109,6 +109,9 @@ export const SI_KERNEL = 128;
 export const SEGV_MAPERR = 1;
 export const SEGV_ACCERR = 2;
 export const SA_SIGINFO = 4;
+/// The disposition names the code the handler returns through. A libc does not: it leaves the
+/// address for the kernel's own trampoline to stand in.
+export const SA_RESTORER = 0x04000000;
 export const SA_ONSTACK = 0x08000000;
 export const SA_RESTART = 0x10000000;
 export const SA_NODEFER = 0x40000000;

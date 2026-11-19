@@ -18,7 +18,7 @@ import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
 import { Mach } from "./pages.mjs";
 import { PTE } from "./addressspace.mjs";
-import { SIGFRAME, SA_ONSTACK, SA_SIGINFO, SI_USER, SS_DISABLE } from "./syscall.mjs";
+import { SIGFRAME, SA_ONSTACK, SA_SIGINFO, SA_RESTORER, SI_USER, SS_DISABLE } from "./syscall.mjs";
 
 const SHADOW = 0x0;
 const SHADOW_PC = 0x108;
@@ -41,6 +41,13 @@ const ENOEXEC = 8;
 /// SIGURG, SIGWINCH - or stop it, which a coroutine has no way to be.
 const FATAL = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 25, 26, 31]);
 for (let sig = 32; sig <= 64; sig++) FATAL.add(sig);
+
+/// Where a handler returns to when its disposition names no restorer. An aarch64 kernel puts its
+/// own trampoline at the end of every handler - the one in the vDSO - and a real libc leaves
+/// `sa_restorer` empty because it expects it there. This address is no image's code: the run
+/// recognises it and puts back the frame the signal left, which is what the trampoline asks for.
+/// It sits below the arena's first byte, where neither the heap nor a mapping can reach.
+const SIGTRAMP = 0x3ffff000;
 
 export class Session {
   constructor({ translator, rootfs, makeImports }) {
@@ -270,6 +277,7 @@ export class Session {
       }
       while (status === 2) {
         const pc = proc.mach.view.getUint32(SHADOW_PC, true) >>> 0;
+        if (pc === SIGTRAMP) return this.sigreturnAt(proc, thread);
         // A jump into a page the guest did not map executable is a fault rather than a request to
         // translate: running data is how a program finds out it has a wild function pointer.
         if ((proc.kernel.space.ptes[pc >>> 12] & (PTE.MAPPED | PTE.EXECUTABLE)) !== (PTE.MAPPED | PTE.EXECUTABLE)) {
@@ -389,6 +397,23 @@ export class Session {
     return this.exit(proc, 0, fault.signal);
   }
 
+  /// Where a handler returns to: the restorer its disposition named, or the trampoline.
+  restorerFor(act) {
+    const named = Number(BigInt.asUintN(64, act.restorer));
+    if ((Number(act.flags) & SA_RESTORER) !== 0 && named !== 0) return named;
+    return SIGTRAMP;
+  }
+
+  /// The `ret` a handler ends with, when it lands on the trampoline: the frame is on the stack the
+  /// signal put it on, and `rt_sigreturn` is what the two instructions there asked for.
+  sigreturnAt(proc, thread) {
+    const at = Number(new DataView(proc.memory.buffer).getBigUint64(0xf8, true));
+    // A frame that is not there is a process that does not survive the return, the way a real
+    // kernel's `rt_sigreturn` kills one that hands it a stack it cannot read.
+    if (!proc.kernel.inBounds(at, SIGFRAME.FPSIMD + 16 + 32 * 16)) return this.exit(proc, 0, 11);
+    return this.sigreturn(proc, thread, { frame: at });
+  }
+
   /// Hand the process the next signal it may take. The frame goes on the guest's stack, in the
   /// shape the kernel builds one, and the handler starts with the registers a call to it would
   /// have: the signal number, and the two pointers when the disposition asked for them.
@@ -449,7 +474,7 @@ export class Session {
     const info = Number(act.flags) & SA_SIGINFO ? BigInt(at) : 0n;
     view.setBigUint64(8, info, true);
     view.setBigUint64(16, info === 0n ? 0n : BigInt(at + SIGFRAME.UC), true);
-    view.setBigUint64(30 * 8, BigInt.asUintN(64, act.restorer), true);
+    view.setBigUint64(30 * 8, BigInt(this.restorerFor(act)), true);
     view.setUint32(0x108, handler >>> 0, true);
     const bit = 1n << BigInt(entry.sig - 1);
     kernel.sigblock = BigInt.asUintN(64, kernel.sigblock | BigInt.asUintN(64, act.mask) | bit);
@@ -531,13 +556,13 @@ export class Session {
   /// process group, so a command that is running gets the signal and the shell that ignores it
   /// while it waits does not.
   interrupt(sig) {
-    // A terminal signals the foreground command, and the shell is not the command: it catches the
-    // interrupt so that it can tidy up after what it was waiting for. With one process group, the
-    // disposition is what stands in for that - a process that handles the signal is the shell, and
-    // the command it started is the one whose default action runs.
+    // A terminal signals the foreground job, and every process here shares one process group, so
+    // the job is every process that has not said it ignores the signal: the shell and the command
+    // it is waiting for both take it, and the command that catches it - a REPL's
+    // `KeyboardInterrupt`, a `trap`, a package manager tidying up - gets to run its own code.
     for (const proc of this.processes) {
       if (proc.state === "exited") continue;
-      if (proc.kernel.disposition(sig) !== "default") continue;
+      if (proc.kernel.disposition(sig) === "ignore") continue;
       this.signal({ from: 0, pid: proc.pid, sig });
     }
   }
