@@ -12,6 +12,13 @@ work=$(mktemp -d)
 out="rootfs/debian/tmp/nvim-check.txt"
 trap 'rm -rf "$work"; rm -f "$out"' EXIT
 
+# `neovim` is not something the tree puts in the image: it is there because an editor is what
+# showed the syscalls that libuv needs. Without it there is nothing to run.
+if [ ! -x rootfs/debian/usr/bin/nvim ]; then
+    echo "skip nvim: the image has no neovim"
+    exit 0
+fi
+
 fail=0
 for mode in $MODES; do
     wasm="$work/nvim.$mode.wasm"

@@ -76,7 +76,7 @@ the console an interactive shell reads (`tests/console.sh`), a pseudo-terminal a
 child of its own (`tests/pty.sh`), a counted wakeup one process writes and another reads
 (`tests/eventfd.sh`), an editor on top of the whole stack (`tests/nvim.sh`), and the socket,
 epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all
-113.
+113; `tests/nvim.sh` skips when the image has no `neovim` in it.
 
 The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
