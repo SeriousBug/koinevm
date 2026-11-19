@@ -86,7 +86,18 @@ that turns off `ICANON` and `ECHO`, which is what readline does before it reads 
 time and draws the line itself, gets the bytes as they come and does its own echo, so the up arrow
 recalls what was run, backspace edits it, `Ctrl-C` ends the command that is running and `Ctrl-D` at
 the prompt ends the shell. `read x` takes the next line the way it does at a terminal, and `python3`
-prints its banner and a `>>>` prompt.
+prints its banner and a `>>>` prompt. A console run also names the host's `TERM`, or an xterm when
+the host has none: without a terminal type readline cannot place its cursor, and it scrolls a long
+line sideways instead of wrapping it.
+
+Two things a package manager taught the console. `dpkg` hands `dpkg-deb`'s output to `tar` on a
+pipe, and `tar` refuses an archive that arrives from a terminal, so `isatty` has to be false on a
+pipe: only the descriptors that name the console answer `tcgetattr`, and everything else answers
+`ENOTTY`. And `apt-get` empties the terminal before it starts `dpkg`, by setting fd 0 non-blocking
+and reading until a read fails, so `O_NONBLOCK` has to stick to a console descriptor the way it
+sticks to any other: the standard descriptors carry an open file description for it. With both,
+`apt-get install` unpacks and configures on the console, and the `[Y/n]` it asks before a removal is
+answered with `y`.
 
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in

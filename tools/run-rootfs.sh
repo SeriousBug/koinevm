@@ -14,6 +14,16 @@ export ARMJIT_ROOTFS=$rootfs
 # The environment a Debian program expects to find. A process started by a shell inherits one, and
 # a package manager checks for `PATH` before it does anything.
 env=${ARMJIT_ENV:-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,HOME=/root}
+# A program that formats for a terminal reads TERM to learn what the terminal can be sent: without
+# one readline cannot place its cursor, and it scrolls a long line sideways instead of wrapping it.
+# A console run names the host's own terminal, and an xterm when the host has none or names `dumb`:
+# the console is a terminal all the same, and the rootfs carries the terminfo for that name.
+if [[ -n ${ARMJIT_CONSOLE:-} ]]; then
+    case ${TERM:-} in
+        "" | dumb) env="$env,TERM=xterm-256color" ;;
+        *) env="$env,TERM=$TERM" ;;
+    esac
+fi
 prog=$1
 shift
 
