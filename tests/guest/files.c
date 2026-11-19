@@ -31,6 +31,12 @@ static long read_(long fd, void *buf, unsigned long n) { return sc6(63, fd, (lon
 static long pread_(long fd, void *buf, unsigned long n, long off) {
     return sc6(67, fd, (long)buf, (long)n, off, 0, 0);
 }
+static long readv_(long fd, const void *iov, long count) {
+    return sc6(65, fd, (long)iov, count, 0, 0, 0);
+}
+static long preadv_(long fd, const void *iov, long count, long off) {
+    return sc6(69, fd, (long)iov, count, off, 0, 0);
+}
 static long write_(long fd, const void *buf, unsigned long n) {
     return sc6(64, fd, (long)buf, (long)n, 0, 0, 0);
 }
@@ -114,6 +120,25 @@ __attribute__((used)) void _start(void) {
     check(n == 5 && bytes_equal(buf, "hello", 5), "pread does not move the offset", (unsigned long)n);
     // 6 from the absolute seek plus 4 read, and pread left the offset where it was.
     check(lseek_(fd, 0, 1) == 10, "lseek relative", 10);
+
+    // The same bytes again into two buffers at once, which is how a library that buffers a file
+    // asks for its next chunk.
+    struct { unsigned long at; unsigned long len; } iov[2];
+    char first[8], second[8];
+    iov[0].at = (unsigned long)first;
+    iov[0].len = 5;
+    iov[1].at = (unsigned long)second;
+    iov[1].len = 6;
+    n = preadv_(fd, iov, 2, 0);
+    check(n == 11, "preadv fills both buffers", (unsigned long)n);
+    check(bytes_equal(first, "hello", 5), "preadv fills the first", 5);
+    check(bytes_equal(second, " from ", 6), "preadv fills the second", 6);
+    check(lseek_(fd, 6, 1) == 16, "preadv does not move the offset", 16);
+    check(lseek_(fd, 11, 0) == 11, "lseek to where the last eleven bytes start", 11);
+    n = readv_(fd, iov, 2);
+    check(n == 11, "readv reads where the offset is", (unsigned long)n);
+    check(bytes_equal(first, "the r", 5), "readv fills the first", 5);
+    check(bytes_equal(second, "ootfs\n", 6), "readv fills the second", 6);
 
     // fstat reports a regular file of the right size.
     check(fstat_(fd, statbuf) == 0, "fstat", 0);

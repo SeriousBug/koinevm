@@ -648,29 +648,37 @@ export class Kernel {
 
     this.on(63, (k, fd, buf, count) => {
       const entry = k.files.get(Number(fd));
-      if (entry && entry.kind === "signalfd") {
-        const got = k.readSignalfd(entry, Number(count));
-        if (got === WOULD_BLOCK) return k.ask({ kind: "read", fd: Number(fd), buf: k.addr(buf), len: 128 });
-        if (typeof got === "number") return k.done(got);
-        if (!k.put(buf, got)) return k.fail(EFAULT);
-        return [BigInt(got.length), 0];
-      }
       if (entry && entry.kind === "socket") {
         return k.done(k.recvInto(Number(fd), k.addr(buf), Number(count), 0, 0, 0));
       }
       const n = Math.min(Number(count), 0x7ffff000);
       if (process.env.ARMJIT_TRACE_SYSCALLS)
         console.error(`  read fd=${Number(fd)} at 0x${BigInt.asUintN(64, buf).toString(16)} n=${n}`);
-      const got = k.files.read(Number(fd), n);
-      if (process.env.ARMJIT_TRACE_SYSCALLS) {
-        console.error(`  read fd=${Number(fd)} n=${n} -> ${typeof got === "number" ? got : got.length}`);
-      }
-      // A pipe with writers and nothing in it yet: the host waits and answers this again.
-      if (got === WOULD_BLOCK) return k.ask({ kind: "read", fd: Number(fd), buf: k.addr(buf), len: n });
-      if (typeof got === "number") return [BigInt(got), 0];
-      if (!k.put(buf, got)) return k.fail(EFAULT);
-      return [BigInt(got.length), 0];
+      const { ask, answer } = k.readInto(Number(fd), [{ at: k.addr(buf), len: n }]);
+      if (process.env.ARMJIT_TRACE_SYSCALLS) console.error(`  read fd=${Number(fd)} n=${n} -> ${answer}`);
+      return ask ? k.ask(ask) : k.done(answer);
     });
+
+    // `readv`: one read scattered into the buffers the guest names, which is how a library that
+    // buffers a file asks for its next chunk. `preadv` is the same at an offset.
+    const readv = (k, fd, iov, count, off) => {
+      const n = Number(count);
+      if (n < 0 || n > 1024) return k.fail(EINVAL);
+      const segs = [];
+      let total = 0;
+      for (let i = 0; i < n; i++) {
+        const entry = k.addr(iov) + i * 16;
+        const at = Number(BigInt.asUintN(64, k.u64(entry)));
+        const len = Number(BigInt.asUintN(64, k.u64(entry + 8)));
+        if (len < 0) return k.fail(EINVAL);
+        segs.push({ at: k.addr(at), len: Math.min(len, 0x7ffff000) });
+        total += len;
+      }
+      const { ask, answer } = k.readInto(Number(fd), segs, off === null ? null : k.addr(off));
+      return ask ? k.ask(ask) : k.done(answer);
+    };
+    this.on(65, (k, fd, iov, count) => readv(k, fd, iov, count, null));
+    this.on(69, (k, fd, iov, count, off) => readv(k, fd, iov, count, off));
 
     this.on(67, (k, fd, buf, count, off) => {
       const n = Math.min(Number(count), 0x7ffff000);
@@ -1393,6 +1401,28 @@ export class Kernel {
     return Math.max(0, Math.ceil(sec * 1000 + nsec / 1e6));
   }
 
+  /// A read into the buffers a request names: one for `read`, and whatever list the guest gave for
+  /// `readv`. A descriptor with nothing in it answers with the request itself, which is what the
+  /// thread parks on and what the host answers again when the bytes arrive.
+  readInto(fd, segs, off = null) {
+    const total = segs.reduce((n, seg) => n + seg.len, 0);
+    const entry = this.files.get(fd);
+    let got;
+    if (off !== null) got = this.files.pread(fd, total, off);
+    else if (entry && entry.kind === "signalfd") got = this.readSignalfd(entry, total);
+    else got = this.files.read(fd, total);
+    if (got === WOULD_BLOCK) return { ask: { kind: "read", fd, segs, len: total } };
+    if (typeof got === "number") return { answer: got };
+    let at = 0;
+    for (const seg of segs) {
+      const part = got.subarray(at, at + seg.len);
+      if (!part.length) break;
+      if (!this.put(seg.at, part)) return { answer: -EFAULT };
+      at += part.length;
+    }
+    return { answer: got.length };
+  }
+
   /// Whether a descriptor would answer `poll` now, per direction.
   pollState(entry, fd) {
     if (entry.kind === "socket") return entry.desc.status();
@@ -1860,6 +1890,16 @@ export class Kernel {
       if (!k.put64(ts, ns / 1_000_000_000n) || !k.put64(ts + 8n, ns % 1_000_000_000n)) {
         return k.fail(EFAULT);
       }
+      return [0n, 0];
+    });
+
+    // clock_getres: how fine a clock is, which is what libuv asks before it sets a timer. A
+    // nanosecond is what a kernel that has an hrtimer answers, and the answer has to be there:
+    // without it the error stays in `errno` and the next failure a program reports is the wrong one.
+    this.on(114, (k, clock, res) => {
+      if (Number(clock) > 7) return k.fail(EINVAL);
+      if (k.addr(res) === 0) return [0n, 0];
+      if (!k.put64(res, 0n) || !k.put64(res + 8n, 1n)) return k.fail(EFAULT);
       return [0n, 0];
     });
 

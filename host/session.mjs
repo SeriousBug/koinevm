@@ -13,7 +13,7 @@
 
 import fs from "node:fs";
 import { Kernel, ECHILD, EBADF, EFAULT, ESRCH, EINTR } from "./syscall.mjs";
-import { WOULD_BLOCK, ENOENT, EACCES, ELOOP } from "./files.mjs";
+import { ENOENT, EACCES, ELOOP } from "./files.mjs";
 import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
 import { Mach } from "./pages.mjs";
@@ -1077,18 +1077,16 @@ export class Session {
       .join(" ");
   }
 
-  /// A pipe read that had nothing in it: answer it now, or keep waiting.
+  /// A read that had nothing in it: answer it now, or keep waiting.
   read(proc, thread, request) {
-    const got = proc.kernel.files.read(request.fd, request.len);
-    if (got === WOULD_BLOCK) {
+    const { ask, answer } = proc.kernel.readInto(request.fd, request.segs);
+    if (ask) {
       const entry = proc.kernel.files.get(request.fd);
       this.block(thread, 0, entry && proc.kernel.files.consoleEntry(entry) ? "stdin" : "pipe");
       thread.pending = request;
       return 0;
     }
-    if (typeof got === "number") return this.resume(proc, thread, got);
-    proc.kernel.put(request.buf, got);
-    return this.resume(proc, thread, got.length);
+    return this.resume(proc, thread, answer);
   }
 
   /// Something a thread may be waiting for happened, or a pipe has data in it. A socket waiter is
