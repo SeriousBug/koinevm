@@ -117,6 +117,16 @@ export const SIG_UNBLOCK = 1;
 export const SIG_SETMASK = 2;
 export const SS_DISABLE = 2;
 
+/// Whether a descriptor is the console. A terminal is a device, and only the descriptors that name
+/// one answer `TCGETS`: a pipe, a file or a socket that answered it would tell `isatty` - and every
+/// program that asks it - that a pipe is a terminal, which is how `tar` came to refuse the archive
+/// `dpkg` handed it on stdin.
+const onConsole = (k, fd) => {
+  if (!terminal.live) return false;
+  const entry = k.files.get(Number(fd));
+  return Boolean(entry) && (entry.kind === "stdin" || entry.kind === "stdout" || entry.kind === "stderr");
+};
+
 /// The size the kernel's `struct termios` occupies: four flag words, `c_line`, and `NCCS = 19`
 /// control characters. The speeds live in glibc's struct and nowhere in this one.
 const KERNEL_TERMIOS = 36;
@@ -852,10 +862,11 @@ export class Kernel {
       }
       // The console. A run that is not reading the host's input has no terminal, and says so: a
       // program that believes it has one formats for it, and a test's output stops being the output
-      // of a pipe. With one, `isatty` is true, and the termios the guest writes is what decides
-      // whether the host reads it a line at a time or a keystroke at a time.
+      // of a pipe. A console the run does have is one on its own descriptors and nowhere else, which
+      // is what `isatty` is asking. Its termios is what decides whether the host reads it a line at a
+      // time or a keystroke at a time.
       if (req === 0x5401 || (req >= 0x5402 && req <= 0x5404)) {
-        if (!terminal.live) return k.fail(ENOTTY);
+        if (!onConsole(k, fd)) return k.fail(ENOTTY);
         // The kernel's own `struct termios`: the four flag words, the line discipline and nineteen
         // control characters. glibc keeps the speeds in its own, larger struct and reads them out
         // of `c_cflag`, so a kernel that wrote the whole of that one would run past the end.
@@ -886,7 +897,7 @@ export class Kernel {
       if (req === 0x5413) {
         // The window: the host's own, so a program that lays text out in columns uses the terminal
         // it is actually in.
-        if (!terminal.live) return k.fail(ENOTTY);
+        if (!onConsole(k, fd)) return k.fail(ENOTTY);
         const ws = Buffer.alloc(8);
         ws.writeUInt16LE(process.stdout.rows || 24, 0);
         ws.writeUInt16LE(process.stdout.columns || 80, 2);
@@ -896,12 +907,12 @@ export class Kernel {
       // The process group of the terminal, which an interactive shell compares with its own before
       // it takes the console over. One process group is what this kernel has.
       if (req === 0x540f) {
-        if (!terminal.live) return k.fail(ENOTTY);
+        if (!onConsole(k, fd)) return k.fail(ENOTTY);
         if (!k.put32(arg, k.pid)) return k.fail(EFAULT);
         return [0n, 0];
       }
       if (req === 0x5410) {
-        if (!terminal.live) return k.fail(ENOTTY);
+        if (!onConsole(k, fd)) return k.fail(ENOTTY);
         return [0n, 0];
       }
       // An ioctl nobody here implements has to fail. Answering zero tells the caller the request

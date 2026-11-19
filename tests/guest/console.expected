@@ -3,6 +3,12 @@ one
 root@armjit:/# read x
 root@armjit:/# echo "read:$x"
 read:hello there
+root@armjit:/# [ -t 0 ] && echo console-0 || echo pipe-0
+console-0
+root@armjit:/# [ -t 1 ] && echo console-1 || echo pipe-1
+console-1
+root@armjit:/# printf x | { read -r y; [ -t 0 ] || echo not-a-tty; }
+not-a-tty
 root@armjit:/# printf "%s\n" a b c | wc -l
 3
 root@armjit:/# nosuchcommand 2>/dev/null || echo "status:$?"
