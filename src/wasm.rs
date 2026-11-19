@@ -49,6 +49,8 @@ pub mod op {
     pub const LOCAL_GET: u8 = 0x20;
     pub const LOCAL_SET: u8 = 0x21;
     pub const LOCAL_TEE: u8 = 0x22;
+    pub const GLOBAL_GET: u8 = 0x23;
+    pub const GLOBAL_SET: u8 = 0x24;
     pub const I32_LOAD: u8 = 0x28;
     pub const I64_LOAD: u8 = 0x29;
     pub const I32_LOAD8_S: u8 = 0x2c;
@@ -476,6 +478,12 @@ impl Func {
     pub fn ls(&mut self, i: u32) -> &mut Self {
         self.idx(op::LOCAL_SET, i)
     }
+    pub fn gg(&mut self, i: u32) -> &mut Self {
+        self.idx(op::GLOBAL_GET, i)
+    }
+    pub fn gs(&mut self, i: u32) -> &mut Self {
+        self.idx(op::GLOBAL_SET, i)
+    }
     pub fn lt(&mut self, i: u32) -> &mut Self {
         self.idx(op::LOCAL_TEE, i)
     }
@@ -589,6 +597,8 @@ pub struct Module {
     /// A module that translates more code for an existing run takes the host's memory instead of
     /// defining one, so both see the same bytes.
     pub mem_import: Option<(String, String)>,
+    /// `(type, mutable, initial value)`, indexed from zero because a module here imports no global.
+    pub globals: Vec<(u8, bool, i64)>,
     pub data: Vec<(u64, Vec<u8>)>,
 }
 
@@ -604,6 +614,7 @@ impl Module {
             exports: Vec::new(),
             mem_pages: 0,
             mem_import: None,
+            globals: Vec::new(),
             data: Vec::new(),
         }
     }
@@ -705,6 +716,19 @@ impl Module {
             s.push(0x00);
             uleb(&mut s, self.mem_pages as u64);
             Self::section(&mut out, 5, &s);
+        }
+
+        if !self.globals.is_empty() {
+            let mut s = Vec::new();
+            uleb(&mut s, self.globals.len() as u64);
+            for &(ty, mutable, init) in &self.globals {
+                s.push(ty);
+                s.push(if mutable { 1 } else { 0 });
+                s.push(if ty == I64 { op::I64_CONST } else { op::I32_CONST });
+                sleb(&mut s, init);
+                s.push(op::END);
+            }
+            Self::section(&mut out, 6, &s);
         }
 
         if !self.exports.is_empty() {
