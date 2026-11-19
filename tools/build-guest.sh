@@ -86,6 +86,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/faults.c -o tests/guest/faults.o
 python3 tools/minilink.py tests/guest/faults.o tests/guest/faults.elf _start
 
+echo "== guest: sighandler (a handler of the guest's own, a block, and the restorer) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
+    -c tests/guest/sighandler.c -o tests/guest/sighandler.o
+python3 tools/minilink.py tests/guest/sighandler.o tests/guest/sighandler.elf _start
+
 echo "== guest: tcp (connect/accept/listen/shutdown, and a child that connects) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/tcp.c -o tests/guest/tcp.o

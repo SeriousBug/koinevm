@@ -25,10 +25,12 @@ root. The setters move them, the getters report them, `fork` copies them, and `e
 - a signal number of zero asks whether a process is there, and answers `ESRCH` if it is not. A
   process that has ended but has not been reaped is still there, and the signal is discarded.
 - a disposition of *ignore* is nothing at all.
-- a disposition of *catch* is recorded and not run. Entering a guest handler is not something this
-  kernel can do: it has no way to make the guest's code run on the signal's behalf, so a caught
-  signal stops at the disposition rather than ending a process that asked to survive it. A program
-  that waits for a signal to interrupt a blocking call would wait for ever.
+- a disposition of *catch* runs the guest's own handler. The signal is queued, and the handler is
+  entered by writing the frame the kernel builds on the guest's stack - `siginfo`, a `ucontext` with
+  the registers, sp and pc, and the FP state beside them - and starting the guest at the handler with
+  the signal number, and with the `siginfo` and `ucontext` pointers when the disposition asked for
+  them. The restorer in that frame calls `rt_sigreturn`, which puts the machine back where it was.
+  A call that was parked when the signal arrived answers `EINTR`.
 - the default action of a terminating signal ends the process, and its parent's `wait4` reports that
   signal. `SIGKILL` and `SIGSTOP` have no disposition: asking about one succeeds and setting one is
   `EINVAL`, as on Linux.
@@ -36,10 +38,14 @@ root. The setters move them, the getters report them, `fork` copies them, and `e
   stopped where it stands, so `SIGSTOP`, `SIGTSTP`, `SIGTTIN` and `SIGTTOU` are accepted and have no
   effect.
 
-Signals are not queued or blocked, `rt_sigprocmask` reads as an empty set, and a signal sent while
-one is already pending is coalesced. A `SIGPIPE` is not raised when a guest writes to a pipe nobody
-reads: the write answers `EPIPE` instead, which is what a program that had ignored `SIGPIPE` would
-see.
+`rt_sigprocmask` blocks and unblocks, `sigaltstack` is remembered, and `SA_ONSTACK`, `SA_SIGINFO`
+and the mask a handler runs under are honoured; a signal sent while one of the same number is
+already pending is coalesced, as a kernel does everything below the realtime range. What is missing
+is the point in the middle of a computation: a signal is taken at a syscall, so a guest that never
+calls one keeps running, which is the poll below. A `SIGPIPE` is not raised when a guest writes to a
+pipe nobody reads: the write answers `EPIPE` instead, which is what a program that had ignored
+`SIGPIPE` would see. A fault cannot be caught yet either: `SIGSEGV` ends the process, because the
+registers a fault would have to save are the ones the wasm call it unwinds is holding.
 
 ## Preemption
 

@@ -31,6 +31,8 @@ export const EBADF = 9;
 export const ENOTTY = 25;
 export const ECHILD = 10;
 export const ENOEXEC = 8;
+export const EINTR = 4;
+export const EPERM = 1;
 const ENODATA = 61;
 const ENOTSUP = 95;
 
@@ -65,6 +67,56 @@ function traceArg(k, v) {
   return new TextDecoder().decode(view.subarray(0, end));
 }
 
+/// The frame a signal handler returns through, in the shape the arm64 kernel builds it: `siginfo`,
+/// a `ucontext` whose `sigcontext` holds the machine state, and the room the kernel keeps for the
+/// floating point registers. The offsets are the kernel's, because glibc's restorer and any handler
+/// that reads its own `ucontext` are written against them.
+const SHADOW_SP = 0xf8;
+const SHADOW_RESUME = 0x118;
+const SHADOW_FPCR = 0x120;
+const SHADOW_FPSR = 0x128;
+const SHADOW_V0 = 0x600;
+
+export const SIGFRAME = {
+  SI_SIZE: 128,
+  SI_SIGNO: 0,
+  SI_ERRNO: 4,
+  SI_CODE: 8,
+  /// The union: a `kill` puts the sender here, a fault puts the address.
+  SI_ADDR: 16,
+  SI_PID: 16,
+  SI_UID: 20,
+  UC: 128,
+  UC_FLAGS: 128,
+  UC_LINK: 136,
+  UC_STACK: 144,
+  UC_SIGMASK: 168,
+  /// `sigcontext`: the address that faulted, then x0..x30, sp, pc and pstate.
+  SC: 296,
+  SC_FAULT: 296,
+  SC_REGS: 304,
+  SC_SP: 552,
+  SC_PC: 560,
+  SC_PSTATE: 568,
+  /// Where the kernel writes `struct fpsimd_context`: a magic word, its size, fpsr, fpcr, and the
+  /// thirty-two vector registers.
+  FPSIMD: 576,
+  SIZE: 4672,
+};
+
+export const SI_USER = 0;
+export const SI_KERNEL = 128;
+export const SEGV_MAPERR = 1;
+export const SEGV_ACCERR = 2;
+export const SA_SIGINFO = 4;
+export const SA_ONSTACK = 0x08000000;
+export const SA_RESTART = 0x10000000;
+export const SA_NODEFER = 0x40000000;
+export const SIG_BLOCK = 0;
+export const SIG_UNBLOCK = 1;
+export const SIG_SETMASK = 2;
+export const SS_DISABLE = 2;
+
 export class Kernel {
   constructor(memory, meta, options = {}) {
     this.memory = memory;
@@ -90,9 +142,18 @@ export class Kernel {
     this.pending = null;
     /// Called when something a process may be waiting for has happened.
     this.wake = options.wake ?? (() => {});
-    /// Signal dispositions this process installed: `catch` or `ignore`, and nothing at all for the
-    /// default. A caught signal is recorded and not run, because there is nowhere to run it.
+    /// Signal dispositions this process installed: `ignore`, or the handler, flags, restorer and
+    /// mask a guest asked for. A signal with no entry takes its default action.
     this.signals = new Map();
+    /// `rt_sigprocmask`'s mask, as many bits as there are signals. A signal that is blocked waits
+    /// rather than being dropped.
+    this.sigblock = 0n;
+    /// Signals raised and not yet handed over. One entry per signal: everything below the realtime
+    /// range coalesces, which is what a kernel does and what a program assumes.
+    this.pendingSignals = [];
+    /// `sigaltstack`: where a handler runs when the disposition says it must not run on the stack
+    /// it interrupted. A guard page makes that a stack overflow's only way out.
+    this.altstack = { sp: 0n, size: 0n, flags: SS_DISABLE };
     /// Called to deliver a signal to a process or a thread of the session, which is the host's job
     /// because the target may not be this process. Answers 0 or a negative errno.
     this.signal = options.signal ?? (() => -ESRCH);
@@ -316,6 +377,8 @@ export class Kernel {
       random: this.random,
       ids: { ...this.ids, groups: [...this.ids.groups] },
       signals: new Map(this.signals),
+      sigblock: this.sigblock,
+      altstack: { ...this.altstack },
       epolls: new Map(
         [...this.epolls].map(([fd, interests]) => [fd, new Map([...interests].map(([f, i]) => [f, { ...i }]))]),
       ),
@@ -332,6 +395,8 @@ export class Kernel {
     this.random = state.random;
     this.ids = state.ids;
     this.signals = state.signals;
+    this.sigblock = state.sigblock;
+    this.altstack = state.altstack;
     this.epolls = state.epolls;
   }
 
@@ -900,6 +965,31 @@ export class Kernel {
 
   /// A signal from this process to another, or to one of its own threads. A signal of zero asks
   /// whether the target is there and does nothing else.
+  /// The action a signal has here: `default`, `ignore`, or what the guest installed.
+  disposition(sig) {
+    return this.signals.get(sig) ?? "default";
+  }
+
+  /// Raise a signal on this process rather than on another one, which is what a fault does.
+  queueSignal(sig, info) {
+    if (sig < 32 && this.pendingSignals.some((p) => p.sig === sig)) return false;
+    this.pendingSignals.push({ sig, ...info });
+    return true;
+  }
+
+  /// Whether there is a signal this process may take now, which is what makes a syscall that
+  /// unblocks one hand the guest back to the host so the handler can run.
+  deliverable() {
+    return this.pendingSignals.some((p) => (this.sigblock & (1n << BigInt(p.sig - 1))) === 0n);
+  }
+
+  /// The next signal this process may take: one that is pending and not blocked.
+  takeSignal() {
+    const at = this.pendingSignals.findIndex((p) => (this.sigblock & (1n << BigInt(p.sig - 1))) === 0n);
+    if (at < 0) return null;
+    return this.pendingSignals.splice(at, 1)[0];
+  }
+
   kill(pid, sig, tid = 0) {
     if (sig < 0 || sig > 64) return -EINVAL;
     // What the signal does is the *target's* business, so the disposition is the host's to look up.
@@ -1688,35 +1778,121 @@ export class Kernel {
     // A signal to the calling process itself is the way a program kills itself, so a call that ends
     // the caller has to end the wasm run too rather than answer and carry on.
     const stopped = (k, answer) => [BigInt(answer), k.exited !== null ? 1 : 0];
-    this.on(129, (k, pid, sig) => stopped(k, k.kill(Number(BigInt.asIntN(32, pid)), Number(sig)))); // kill
-    this.on(130, (k, tid, sig) => stopped(k, k.kill(0, Number(sig), Number(BigInt.asIntN(32, tid))))); // tkill
+    // A signal this process sent itself runs its handler before the syscall answers, and the frame
+    // has to hold the state the call leaves behind: building it needs the host, so the answer goes
+    // through `resume` like any other one the host owes the guest.
+    const killed = (k, answer) => {
+      if (answer === 0 && k.exited === null && k.pendingSignals.length > 0) {
+        return k.ask({ kind: "deliver" });
+      }
+      return stopped(k, answer);
+    };
+    this.on(129, (k, pid, sig) => killed(k, k.kill(Number(BigInt.asIntN(32, pid)), Number(sig)))); // kill
+    this.on(130, (k, tid, sig) => killed(k, k.kill(0, Number(sig), Number(BigInt.asIntN(32, tid))))); // tkill
     this.on(131, (k, tgid, tid, sig) =>
       // tgkill: the thread id names the target, and the group is a check Linux makes that this
       // kernel has nothing to check it against.
-      stopped(k, k.kill(0, Number(sig), Number(BigInt.asIntN(32, tid)))),
+      killed(k, k.kill(0, Number(sig), Number(BigInt.asIntN(32, tid)))),
     );
 
+    // `struct sigaction` is 32 bytes: the handler, the flags, the restorer and the mask.
+    const actionBytes = (k, n) => {
+      const act = k.signals.get(n);
+      const buf = Buffer.alloc(32);
+      if (!act || act === "ignore") {
+        if (act === "ignore") buf.writeBigUInt64LE(1n, 0);
+        return buf;
+      }
+      buf.writeBigUInt64LE(BigInt.asUintN(64, act.handler), 0);
+      buf.writeBigUInt64LE(BigInt.asUintN(64, BigInt(act.flags)), 8);
+      buf.writeBigUInt64LE(BigInt.asUintN(64, act.restorer), 16);
+      buf.writeBigUInt64LE(BigInt.asUintN(64, act.mask), 24);
+      return buf;
+    };
     this.on(134, (k, sig, act, old) => {
       const n = Number(sig);
       if (n < 1 || n > 64) return k.fail(EINVAL);
       // SIGKILL and SIGSTOP have no disposition to set: asking about one is fine, and setting one
       // is EINVAL.
       if ((n === 9 || n === 19) && Number(act) !== 0) return k.fail(EINVAL);
-      if (Number(old) !== 0) {
-        // `struct sigaction` is the handler, the flags, the restorer and the mask.
-        if (!k.put(Number(old), Buffer.alloc(32))) return k.fail(EFAULT);
-      }
-      if (Number(act) !== 0) {
-        const handler = Number(k.u64(act));
-        k.signals.set(n, handler === 1 ? "ignore" : "catch");
-      } else {
+      if (Number(old) !== 0 && !k.put(Number(old), actionBytes(k, n))) return k.fail(EFAULT);
+      if (Number(act) === 0) return [0n, 0];
+      const handler = k.u64(act);
+      if (handler === 0n) {
         k.signals.delete(n);
+      } else if (handler === 1n) {
+        k.signals.set(n, "ignore");
+      } else {
+        k.signals.set(n, {
+          handler,
+          flags: Number(k.u64(Number(act) + 8)),
+          restorer: k.u64(Number(act) + 16),
+          mask: k.u64(Number(act) + 24),
+        });
       }
       return [0n, 0];
     });
     this.on(135, (k, how, set, old) => {
-      if (Number(old) !== 0) k.put64(old, 0n);
+      const mask = Number(set) === 0 ? 0n : BigInt.asUintN(64, k.u64(set));
+      if (Number(old) !== 0) k.put64(old, k.sigblock);
+      const bit = (v) => BigInt.asUintN(64, v);
+      if (Number(how) === SIG_BLOCK) k.sigblock = bit(k.sigblock | mask);
+      else if (Number(how) === SIG_UNBLOCK) k.sigblock = bit(k.sigblock & ~mask);
+      else k.sigblock = mask;
+      // A signal that was waiting for this mask is taken here, before the guest runs another
+      // instruction: that is what "as soon as it is unblocked" means.
+      if (k.deliverable()) return k.ask({ kind: "deliver" });
       return [0n, 0];
+    });
+    // `sigaltstack`: a stack a handler may run on, or a request to read back what is there.
+    this.on(132, (k, ss, old) => {
+      if (Number(old) !== 0) {
+        const buf = Buffer.alloc(24);
+        buf.writeBigUInt64LE(BigInt.asUintN(64, k.altstack.sp), 0);
+        buf.writeInt32LE(k.altstack.flags, 8);
+        buf.writeBigUInt64LE(BigInt.asUintN(64, k.altstack.size), 16);
+        if (!k.put(Number(old), buf)) return k.fail(EFAULT);
+      }
+      if (Number(ss) !== 0) {
+        if (!k.inBounds(k.addr(ss), 24)) return k.fail(EFAULT);
+        const sp = k.u64(ss);
+        const flags = k.u32(Number(ss) + 8);
+        const size = k.u64(Number(ss) + 16);
+        // A stack that is being used cannot be replaced, and a new one has to be big enough to be
+        // one at all.
+        if ((k.altstack.flags & 1) !== 0) return k.fail(EPERM);
+        if (flags !== SS_DISABLE && Number(size) < 2048) return k.fail(ENOMEM);
+        k.altstack = { sp, size, flags };
+      }
+      return [0n, 0];
+    });
+    // `rt_sigreturn`: what the restorer at the end of a handler calls. The frame the kernel put on
+    // the stack says what the machine was doing when the signal arrived, so this puts the
+    // registers, the stack and the pc back; the answer it returns is the x0 the frame remembers,
+    // which the host writes for it.
+    this.on(139, (k) => {
+      const view = new DataView(k.memory.buffer);
+      const at = Number(view.getBigUint64(SHADOW_SP, true));
+      if (!k.inBounds(at, SIGFRAME.FPSIMD + 16 + 32 * 16)) return k.fail(EFAULT);
+      for (let i = 0; i < 31; i++) {
+        view.setBigUint64(i * 8, view.getBigUint64(at + SIGFRAME.SC_REGS + i * 8, true), true);
+      }
+      view.setBigUint64(SHADOW_SP, view.getBigUint64(at + SIGFRAME.SC_SP, true), true);
+      k.sigblock = view.getBigUint64(at + SIGFRAME.UC_SIGMASK, true);
+      view.setBigUint64(SHADOW_FPSR, BigInt(view.getUint32(at + SIGFRAME.FPSIMD + 8, true)), true);
+      view.setBigUint64(SHADOW_FPCR, BigInt(view.getUint32(at + SIGFRAME.FPSIMD + 12, true)), true);
+      for (let i = 0; i < 32; i++) {
+        const from = at + SIGFRAME.FPSIMD + 16 + i * 16;
+        new Uint8Array(k.memory.buffer, SHADOW_V0 + i * 16, 16).set(
+          new Uint8Array(k.memory.buffer, from, 16),
+        );
+      }
+      // Where the signal interrupted is where execution goes back to, and the host resumes at the
+      // address this leaves behind rather than after the `svc` that got here.
+      view.setUint32(SHADOW_RESUME, view.getUint32(at + SIGFRAME.SC_PC, true), true);
+      // The guest does not go on after this `svc`: it goes wherever the frame says it was, so the
+      // host is the one that resumes it, with the x0 the frame remembers as the answer.
+      return k.ask({ kind: "sigreturn", answer: view.getBigUint64(at + SIGFRAME.SC_REGS, true) });
     });
     this.on(98, (k, uaddr, op, val) => {
       // The private flag and the realtime clock are bits above the command, and the bitset forms

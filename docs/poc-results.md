@@ -66,11 +66,11 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Eighteen more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+checks on and off. Twenty more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
 memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`, which makes two names that
 differ only in case and checks they stay two files), the pages a guest may not touch
-(`tests/faults.sh`), and the socket, epoll, signal and resolver paths, each in both address-check
-modes. `bash tests/run.sh` runs all 99.
+(`tests/faults.sh`), the handler a caught signal runs (`tests/sighandler.sh`), and the socket, epoll,
+signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all 101.
 
 Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
 `printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
@@ -160,7 +160,10 @@ Two things follow.
   handler: a synchronous fault cannot be caught yet, so a program with a `SIGSEGV` handler dies.
 - **Self-modifying code and guest JITs.** Nothing invalidates a translation. Adding a page module is
   already dynamic, so invalidation has somewhere to live, but it is not implemented.
-- **Signals.** A trap kills the run instead of being delivered to a guest handler.
+- **Signals.** A handler of the guest's own runs, with the frame, the mask and the restorer a kernel
+  gives it, when a syscall is where the signal can be taken; a signal that arrives while the guest is
+  in the middle of a computation waits for the next syscall. A fault is still fatal, so a `SIGSEGV`
+  handler does not run.
 - **Threads are coroutines, and nothing has a disk.** `clone` makes a thread inside one instance with
   its own registers and stack, and the scheduler runs whichever thread asks the host for nothing; no
   thread is preempted, so a guest that spins without a syscall stalls the others. Files come from a

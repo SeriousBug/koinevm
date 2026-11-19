@@ -12,12 +12,13 @@
 // the child can run, and a deadlock is reported as one instead of hanging.
 
 import fs from "node:fs";
-import { Kernel, ECHILD, EBADF, EFAULT, ESRCH } from "./syscall.mjs";
+import { Kernel, ECHILD, EBADF, EFAULT, ESRCH, EINTR } from "./syscall.mjs";
 import { WOULD_BLOCK, ENOENT, EACCES, ELOOP } from "./files.mjs";
 import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
 import { Mach } from "./pages.mjs";
 import { PTE } from "./addressspace.mjs";
+import { SIGFRAME, SA_ONSTACK, SA_SIGINFO, SI_USER, SS_DISABLE } from "./syscall.mjs";
 
 const SHADOW = 0x0;
 const SHADOW_PC = 0x108;
@@ -38,7 +39,7 @@ const ENOEXEC = 8;
 
 /// The signals whose default action is to end the process. The rest either do nothing - SIGCHLD,
 /// SIGURG, SIGWINCH - or stop it, which a coroutine has no way to be.
-const FATAL = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 13, 14, 15, 16, 24, 25, 26, 31]);
+const FATAL = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 25, 26, 31]);
 for (let sig = 32; sig <= 64; sig++) FATAL.add(sig);
 
 export class Session {
@@ -216,6 +217,21 @@ export class Session {
           ` resume=0x${v.getUint32(SHADOW_RESUME, true).toString(16)} x0=0x${v.getBigUint64(0, true).toString(16)}`,
       );
     }
+    // A signal is taken before the guest runs again, which is the only moment its whole state is
+    // in the shadow: the last return from a region put it there.
+    const entry = proc.kernel.takeSignal();
+    if (entry) {
+      if (thread.pending) {
+        // The call it was waiting on is interrupted rather than restarted: the handler runs first,
+        // and the frame remembers the -EINTR the guest will find when it returns.
+        thread.pending = null;
+        thread.state = "runnable";
+        thread.blockedOn = 0;
+        thread.waitingFor = null;
+        proc.mach.view.setBigInt64(0, -EINTR, true);
+      }
+      this.deliver(proc, entry);
+    }
     // A syscall that was waiting is answered here, not by running the guest's code again: the
     // function it was in pushed a frame before the svc, and a second entry would push another.
     if (thread.pending) {
@@ -325,6 +341,10 @@ export class Session {
         return this.futex(proc, thread, request);
       case "sleep":
         return this.sleepFor(proc, thread, request);
+      case "deliver":
+        return this.deliverRequest(proc, thread, request);
+      case "sigreturn":
+        return this.resume(proc, thread, request.answer);
       default:
         console.error(`armjit: pid ${proc.pid} asked for an unknown host action ${request.kind}`);
         return 1;
@@ -342,6 +362,86 @@ export class Session {
     }
     proc.fault = { signal: fault.signal, addr: fault.addr, at: fault.at };
     return this.exit(proc, 0, fault.signal);
+  }
+
+  /// Hand the process the next signal it may take. The frame goes on the guest's stack, in the
+  /// shape the kernel builds one, and the handler starts with the registers a call to it would
+  /// have: the signal number, and the two pointers when the disposition asked for them.
+  deliver(proc, entry) {
+    const kernel = proc.kernel;
+    const view = new DataView(proc.memory.buffer);
+    const act = kernel.disposition(entry.sig);
+    if (!act || act === "ignore" || act === "default") return false;
+    const handler = Number(BigInt.asUintN(64, act.handler));
+    if (handler === 0) return false;
+
+    const sp = view.getBigUint64(0xf8, true);
+    const alt = kernel.altstack;
+    const onAlt = (Number(act.flags) & SA_ONSTACK) !== 0 && alt.flags !== SS_DISABLE;
+    const top = onAlt ? BigInt.asUintN(64, alt.sp) + BigInt.asUintN(64, alt.size) : sp;
+    const at = Number((top - BigInt(SIGFRAME.SIZE)) & ~15n);
+    if (!kernel.inBounds(at, SIGFRAME.SIZE)) {
+      // A signal whose frame cannot be built is one the process does not survive: that is what a
+      // stack overflow does on a real kernel.
+      return false;
+    }
+
+    const frame = Buffer.alloc(SIGFRAME.SIZE);
+    frame.writeInt32LE(entry.sig, SIGFRAME.SI_SIGNO);
+    frame.writeInt32LE(entry.code ?? SI_USER, SIGFRAME.SI_CODE);
+    if (entry.addr !== undefined) {
+      frame.writeBigUInt64LE(BigInt.asUintN(64, BigInt(entry.addr)), SIGFRAME.SI_ADDR);
+      frame.writeBigUInt64LE(BigInt.asUintN(64, BigInt(entry.addr)), SIGFRAME.SC_FAULT);
+    } else {
+      frame.writeInt32LE(entry.pid ?? proc.pid, SIGFRAME.SI_PID);
+      frame.writeInt32LE(entry.uid ?? 0, SIGFRAME.SI_UID);
+    }
+    // `ucontext`: what the machine was doing, so the restorer can put it back.
+    frame.writeBigUInt64LE(BigInt.asUintN(64, alt.sp), SIGFRAME.UC_STACK);
+    frame.writeInt32LE(alt.flags, SIGFRAME.UC_STACK + 8);
+    frame.writeBigUInt64LE(BigInt.asUintN(64, alt.size), SIGFRAME.UC_STACK + 16);
+    frame.writeBigUInt64LE(kernel.sigblock, SIGFRAME.UC_SIGMASK);
+    for (let i = 0; i < 31; i++) {
+      frame.writeBigUInt64LE(view.getBigUint64(i * 8, true), SIGFRAME.SC_REGS + i * 8);
+    }
+    frame.writeBigUInt64LE(sp, SIGFRAME.SC_SP);
+    frame.writeUInt32LE(view.getUint32(0x118, true), SIGFRAME.SC_PC); // resume after the `svc`
+    frame.writeUInt32LE(0, SIGFRAME.SC_PSTATE);
+    // `struct fpsimd_context`: the magic the kernel writes there, its size, and the state.
+    frame.writeUInt32LE(0x46508001, SIGFRAME.FPSIMD);
+    frame.writeUInt32LE(16 + 32 * 16, SIGFRAME.FPSIMD + 4);
+    frame.writeUInt32LE(Number(view.getBigUint64(0x128, true)), SIGFRAME.FPSIMD + 8);
+    frame.writeUInt32LE(Number(view.getBigUint64(0x120, true)), SIGFRAME.FPSIMD + 12);
+    for (let i = 0; i < 32; i++) {
+      const from = 0x600 + i * 16;
+      frame.set(new Uint8Array(proc.memory.buffer, from, 16), SIGFRAME.FPSIMD + 16 + i * 16);
+    }
+    kernel.put(at, frame);
+
+    // The handler runs on that frame, with the mask the disposition asks for while it is there.
+    view.setBigUint64(0xf8, BigInt(at), true);
+    view.setBigUint64(0, BigInt(entry.sig), true);
+    const info = Number(act.flags) & SA_SIGINFO ? BigInt(at) : 0n;
+    view.setBigUint64(8, info, true);
+    view.setBigUint64(16, info === 0n ? 0n : BigInt(at + SIGFRAME.UC), true);
+    view.setBigUint64(30 * 8, BigInt.asUintN(64, act.restorer), true);
+    view.setUint32(0x108, handler >>> 0, true);
+    const bit = 1n << BigInt(entry.sig - 1);
+    kernel.sigblock = BigInt.asUintN(64, kernel.sigblock | BigInt.asUintN(64, act.mask) | bit);
+    if (process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(`signal: ${proc.pid} runs the handler for ${entry.sig} at 0x${handler.toString(16)}`);
+    }
+    return true;
+  }
+
+  /// A signal this process raised on itself, taken before the syscall's answer reaches the guest:
+  /// the handler runs first and the frame it returns through holds the state the call left, so the
+  /// answer is the one the guest finds when the handler returns.
+  deliverRequest(proc, thread, request) {
+    this.resume(proc, thread, Number(request.answer ?? 0));
+    const entry = proc.kernel.takeSignal();
+    if (entry) this.deliver(proc, entry);
+    return 0;
   }
 
   /// A signal from one process to another. There is no handler to run, so what a signal does is
@@ -373,12 +473,20 @@ export class Session {
     for (const { proc, thread } of live) {
       if (proc.state === "exited") continue;
       // The disposition is the target's, and SIGKILL and SIGSTOP have none to consult.
-      const how = sig === 9 || sig === 19 ? "default" : (proc.kernel.signals.get(sig) ?? "default");
+      const how = sig === 9 || sig === 19 ? "default" : proc.kernel.disposition(sig);
       if (how === "ignore") continue;
-      if (how === "catch") {
-        // The handler is guest code, and entering it is not something this kernel can do. The signal
-        // stops here rather than ending a process that asked to survive it.
-        if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`signal: ${sig} to ${proc.pid} caught, not run`);
+      if (how !== "default") {
+        proc.kernel.queueSignal(sig, { code: SI_USER, pid: from, uid: 0 });
+        // A thread parked on a syscall has to wake up to see the signal, and the call it was in
+        // answers EINTR: that is the whole point of a handler.
+        const parked = thread ?? proc.threads.find((t) => t.state !== "exited");
+        if (parked && parked.state === "blocked") {
+          parked.state = "runnable";
+          parked.blockedOn = 0;
+          parked.waitingFor = null;
+        }
+        this.wake(proc);
+        this.poll();
         continue;
       }
       if (!FATAL.has(sig)) continue;

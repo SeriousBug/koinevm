@@ -1,0 +1,20 @@
+ok   a handler is installed
+ok   and reads back as the same one
+ok   a signal sent to itself is taken
+ok   the handler ran
+ok   with the signal number in the first argument
+ok   and again on the next one
+ok   a signal can be blocked
+ok   a blocked signal is accepted
+ok   and does not run while it is blocked
+ok   the block is in the mask
+ok   unblocking it
+ok   runs it, at the first moment the guest is at a signal's mercy
+ok   and leaves the mask as it was apart from the block
+ok   which was clear to begin with
+ok   a three-argument handler is installed
+ok   a signal reaches it
+ok   the three-argument handler ran
+ok   with the signal number
+ok   and the sender it came from
+sighandler: all checks passed
