@@ -14,6 +14,7 @@ process and the ABI contract, and `docs/prior-art.md` for the survey.
     cargo build --release
     ./target/release/armjit translate tests/guest/call.elf -o /tmp/call.wasm
     node run.mjs /tmp/call.wasm                     # prints, exits with the guest's exit code
+    just console                                    # a bash prompt at this terminal
 
 Flags: `--bounds=check|trust` (per-access address checks), `--mem-pages=N` (default 65535, i.e. 4 GiB
 less a page), `--trace` (per-instruction pc and register trace on a trap), `--argv=a,b`, `--env=k=v`.
