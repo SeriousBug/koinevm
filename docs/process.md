@@ -41,6 +41,25 @@ one is already pending is coalesced. A `SIGPIPE` is not raised when a guest writ
 reads: the write answers `EPIPE` instead, which is what a program that had ignored `SIGPIPE` would
 see.
 
+## Preemption
+
+Nothing outside a running wasm function can stop it: V8's epoch interruption is not available to an
+embedder that is not a browser, so a preemption point has to be in the translated code. It goes at
+backward branches, which is the only place a guest can stay in one region for ever: a decrement of a
+counter held in a wasm global, a branch past the rest while it is not zero, and a call into the host
+at zero, where a pending signal is delivered or another coroutine is picked. Straight-line code is
+finite, and a call or a return already leaves the region through the dispatcher, which is a safe
+point for free.
+
+Preempting anywhere else would mean splitting an `ldxr`/`stxr` pair or a lock acquisition from its
+release, which the ABI lets a kernel do only because it can look at the instruction it interrupted.
+
+The cost is a few instructions per taken back edge, and it is not always necessary: a loop whose
+bound is provable at translation time cannot run for ever, so it can be emitted twice, once
+instrumented and once not, behind a test that picks the version whose bound it established. That is
+worth doing where the loop body is small enough that the poll is a measurable share of it, and it is
+not written yet.
+
 ## Waiting for descriptors
 
 `ppoll`, `pselect6` and `epoll_pwait` ask the same question - is this descriptor ready - and the
