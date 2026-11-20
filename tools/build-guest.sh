@@ -116,6 +116,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/smc.c -o tests/guest/smc.o
 python3 tools/minilink.py tests/guest/smc.o tests/guest/smc.elf _start
 
+echo "== guest: proc (the machine's own files) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
+    -c tests/guest/proc.c -o tests/guest/proc.o
+python3 tools/minilink.py tests/guest/proc.o tests/guest/proc.elf _start
+
 echo "== guest: jit (a page the guest writes and runs, with no file behind it) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/jit.c -o tests/guest/jit.o

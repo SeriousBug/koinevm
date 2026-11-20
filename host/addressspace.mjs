@@ -73,6 +73,10 @@ export class AddressSpace {
     /// it has to look. It starts at what the image and the stack already claim, which the page
     /// table in memory says.
     this.mapped = new Array(this.chunks).fill(0);
+    /// How many pages have a mapping on them, kept as the table changes: a space this machine does
+    /// not swap, so every page a program has mapped is a page that is there. `/proc` calls it
+    /// resident.
+    this.resident = 0;
     for (let k = 0; k < this.chunks; k++) {
       const base = k << 20;
       for (let p = base + (1 << 20) - 1; p >= base; p--) {
@@ -80,6 +84,9 @@ export class AddressSpace {
           this.mapped[k] = p - base + 1;
           break;
         }
+      }
+      for (let p = base; p < base + this.mapped[k]; p++) {
+        if (this.ptes[p] & PTE.MAPPED) this.resident++;
       }
     }
     // Which file each mapping came from. A jump into one of these is a page this machine has not
@@ -222,7 +229,10 @@ export class AddressSpace {
   setPtes(lo, hi, bits) {
     const first = pageOf(lo);
     const last = pageOf(roundUp(hi, PAGE));
-    for (let p = first; p < last; p++) this.ptes[p] |= bits;
+    for (let p = first; p < last; p++) {
+      if (bits & PTE.MAPPED && (this.ptes[p] & PTE.MAPPED) === 0) this.resident++;
+      this.ptes[p] |= bits;
+    }
     for (let p = first; p < last; ) {
       const chunk = Math.floor(p / (1 << 20));
       const stop = Math.min(last, (chunk + 1) << 20);
@@ -232,7 +242,10 @@ export class AddressSpace {
   }
 
   clearPtes(lo, hi) {
-    for (let p = pageOf(lo); p < pageOf(roundUp(hi, PAGE)); p++) this.ptes[p] = 0;
+    for (let p = pageOf(lo); p < pageOf(roundUp(hi, PAGE)); p++) {
+      if (this.ptes[p] & PTE.MAPPED) this.resident--;
+      this.ptes[p] = 0;
+    }
   }
 
   /// Whether every byte of `[lo, hi)` is unmapped. A span never crosses from one memory into the

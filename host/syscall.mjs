@@ -8,6 +8,7 @@ import { randomFillSync } from "node:crypto";
 import fs from "node:fs";
 import { AddressSpace, CHUNK, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
 import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK, O_WRONLY, O_RDWR, terminal } from "./files.mjs";
+import { procFile, procLink } from "./proc.mjs";
 import { Usage, rusageBytes, tmsBytes } from "./usage.mjs";
 import {
   Net,
@@ -154,9 +155,17 @@ export class Kernel {
     this.pid = options.pid ?? 1;
     this.ppid = options.ppid ?? 0;
     this.space = new AddressSpace(memories, meta);
+    /// Where the tree lives on this machine, which is what a guest path is inside: a program that
+    /// reads the name of its own binary out of `/proc` gets the path it can open.
+    this.rootfs = options.rootfs ?? null;
     this.files =
       options.files ??
-      new Files(options.rootfs, { virtual: options.resolver?.files(options.rootfs), pid: this.pid });
+      new Files(options.rootfs, {
+        virtual: options.resolver?.files(options.rootfs),
+        pid: this.pid,
+        proc: (name) => procFile(this, name),
+        procTarget: (name) => procLink(this, name),
+      });
     this.exited = null;
     /// `exit` ends one thread and `exit_group` ends them all, so the host has to know which.
     this.exitedGroup = false;

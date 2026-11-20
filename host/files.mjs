@@ -238,6 +238,11 @@ export class Files {
     /// Files this kernel has that the tree does not. A rootfs unpacked by `apt` has an empty
     /// `/etc/resolv.conf`, and a program that resolves a name still needs one to read.
     this.virtual = options.virtual ?? new Map();
+    /// Files this kernel synthesizes rather than reads: `/proc`, where a program asks the machine
+    /// about itself. `proc(name)` answers the bytes for a guest path, or null for a name that is not
+    /// one of them, and `procTarget(name)` answers where one of the links in there points.
+    this.proc = options.proc ?? (() => null);
+    this.procTarget = options.procTarget ?? (() => null);
     this.map = new Map();
     this.next = 3;
     this.seed = 1;
@@ -388,6 +393,33 @@ export class Files {
     return this.resolve(name.startsWith("/") ? name : `${base}/${name}`, follow);
   }
 
+  /// The contents of a file this kernel synthesizes, or null.
+  procFile(guestPath) {
+    return this.proc(this.guestPath(guestPath));
+  }
+
+  /// The metadata of one of them: a read-only file that is not in the tree.
+  procStat(guestPath) {
+    const bytes = this.procFile(guestPath);
+    if (!bytes) return null;
+    return { mode: 0o100444n, nlink: 1n, size: BigInt(bytes.length), ino: 4n, dev: 0n, rdev: 0n, blksize: 4096n };
+  }
+
+  /// The metadata of one of the links in there, for a name that is a link rather than a file.
+  procLinkStat(guestPath) {
+    const target = this.procTarget(this.guestPath(guestPath));
+    if (target === null) return null;
+    return {
+      mode: 0o120777n,
+      nlink: 1n,
+      size: BigInt(Buffer.byteLength(target)),
+      ino: 5n,
+      dev: 0n,
+      rdev: 0n,
+      blksize: 4096n,
+    };
+  }
+
   /// The contents of a file this kernel provides rather than the tree, or null.
   virtualFile(guestPath) {
     return this.virtual.get(this.guestPath(guestPath)) ?? null;
@@ -504,6 +536,19 @@ export class Files {
 
   open(guestPath, flags, mode, dirfd = AT_FDCWD) {
     const name = this.guestPath(guestPath);
+    const made = this.procFile(name);
+    if (made) {
+      if ((flags & O_ACCMODE) !== 0 || (flags & O_TRUNC)) return -EROFS;
+      return this.add({
+        kind: "file",
+        host: null,
+        virtual: made,
+        guest: name,
+        size: made.length,
+        desc: { pos: 0, readable: true, writable: false },
+        cloexec: (flags & O_CLOEXEC) !== 0,
+      });
+    }
     const virtual = this.virtual.get(name) ?? null;
     if (virtual) {
       if ((flags & O_ACCMODE) !== 0 || (flags & O_TRUNC)) return -EROFS;
@@ -970,6 +1015,8 @@ export class Files {
   }
 
   statPath(guestPath, dirfd = AT_FDCWD) {
+    const made = this.procStat(guestPath) ?? this.procLinkStat(guestPath);
+    if (made) return made;
     const virtual = this.virtualStat(guestPath);
     if (virtual) return virtual;
     const host = this.resolveAt(guestPath, dirfd, false);
@@ -982,6 +1029,8 @@ export class Files {
   }
 
   statFile(guestPath, dirfd = AT_FDCWD) {
+    const made = this.procStat(guestPath) ?? this.procLinkStat(guestPath);
+    if (made) return made;
     const virtual = this.virtualStat(guestPath);
     if (virtual) return virtual;
     const proc = this.procFd(guestPath);
@@ -1045,6 +1094,8 @@ export class Files {
   }
 
   readlink(guestPath, dirfd = AT_FDCWD) {
+    const link = this.procTarget(this.guestPath(guestPath));
+    if (link !== null) return link;
     const proc = this.procFd(guestPath);
     if (proc) return this.fdName(proc.entry);
     const host = this.resolveAt(guestPath, dirfd, false);

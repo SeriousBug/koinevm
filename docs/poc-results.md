@@ -64,7 +64,12 @@ so a library the loader maps while it runs executes without being known in advan
   and the page table maintained in guest memory, and `sysinfo` answering the ranges a run can still
   allocate. Files: `openat`, `close`, `read`, `pread64`, `readv`, `preadv`, `write`, `writev`,
   `lseek`, `fstat`, `newfstatat`, `readlinkat`, `faccessat`, `getcwd`, `ioctl`, resolved inside a
-  root filesystem directory. Waiting and counting: `pipe2`, `eventfd`/`eventfd2`, `signalfd4`,
+  root filesystem directory. `/proc` is synthesized rather than read: `self/stat` with its fifty-two
+  fields, `self/statm`, `self/status`, `self/cmdline` and `self/environ` read back out of the stack a
+  kernel built them on, `self/maps` from the address space, and the machine's own `cpuinfo`, `stat`,
+  `meminfo`, `uptime`, `version`, `loadavg` and `sys/kernel` and `sys/vm`. The resident count is the
+  pages the page table has mapped, kept as the table changes, which is what a space that does not
+  swap has. Waiting and counting: `pipe2`, `eventfd`/`eventfd2`, `signalfd4`,
   `ppoll`, `epoll_*`, `futex` with both shapes of deadline and the requeue forms, `getrusage`,
   `times`. Start-up: `set_tid_address`, `set_robust_list`, `uname`, `clock_gettime`,
   `clock_getres`, `getrandom`, `prlimit64`, `sched_getaffinity`, `getuid` family, `rt_sigaction`,
@@ -291,6 +296,10 @@ Two things follow.
   gives it, when a syscall is where the signal can be taken; a signal that arrives while the guest is
   in the middle of a computation waits for the next syscall. A fault is still fatal, so a `SIGSEGV`
   handler does not run.
+- **`/proc` is the files a kernel keeps there, not the tree.** A program that reads one of them
+  gets the shape and the numbers above, and `self/exe` is a link to the path the guest can open. What
+  is missing is the listing: `/proc` and `/proc/self` are not directories here, so `ls` of them
+  finds nothing, and a process cannot see another process's files.
 - **Job control.** One console and one process group: `Ctrl-Z`, `fg`, `jobs`, and a window that is
   resized (`SIGWINCH`) are not there, so a stopped job cannot be resumed. And the console's interrupt
   reaches the processes that take the default action for it: the shell catches it so that it can
