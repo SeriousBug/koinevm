@@ -98,6 +98,8 @@ What a static hello-world touches: a hand-written entry uses `write` (64) and `e
 
 **(a)** The ceiling also forces a fixed layout with no address randomisation (there is no room to spread mappings over the real 2^47 user range), an arena for `mmap` that the implementation chooses and enforces, and an answer for programs that need more than 4 GiB, which is wasm's 64-bit memory, a different feature set that not every engine offers.
 
+Answered by the implementation: the address space is a sequence of memories instead. A chunk is exactly 2^32 bytes, so the top bits of an address name the memory and the low 32 bits the offset in it, and the page table stays one table because a chunk is exactly 2^20 pages. A branch on the chunk number - absent when there is one chunk - is the whole cost of an access above the first memory, and wasm's multi-memory instruction form names the memory, so the access itself is the same load or store. What this does not lift is the ceiling on one mapping: a contiguous reservation larger than 4 GiB still has nowhere to go until an engine ships 64-bit memories.
+
 ## 5. Code translation and dispatch
 
 A translation unit is a maximal straight run of instructions with one entry and one exit, the exit being a terminator: direct branch, indirect branch, call, return, syscall, or an instruction the implementation refuses. Units are cut by the decoder, not by the binary's symbols, and a unit is identified by the address of its first instruction.

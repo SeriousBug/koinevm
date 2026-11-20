@@ -156,9 +156,10 @@ pub mod trap {
     pub const EXEC: i32 = 6;
 }
 
-/// 4 GiB less a page: every guest address is then checked by the engine itself, and an address in
-/// the last page traps rather than aliasing.
-pub const DEFAULT_MEM_PAGES: u32 = 65535;
+/// Two 4 GiB memories: the address space is twice what a wasm32 memory holds, which is what a
+/// program that reserves a region of its own - a runtime's heap cage, a code range, a guard - needs
+/// on top of everything else. An address that is not in the space traps rather than aliasing.
+pub const DEFAULT_MEM_PAGES: u32 = 131072;
 pub const STACK_RESERVE: u64 = 8 * 1024 * 1024;
 
 /// A wasm32 linear memory holds at most 4 GiB, so a guest address space bigger than that is a

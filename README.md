@@ -16,8 +16,9 @@ process and the ABI contract, and `docs/prior-art.md` for the survey.
     node run.mjs /tmp/call.wasm                     # prints, exits with the guest's exit code
     just console                                    # a bash prompt at this terminal
 
-Flags: `--bounds=check|trust` (per-access address checks), `--mem-pages=N` (default 65535, i.e. 4 GiB
-less a page), `--trace` (per-instruction pc and register trace on a trap), `--argv=a,b`, `--env=k=v`.
+Flags: `--bounds=check|trust` (per-access address checks), `--mem-pages=N` (default 131072, i.e.
+8 GiB of address space in two wasm memories of 4 GiB each), `--trace` (per-instruction pc and
+register trace on a trap), `--argv=a,b`, `--env=k=v`.
 `armjit dump <elf>` prints the decoded instruction stream, `ARMJIT_DUMP_REGIONS=1` prints regions and
 blocks.
 

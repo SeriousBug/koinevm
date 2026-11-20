@@ -30,10 +30,18 @@ so a library the loader maps while it runs executes without being known in advan
   that looks the pc up in an open-addressed table (a slot is `pc >> 2`'s tag plus `region, block`),
   so wasm stack depth is constant, guest recursion is bounded by the guest stack in linear memory,
   and code from images at unrelated addresses costs nothing extra.
-- A fixed address space plan, because the guest's whole map is the linear memory: control block,
-  a soft page table of one byte per 4 KiB page, the dispatch table, images from 4 MiB, heap above
-  the images, stack at the top. The translator fills in the page table for what it maps; `mmap` and
-  `mprotect` will maintain the rest.
+- A fixed address space plan, because the guest's whole map is linear memory: control block, the
+  dispatch table, images from 4 MiB, heap above the images, `mmap` arena from 1 GiB, a soft page
+  table of one byte per 4 KiB page and the stack just below the top. The translator fills in the
+  page table for what it maps; `mmap` and `mprotect` maintain the rest.
+- More than 4 GiB of address space, which one wasm32 memory cannot hold: a chunk is exactly 2^32
+  bytes and the address space is a sequence of them, with the top bits of an address naming the
+  memory and the low 32 bits the offset inside it. The module imports one memory per chunk and
+  exports each of them, the page table is one table for all of them (a chunk is exactly 2^20 pages,
+  so `addr >> 12` indexes it whatever chunk the address is in), and the arena of every chunk above
+  the first is all of it. An access inside the first 4 GiB is the inline sequence; past it the
+  chunk number picks the memory, which wasm names in the instruction rather than taking off the
+  stack, so the access becomes a call to one helper per access shape. The default is two chunks.
 - Translation on demand: `armjit page` reads `page <elf> <base> <address>` requests and answers with a
   module that imports the host's memory and exports the regions it found, plus the block starts of
   each. The host puts those functions in the running image's table, patches the dispatch table with
@@ -71,8 +79,9 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
 checks on and off. Thirty-seven more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
 memory syscalls (`tests/mem.sh`), a wait that times out and the wake that ends one
-(`tests/futex.sh`), the file syscalls (`tests/files.sh`, which makes two names that differ only in
-case and checks they stay two files), the pages a guest may not touch
+(`tests/futex.sh`), an address space of more than 4 GiB (`tests/big.sh`, every access width past the
+boundary), the file syscalls (`tests/files.sh`, which makes two names that differ only in case and
+checks they stay two files), the pages a guest may not touch
 (`tests/faults.sh`), the handler a caught signal runs (`tests/sighandler.sh`), a signal and another
 process reaching a spinning guest (`tests/poll.sh`), a guest patching its own code (`tests/smc.sh`),
 the console an interactive shell reads (`tests/console.sh`), a pseudo-terminal a program makes for a
@@ -81,7 +90,7 @@ child of its own (`tests/pty.sh`), a counted wakeup one process writes and anoth
 (`tests/random.sh`), the CPU a process, a thread and its children have used (`tests/rusage.sh`), an
 editor on top of the whole stack (`tests/nvim.sh`), and the socket,
 epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all
-117; `tests/nvim.sh` skips when the image has no `neovim` in it.
+119; `tests/nvim.sh` skips when the image has no `neovim` in it.
 
 The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
@@ -171,10 +180,19 @@ module compilation. Run it on an idle machine: contention moved every number her
 
 | configuration | time | vs native |
 |---|---|---|
-| native arm64 | 820 ms | 1.00x |
-| wasm, 4 GiB memory, per-access checks off | 1139 ms | 1.39x |
-| wasm, 4 GiB memory, per-access checks on | 1662 ms | 2.03x |
-| wasm, 64 MiB memory, per-access checks on | 1652 ms | 2.01x |
+| native arm64 | 803 ms | 1.00x |
+| wasm, 8 GiB of address space (2 chunks), checks off | 1451 ms | 1.81x |
+| wasm, 8 GiB of address space (2 chunks), checks on | 1587 ms | 1.98x |
+| wasm, 16 GiB of address space (4 chunks), checks off | 1453 ms | 1.81x |
+| wasm, 16 GiB of address space (4 chunks), checks on | 1584 ms | 1.97x |
+| wasm, 32 GiB of address space (8 chunks), checks on | 1599 ms | 1.99x |
+
+The chunk a program is not using costs nothing at run time. Every access carries one compare
+against 4 GiB when there is more than one chunk, and the branch predictor never misses it, so the
+rows above are flat from 1 to 8 chunks within the noise this machine measures at (the same
+configuration moves by 10% between runs). What does grow is the module: about 3 KiB per chunk, for
+the arms of the helpers' jump tables. The absolute numbers here are slower than the run that stood
+in this table before, on a busier machine; the shape is what it measures.
 
 Translation cost: 161 instructions of 1 region in 0.7 ms, 43 KB of wasm from 37 KB of guest. V8
 compiles that module in 0.2 ms. Most of the 0.7 ms is one pass over the 1 MiB page table, which is a
@@ -186,12 +204,12 @@ Two things follow.
    pass, no flag liveness, no block linking, and a dispatcher round trip per call and return. That is
    already inside the band that makes a browser VM usable, and near CheerpX's self-reported *best*
    case (2x-3x) rather than its typical case (5x-10x).
-2. Address validation is the single biggest cost, at 46% of runtime. With a 4 GiB linear memory the
-   engine's own bounds check guards every access for free, which is why the 4 GiB row is as fast as
-   the 64 MiB one, but it does not catch 64-bit wrap: an address at or above 4 GiB truncates and
-   aliases low memory. Catching that needs a compare per access, which is what the `check` rows pay
-   for. This is the clearest first optimization target: prove addresses in range where the source of
-   the address makes it provable, and check only the rest.
+2. Address validation is the single biggest cost, at 46% of runtime, and catching 64-bit wrap needs
+   a compare per access, which is what the `check` rows pay for. A chunk past the first is now what
+   an address above 4 GiB means, so such an address can no longer truncate and alias: it names a
+   memory this machine has or traps, and the descriptor of a program that only uses the first memory
+   pays one predictable branch. This is still the clearest first optimization target: prove
+   addresses in range where the source of the address makes it provable, and check only the rest.
 
 ## What this does not prove, in order of how much it matters
 
@@ -255,10 +273,16 @@ Two things follow.
   there is no timer interrupt. Files come from a host directory rather than a block device or an
   ext4 image, which is what `docs/fs.md` is about.
   `ptrace` is not implemented, so a debugger cannot attach.
-- **The kernel's own memory is guest-addressable.** Guest virtual addresses are linear-memory
-  offsets, so the shadow register file and the page table sit in low memory where a wild guest write
-  can reach them, and a relocation written with a zero bias would land there silently instead of
-  faulting. A real kernel keeps them out of the address space entirely.
+- **The kernel's own memory is guest-addressable.** Guest virtual addresses are offsets into the
+  same memories, so the shadow register file, the dispatch table and the page table sit in the first
+  one where a wild guest write can reach them, and a relocation written with a zero bias would land
+  there silently instead of faulting. The page table says those pages are unmapped, so a translated
+  access faults, which is what `tests/faults.sh` checks; a real kernel keeps them out of the address
+  space entirely, and giving the engine a memory of its own is the way to that.
+- **One mapping cannot cross a chunk boundary.** The address space is more than 4 GiB but no single
+  `mmap` is: a reservation larger than one memory cannot be served contiguously, so what wants the
+  whole real 2^47 user range - a sanitizer's shadow, a runtime's guard region - still does not fit,
+  and `mmap` of it answers `ENOMEM`. Anything that reserves at most 4 GiB, aligned or not, is fine.
 - **A program the size of `cc1` is a 285 MB module.** `gcc` installs, and `cc1` translates to 1373914
   blocks and 5.1 million instructions in 42039 wasm functions. The engine compiles that, but not as
   one function per region: its per-function bookkeeping grows with the square of the blocks in the

@@ -174,9 +174,9 @@ __attribute__((used)) void _start(void) {
     check(madvise(gone, 2 * PAGE, MADV_WILLNEED) == 0, "an advice that is only a hint", MADV_WILLNEED);
     check(madvise(gone, 2 * PAGE, MADV_NORMAL) == 0, "and the one for no advice at all", MADV_NORMAL);
 
-    // sysinfo: what a program sizes itself by has to be memory a run can back. The whole guest is
-    // one wasm memory of at most 4 GiB, so a total above that is a promise this machine cannot
-    // keep, and the free part has to be inside it.
+    // sysinfo: what a program sizes itself by has to be memory a run can back. The guest's address
+    // space is a few wasm memories, so the total is whatever those hold, and the free part has to
+    // be inside it rather than beside it.
     unsigned char info[112];
     check(sysinfo(info) == 0, "sysinfo", (unsigned long)info);
     unsigned long total = field64(info, 32);
@@ -184,7 +184,7 @@ __attribute__((used)) void _start(void) {
     check(field64(info, 0) <= 1UL << 20, "sysinfo uptime is seconds, not a random word",
           field64(info, 0));
     check(field32(info, 104) == 1, "sysinfo counts in bytes", field32(info, 104));
-    check(total > 0 && total <= (1UL << 32), "sysinfo total is inside the address space", total);
+    check(total > 0 && total <= (1UL << 40), "sysinfo total is a size, not a word", total);
     check(free > 0 && free <= total, "sysinfo free is inside the total", free);
 
     put(failures ? "mem: FAILURES\n" : "mem: all checks passed\n");
