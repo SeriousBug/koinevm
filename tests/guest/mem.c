@@ -148,6 +148,18 @@ __attribute__((used)) void _start(void) {
     for (unsigned long i = 0; i < 2 * PAGE; i++) clean &= again[i] == 0;
     check(clean, "remapped memory is zeroed", (unsigned long)again);
 
+    // A reservation nothing touches must not cost the memory it names: a page mapped and read
+    // again is still zero, and no page of a huge PROT_NONE range has to be written to make that
+    // true. The pointer is what a runtime's own cage is.
+    unsigned char *reserved = (void *)sc6(222, (long)(1UL << 32), (long)(1UL << 32),
+                                        0 /* PROT_NONE */, MAP_PRIVATE | MAP_ANONYMOUS | 0x4000, -1, 0);
+    check(reserved == (unsigned char *)(1UL << 32), "a 4 GiB reservation above 4 GiB", (unsigned long)reserved);
+    check(mprotect(reserved, PAGE, PROT_READ | PROT_WRITE) == 0, "and a page of it can be committed",
+          (unsigned long)reserved);
+    clean = 1;
+    for (unsigned long i = 0; i < PAGE; i++) clean &= reserved[i] == 0;
+    check(clean, "a page committed out of a reservation reads as zeros", (unsigned long)reserved);
+
     // An explicit address must be honoured, as a loader relies on.
     unsigned char *hint = mmap((void *)((unsigned long)again + 8 * PAGE), PAGE);
     check(hint == again + 8 * PAGE, "mmap honours an address", (unsigned long)hint);

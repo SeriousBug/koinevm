@@ -65,6 +65,10 @@ export class AddressSpace {
     // One table for every chunk: a chunk is exactly 2^20 pages, so an address indexes it with
     // `addr >> 12` and the high bits are already that chunk's part of it.
     this.ptes = new Uint8Array(this.memory.buffer, this.pteBase, this.chunks << 20);
+    /// Per chunk, the first page above every page that has ever been mapped. Nothing above it has
+    /// been written, so it is already zero and does not have to be written zero: a reservation of
+    /// gigabytes costs the bytes a program touches, not the bytes it names.
+    this.touched = new Array(this.chunks).fill(0);
     // Which file each mapping came from. A jump into one of these is a page this machine has not
     // translated yet, and the file is what it has to translate it from.
     this.images = [];
@@ -105,6 +109,28 @@ export class AddressSpace {
       const at = Number(addr) + done;
       const room = Math.min(CHUNK - (at % CHUNK), bytes.length - done);
       new Uint8Array(this.memoryOf(at).buffer, at % CHUNK, room).set(bytes.subarray(done, done + room));
+      done += room;
+    }
+  }
+
+  /// Clears a range that is about to be readable again: only the part of it that was mapped before
+  /// has anything in it, because a page nothing has ever mapped is still zero. The mark moves with
+  /// the mapping, so a page handed out twice is cleared the second time.
+  clear(addr, len) {
+    const at = Number(addr);
+    let done = 0;
+    while (done < len) {
+      const lo = at + done;
+      const chunk = Math.floor(lo / CHUNK);
+      const room = Math.min(CHUNK - (lo % CHUNK), len - done);
+      const first = pageOf(lo);
+      const mark = this.touched[chunk];
+      if (mark > first) {
+        const pages = Math.min(pageOf(roundUp(lo + room, PAGE)), mark) - first;
+        if (pages > 0) this.zero(lo, pages * PAGE);
+      }
+      const last = pageOf(roundUp(lo + room, PAGE));
+      if (last > this.touched[chunk]) this.touched[chunk] = last;
       done += room;
     }
   }
@@ -216,7 +242,7 @@ export class AddressSpace {
     if (len <= 0) return -EINVAL;
     const at = this.reserve(len, addr, flags & MAP.FIXED);
     if (at < 0) return at;
-    this.zero(at, len);
+    this.clear(at, len);
     if (contents) this.copyIn(at, contents.subarray(0, Math.min(contents.length, len)));
     this.setPtes(at, at + len, this.protBits(prot));
     return at;
@@ -352,7 +378,10 @@ export class AddressSpace {
     if (want === 0) return this.brk;
     if (want < this.brkBase || want > this.brkLimit) return this.brk;
     const old = this.brk;
-    if (want > old) this.setPtes(old, want, PTE.MAPPED | PTE.READABLE | PTE.WRITABLE);
+    if (want > old) {
+      this.clear(old, want - old);
+      this.setPtes(old, want, PTE.MAPPED | PTE.READABLE | PTE.WRITABLE);
+    }
     else if (want < old) this.clearPtes(want, old);
     this.brk = want;
     return want;
