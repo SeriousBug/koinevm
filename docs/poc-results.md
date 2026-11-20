@@ -41,7 +41,11 @@ so a library the loader maps while it runs executes without being known in advan
   so `addr >> 12` indexes it whatever chunk the address is in), and the arena of every chunk above
   the first is all of it. An access inside the first 4 GiB is the inline sequence; past it the
   chunk number picks the memory, which wasm names in the instruction rather than taking off the
-  stack, so the access becomes a call to one helper per access shape. The default is two chunks.
+  stack, so the access becomes a call to one helper per access shape. A mapping is free to cross
+  from one memory into the next, because the chunk comes out of the address and not out of the
+  mapping: the allocator hands out a range only where every chunk it crosses has that part of it
+  free, and the only thing that a boundary breaks is an access that straddles it, which copies its
+  bytes through the engine's scratch one at a time. The default is four chunks.
 - Translation on demand: `armjit page` reads `page <elf> <base> <address>` requests and answers with a
   module that imports the host's memory and exports the regions it found, plus the block starts of
   each. The host puts those functions in the running image's table, patches the dispatch table with
@@ -180,19 +184,20 @@ module compilation. Run it on an idle machine: contention moved every number her
 
 | configuration | time | vs native |
 |---|---|---|
-| native arm64 | 803 ms | 1.00x |
-| wasm, 8 GiB of address space (2 chunks), checks off | 1451 ms | 1.81x |
-| wasm, 8 GiB of address space (2 chunks), checks on | 1587 ms | 1.98x |
-| wasm, 16 GiB of address space (4 chunks), checks off | 1453 ms | 1.81x |
-| wasm, 16 GiB of address space (4 chunks), checks on | 1584 ms | 1.97x |
-| wasm, 32 GiB of address space (8 chunks), checks on | 1599 ms | 1.99x |
+| native arm64 | 871 ms | 1.00x |
+| wasm, 4 GiB of address space (1 chunk), checks off | 1535 ms | 1.76x |
+| wasm, 8 GiB of address space (2 chunks), checks off | 1434 ms | 1.65x |
+| wasm, 16 GiB of address space (4 chunks), checks off | 1444 ms | 1.66x |
+| wasm, 32 GiB of address space (8 chunks), checks off | 1489 ms | 1.71x |
+| wasm, 16 GiB of address space (4 chunks), checks on | 1538 ms | 1.77x |
 
 The chunk a program is not using costs nothing at run time. Every access carries one compare
 against 4 GiB when there is more than one chunk, and the branch predictor never misses it, so the
 rows above are flat from 1 to 8 chunks within the noise this machine measures at (the same
-configuration moves by 10% between runs). What does grow is the module: about 3 KiB per chunk, for
-the arms of the helpers' jump tables. The absolute numbers here are slower than the run that stood
-in this table before, on a busier machine; the shape is what it measures.
+configuration moves by 10% between runs). What does grow is the module: 49 KiB at one chunk, 57 at
+four, 66 at eight, for the arms of the helpers' jump tables and the byte-at-a-time path across a
+boundary. The absolute numbers here are slower than the run that stood in this table before, on a
+busier machine; the shape is what it measures.
 
 Translation cost: 161 instructions of 1 region in 0.7 ms, 43 KB of wasm from 37 KB of guest. V8
 compiles that module in 0.2 ms. Most of the 0.7 ms is one pass over the 1 MiB page table, which is a
@@ -279,10 +284,12 @@ Two things follow.
   there silently instead of faulting. The page table says those pages are unmapped, so a translated
   access faults, which is what `tests/faults.sh` checks; a real kernel keeps them out of the address
   space entirely, and giving the engine a memory of its own is the way to that.
-- **One mapping cannot cross a chunk boundary.** The address space is more than 4 GiB but no single
-  `mmap` is: a reservation larger than one memory cannot be served contiguously, so what wants the
-  whole real 2^47 user range - a sanitizer's shadow, a runtime's guard region - still does not fit,
-  and `mmap` of it answers `ENOMEM`. Anything that reserves at most 4 GiB, aligned or not, is fine.
+- **A reservation is bounded by the space, and starts above the first memory.** A mapping can cross
+  a chunk boundary, so the ten gigabytes a wasm engine asks for fit in the default space, guard
+  region and all. Two things still answer `ENOMEM`: a reservation bigger than everything above the
+  first memory (twelve of the default sixteen gigabytes), and one that would have to cross *out* of
+  the first memory, whose top holds the page table and the stack. The real 2^47 user range, a
+  sanitizer's shadow, is out of reach until an engine ships 64-bit memories.
 - **A program the size of `cc1` is a 285 MB module.** `gcc` installs, and `cc1` translates to 1373914
   blocks and 5.1 million instructions in 42039 wasm functions. The engine compiles that, but not as
   one function per region: its per-function bookkeeping grows with the square of the blocks in the

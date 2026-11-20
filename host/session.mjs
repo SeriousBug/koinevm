@@ -23,6 +23,8 @@ import { Usage, rusageBytes } from "./usage.mjs";
 import { SIGFRAME, SA_ONSTACK, SA_SIGINFO, SA_RESTORER, SI_USER, SS_DISABLE } from "./syscall.mjs";
 
 const SHADOW = 0x0;
+/// Where the engine's own control block ends, above the register shadow and the trace ring.
+const ENGINE_HI = 0x1000;
 const SHADOW_PC = 0x108;
 const SHADOW_RESUME = 0x118;
 const SHADOW_TP = 0x110;
@@ -959,31 +961,34 @@ export class Session {
   copyMemory(from, to) {
     const pteBase = from.meta.pte_base;
     const chunks = from.kernel.space.chunks;
-    const engine = new Uint8Array(from.memory.buffer, 0, pteBase + (chunks << 20));
-    new Uint8Array(to.memory.buffer, 0, engine.length).set(engine);
-    const ptes = new Uint8Array(from.memory.buffer, pteBase, chunks << 20);
-    let i = 0;
-    while (i < ptes.length) {
-      if (ptes[i] === 0) {
-        i++;
-        continue;
-      }
-      const lo = i;
-      while (i < ptes.length && ptes[i] !== 0) i++;
-      // Pages of one chunk together, because a run of mapped pages never crosses into another
-      // memory: the chunk boundary is where one ends.
-      let page = lo;
-      while (page < i) {
-        const chunk = Math.floor(page / (1 << 20));
-        const stop = Math.min(i, (chunk + 1) << 20);
-        const at = page * 4096;
-        const len = (stop - page) * 4096;
-        const src = from.kernel.space.memoryOf(at);
-        const dst = to.kernel.space.memoryOf(at);
-        const offset = at % CHUNK;
-        const room = Math.min(len, dst.buffer.byteLength - offset);
-        new Uint8Array(dst.buffer, offset, room).set(new Uint8Array(src.buffer, offset, room));
-        page = stop;
+    // The control block and the page table, and nothing of the arena between them: the table sits
+    // below the stack, with three gigabytes of a program's own memory in front of it.
+    const control = new Uint8Array(from.memory.buffer, 0, ENGINE_HI);
+    new Uint8Array(to.memory.buffer, 0, control.length).set(control);
+    const table = new Uint8Array(from.memory.buffer, pteBase, chunks << 20);
+    new Uint8Array(to.memory.buffer, pteBase, table.length).set(table);
+    to.kernel.space.mapped = from.kernel.space.mapped.slice();
+    to.kernel.space.touched = from.kernel.space.touched.slice();
+    const ptes = table;
+    const mapped = from.kernel.space.mapped;
+    for (let chunk = 0; chunk < chunks; chunk++) {
+      const base = chunk << 20;
+      const last = base + mapped[chunk];
+      const memory = from.kernel.space.memories[chunk];
+      const into = to.kernel.space.memories[chunk];
+      let page = base;
+      while (page < last) {
+        if (ptes[page] === 0) {
+          page++;
+          continue;
+        }
+        const lo = page;
+        while (page < last && ptes[page] !== 0) page++;
+        // One run of mapped pages, inside one memory: a length in pages times 4096 passes what a
+        // 32-bit shift can hold, so it is arithmetic.
+        const offset = (lo - base) * 4096;
+        const len = Math.min((page - lo) * 4096, into.buffer.byteLength - offset);
+        new Uint8Array(into.buffer, offset, len).set(new Uint8Array(memory.buffer, offset, len));
       }
     }
   }

@@ -65,6 +65,10 @@ const FPCR_FZ: u32 = 1 << 24;
 const FPCR_DN: u32 = 1 << 25;
 /// Where the trace writes the vector file, one 16-byte value per register.
 pub const SHADOW_V0: u64 = 0x600;
+/// The sixteen bytes an access that crosses from one memory into the next is copied through. The
+/// engine block ends at 0x1000 and nothing else lives above the vector shadow, so this costs no
+/// guest address: the page table says the page is unmapped.
+pub const SCRATCH: u64 = 0x800;
 
 pub const SHADOW: u64 = 0x0;
 pub const SHADOW_SP: u64 = SHADOW + 31 * 8;
@@ -156,10 +160,10 @@ pub mod trap {
     pub const EXEC: i32 = 6;
 }
 
-/// Two 4 GiB memories: the address space is twice what a wasm32 memory holds, which is what a
-/// program that reserves a region of its own - a runtime's heap cage, a code range, a guard - needs
-/// on top of everything else. An address that is not in the space traps rather than aliasing.
-pub const DEFAULT_MEM_PAGES: u32 = 131072;
+/// Four 4 GiB memories. A program that reserves a region of its own needs one of them for its own
+/// heap and images, and a run of free addresses above that long enough for the reservation itself:
+/// a wasm engine asks for ten gigabytes in one piece, which is every chunk but the first.
+pub const DEFAULT_MEM_PAGES: u32 = 262144;
 pub const STACK_RESERVE: u64 = 8 * 1024 * 1024;
 
 /// A wasm32 linear memory holds at most 4 GiB, so a guest address space bigger than that is a
@@ -614,7 +618,98 @@ const ACCESS_SHAPES: [Access; N_ACCESS] = [
 /// with `addr >> 12` because the bits above 32 are already that chunk's part of the table. An arm
 /// the address space does not have traps, which is what an address past the end answers with a
 /// single memory too.
-fn emit_chunk_access(m: &mut Module, ty: u32, shape: &AccessShape, plan: &Plan) -> u32 {
+/// A byte-at-a-time copy between the guest and the scratch, for an access that ends in the next
+/// memory. Every byte picks its memory from the address it lands at, which is the same rule the
+/// access itself follows, and a byte is the widest thing that cannot cross a boundary.
+fn emit_straddle(m: &mut Module, ty: u32, to_scratch: bool, chunks: u32) -> u32 {
+    let id = m.add_func(ty);
+    let f = m.func_mut(id);
+    f.locals = vec![I32, I32]; // 2 = i, 3 = the chunk it lands in
+    f.i32c(0);
+    f.ls(2);
+    f.block();
+    f.loop_();
+    // While there are bytes left.
+    f.lg(2);
+    f.lg(1);
+    f.op(I32_GE_U);
+    f.op(IF);
+    f.body.push(0x40);
+    f.br(2); // out of the block, past the loop
+    f.end();
+    f.lg(0);
+    f.lg(2);
+    f.op(I64_EXTEND_I32_U);
+    f.op(I64_ADD);
+    f.i64c(32);
+    f.op(I64_SHR_U);
+    f.wrap_i64();
+    f.ls(3);
+    for chunk in 0..chunks {
+        f.lg(3);
+        f.i32c(chunk as i32);
+        f.op(I32_EQ);
+        f.op(IF);
+        f.body.push(0x40);
+        // The offset inside that chunk's memory.
+        f.lg(0);
+        f.lg(2);
+        f.op(I64_EXTEND_I32_U);
+        f.op(I64_ADD);
+        f.wrap_i64();
+        if to_scratch {
+            f.i32c(SCRATCH as i32);
+            f.lg(2);
+            f.op(I32_ADD);
+            f.mem_at(chunk, I32_LOAD8_U, 0, 0);
+        } else {
+            f.i32c(SCRATCH as i32);
+            f.lg(2);
+            f.op(I32_ADD);
+            f.mem_at(0, I32_LOAD8_U, 0, 0);
+            f.mem_at(chunk, I32_STORE8, 0, 0);
+        }
+        f.lg(2);
+        f.i32c(1);
+        f.op(I32_ADD);
+        f.ls(2);
+        f.br(1); // the next byte
+        f.end();
+    }
+    // A chunk this machine does not have: an address past the space, which the caller's bound
+    // already refused, so this is the same trap it would have taken.
+    f.i32c(trap::RANGE);
+    f.lg(0);
+    f.lg(1);
+    f.call(1);
+    f.op(UNREACHABLE);
+    f.end();
+    f.end();
+    id
+}
+
+/// The load or store an access shape is, in the memory `memory` at offset zero. The address and the
+/// value are already on the stack.
+fn storage(f: &mut Func, shape: &AccessShape, memory: u32) {
+    if shape.vector {
+        if shape.op == simd::V128_STORE64_LANE || shape.op == simd::V128_STORE32_LANE {
+            f.simd_mem_lane_at(memory, shape.op, shape.align, 0, 0);
+        } else {
+            f.simd_mem_at(memory, shape.op, shape.align, 0);
+        }
+    } else {
+        f.mem_at(memory, shape.op as u8, shape.align, 0);
+    }
+}
+
+fn emit_chunk_access(
+    m: &mut Module,
+    ty: u32,
+    shape: &AccessShape,
+    plan: &Plan,
+    into_scratch: u32,
+    out_of_scratch: u32,
+) -> u32 {
     let id = m.add_func(ty);
     let f = m.func_mut(id);
     // The parameters: the address, the value of a store, and the pc the trap reports.
@@ -688,20 +783,40 @@ fn emit_chunk_access(m: &mut Module, ty: u32, shape: &AccessShape, plan: &Plan) 
         emit_trap(f, if shape.store { trap::WRITE } else { trap::READ });
         f.end();
 
+        // An address within one access of the end of this memory ends in the next one, and wasm
+        // names one memory per instruction: the bytes go through the scratch a byte at a time, and
+        // the access itself is the same instruction pointed at it.
+        f.lg(0);
+        f.i64c(0xffff_ffff);
+        f.op(I64_AND);
+        f.i64c(shape.width as i64);
+        f.op(I64_ADD);
+        f.i64c(1 << 32);
+        f.op(I64_GT_U);
+        f.op(IF);
+        f.body.push(if shape.store { 0x40 } else { shape.value });
+        if shape.store {
+            f.i32c(SCRATCH as i32);
+            f.lg(value);
+            storage(f, shape, 0);
+            f.lg(0);
+            f.i32c(shape.width as i32);
+            f.call(out_of_scratch);
+        } else {
+            f.lg(0);
+            f.i32c(shape.width as i32);
+            f.call(into_scratch);
+            f.i32c(SCRATCH as i32);
+            storage(f, shape, 0);
+        }
+        f.op(ELSE);
         f.lg(0);
         f.wrap_i64();
         if shape.store {
             f.lg(value);
         }
-        if shape.vector {
-            if shape.op == simd::V128_STORE64_LANE || shape.op == simd::V128_STORE32_LANE {
-                f.simd_mem_lane_at(chunk, shape.op, shape.align, 0, 0);
-            } else {
-                f.simd_mem_at(chunk, shape.op, shape.align, 0);
-            }
-        } else {
-            f.mem_at(chunk, shape.op as u8, shape.align, 0);
-        }
+        storage(f, shape, chunk);
+        f.end();
         f.ret();
     }
     // The default of the jump table: an address in a chunk this machine does not have.
@@ -741,7 +856,11 @@ fn prelude(m: &mut Module, cfg: &Config, plan: &Plan) -> Prelude {
     let umulh_id = emit_umulh(m, ty_ii_i64);
     let smulh_id = emit_smulh(m, ty_ii_i64, umulh_id);
     let mut chunks = [0u32; N_ACCESS];
+    let (mut into_scratch, mut out_of_scratch) = (0u32, 0u32);
     if plan.chunks > 1 {
+        let ty_copy = m.ty(vec![I64, I32], vec![]);
+        into_scratch = emit_straddle(m, ty_copy, true, plan.chunks);
+        out_of_scratch = emit_straddle(m, ty_copy, false, plan.chunks);
         for acc in ACCESS_SHAPES {
             let shape = acc.shape();
             let ty = if shape.store {
@@ -749,7 +868,7 @@ fn prelude(m: &mut Module, cfg: &Config, plan: &Plan) -> Prelude {
             } else {
                 m.ty(vec![I64, I32], vec![shape.value])
             };
-            chunks[acc.index()] = emit_chunk_access(m, ty, &shape, plan);
+            chunks[acc.index()] = emit_chunk_access(m, ty, &shape, plan, into_scratch, out_of_scratch);
         }
     }
     let ids = Ids {

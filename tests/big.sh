@@ -9,7 +9,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 MODES=${MODES:-"check trust"}
-PAGES=${PAGES:-131072}
+PAGES=${PAGES:-262144}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 

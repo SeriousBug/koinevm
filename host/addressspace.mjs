@@ -69,6 +69,19 @@ export class AddressSpace {
     /// been written, so it is already zero and does not have to be written zero: a reservation of
     /// gigabytes costs the bytes a program touches, not the bytes it names.
     this.touched = new Array(this.chunks).fill(0);
+    /// The same mark without the reuse: a fork copies what a chunk has mapped, and this is how far
+    /// it has to look. It starts at what the image and the stack already claim, which the page
+    /// table in memory says.
+    this.mapped = new Array(this.chunks).fill(0);
+    for (let k = 0; k < this.chunks; k++) {
+      const base = k << 20;
+      for (let p = base + (1 << 20) - 1; p >= base; p--) {
+        if (this.ptes[p] !== 0) {
+          this.mapped[k] = p - base + 1;
+          break;
+        }
+      }
+    }
     // Which file each mapping came from. A jump into one of these is a page this machine has not
     // translated yet, and the file is what it has to translate it from.
     this.images = [];
@@ -196,25 +209,53 @@ export class AddressSpace {
   }
 
   setPtes(lo, hi, bits) {
-    for (let p = pageOf(lo); p < pageOf(roundUp(hi, PAGE)); p++) this.ptes[p] |= bits;
+    const first = pageOf(lo);
+    const last = pageOf(roundUp(hi, PAGE));
+    for (let p = first; p < last; p++) this.ptes[p] |= bits;
+    for (let p = first; p < last; ) {
+      const chunk = Math.floor(p / (1 << 20));
+      const stop = Math.min(last, (chunk + 1) << 20);
+      if (stop - (chunk << 20) > this.mapped[chunk]) this.mapped[chunk] = stop - (chunk << 20);
+      p = stop;
+    }
   }
 
   clearPtes(lo, hi) {
     for (let p = pageOf(lo); p < pageOf(roundUp(hi, PAGE)); p++) this.ptes[p] = 0;
   }
 
+  /// Whether every byte of `[lo, hi)` is unmapped. A span never crosses from one memory into the
+  /// next, so a range that does is a question about each memory's part of it.
+  isFree(lo, hi) {
+    for (let at = lo; at < hi; ) {
+      const end = Math.min(hi, (Math.floor(at / CHUNK) + 1) * CHUNK);
+      if (!this.free.some((s) => s.lo <= at && end <= s.hi)) return false;
+      at = end;
+    }
+    return true;
+  }
+
+  /// Takes `[at, at + len)` out of the free list.
+  take(at, len) {
+    this.free = this.subtract(at, at + len);
+    return at;
+  }
+
   /// Take `len` bytes of the free list, at `addr` when it is fixed, else as low as it fits.
   reserve(len, addr, fixed) {
-    if (len > CHUNK) return -ENOMEM;
     if (addr !== 0 && fixed) {
-      // The range has to stay inside one memory, and a chunk boundary is where one ends.
-      if (Math.floor(addr / CHUNK) !== Math.floor((addr + len - 1) / CHUNK)) return -EINVAL;
       // MAP_FIXED puts the mapping where it says even when something else is already there, which
       // is how a loader maps each segment over the reservation it just made for the whole library.
-      if (addr < this.arenaLo || addr + len > this.arenaHi) return -ENOMEM;
-      this.free = this.subtract(addr, addr + len);
-      return addr;
+      // The arena is the first chunk below the page table, and every chunk above it.
+      const insideFirst = addr >= this.arenaLo && addr + len <= this.arenaHi;
+      const aboveFirst = addr >= CHUNK && addr + len <= this.size;
+      if (!insideFirst && !aboveFirst) return -ENOMEM;
+      return this.take(addr, len);
     }
+    // More than one memory can hold in one piece: only the chunks above the first have the room,
+    // because the first ends in the page table and the stack, and a range is only free where every
+    // chunk it crosses has its part of it free.
+    if (len > CHUNK) return this.reserveSpanning(len, addr);
     let best = -1;
     for (let i = 0; i < this.free.length; i++) {
       const s = this.free[i];
@@ -236,6 +277,24 @@ export class AddressSpace {
     return at;
   }
 
+  /// A range larger than one memory: the lowest address the whole of it is free at, or the hint
+  /// when the whole of it is free there. Nothing can cross out of the first chunk, so a range that
+  /// big starts at the second one or above.
+  reserveSpanning(len, hint) {
+    if (hint !== 0 && hint >= CHUNK && hint + len <= this.size && this.isFree(hint, hint + len)) {
+      return this.take(hint, len);
+    }
+    let best = -1;
+    for (const span of this.free) {
+      if (span.lo < CHUNK) continue;
+      if (best >= 0 && span.lo >= best) continue;
+      if (span.lo + len > this.size) continue;
+      if (this.isFree(span.lo, span.lo + len)) best = span.lo;
+    }
+    if (best < 0) return -ENOMEM;
+    return this.take(best, len);
+  }
+
   /// mmap(2) with eager contents: a file-backed mapping reads its range in now rather than on fault.
   mmap({ addr = 0, len, prot = PROT.READ | PROT.WRITE, flags = 0, contents = null }) {
     len = roundUp(len, PAGE);
@@ -254,12 +313,19 @@ export class AddressSpace {
     this.forgetImages(addr, addr + len);
     this.forget(addr, addr + len);
     this.clearPtes(addr, addr + len);
-    this.free.push({ lo: addr, hi: addr + len });
+    // A span per memory: one that crossed a boundary would be a range a program could not start
+    // inside, because a mapping is only free where each of its chunks is.
+    for (let at = addr; at < addr + len; ) {
+      const end = Math.min(addr + len, (Math.floor(at / CHUNK) + 1) * CHUNK);
+      this.free.push({ lo: at, hi: end });
+      at = end;
+    }
     this.free.sort((a, b) => a.lo - b.lo);
     const merged = [];
     for (const s of this.free) {
       const last = merged[merged.length - 1];
-      if (last && s.lo <= last.hi) last.hi = Math.max(last.hi, s.hi);
+      const sameChunk = last && Math.floor((s.hi - 1) / CHUNK) === Math.floor(last.lo / CHUNK);
+      if (last && sameChunk && s.lo <= last.hi) last.hi = Math.max(last.hi, s.hi);
       else merged.push({ ...s });
     }
     this.free = merged;
@@ -277,12 +343,11 @@ export class AddressSpace {
     const fixed = (flags & MREMAP.FIXED) !== 0;
     const mayMove = fixed || (flags & MREMAP.MAYMOVE) !== 0;
     if (newLen === oldLen && !fixed) return oldAddr;
-    // Growing where it stands: the pages just past the old range have to be nobody's.
+    // Growing where it stands: everything from the end of the old range has to be nobody's.
     if (!fixed && newLen > oldLen) {
-      const tail = this.free.find((s) => s.lo === oldAddr + oldLen);
-      if (tail && tail.lo + (newLen - oldLen) <= tail.hi) {
-        this.reserve(newLen - oldLen, oldAddr + oldLen, true);
-        this.bytes(oldAddr + oldLen, newLen - oldLen).fill(0);
+      if (this.isFree(oldAddr + oldLen, oldAddr + newLen)) {
+        this.take(oldAddr + oldLen, newLen - oldLen);
+        this.clear(oldAddr + oldLen, newLen - oldLen);
         this.setPtes(oldAddr + oldLen, oldAddr + newLen, this.ptes[pageOf(oldAddr)] & ~PTE.TRANSLATED);
         return oldAddr;
       }
@@ -291,9 +356,9 @@ export class AddressSpace {
     const at = this.reserve(newLen, fixed ? newAddr : 0, fixed);
     if (at < 0) return at;
     const keep = Math.min(oldLen, newLen);
-    const view = this.bytes(at, newLen);
-    view.fill(0);
-    view.set(this.bytes(oldAddr, keep));
+    const moved = this.copyOut(oldAddr, keep);
+    this.clear(at, newLen);
+    this.copyIn(at, moved);
     this.setPtes(at, at + newLen, this.ptes[pageOf(oldAddr)] & ~PTE.TRANSLATED);
     this.munmap(oldAddr, oldLen);
     return at;

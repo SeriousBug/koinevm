@@ -142,6 +142,41 @@ __attribute__((used)) void _start(void) {
     check(total > CHUNK, "sysinfo counts every memory", total);
     check(field64(info, 40) <= total, "and the free part is inside it", field64(info, 40));
 
+    // A mapping bigger than one memory: the address space is a sequence of them, and a run of
+    // addresses that crosses from one into the next is one mapping to the program that asked for
+    // it. Every access at the seam has to work, including one that starts in one memory and ends
+    // in the other - 16 bytes at 8 GiB - 8, an 8-byte load at 8 GiB - 4, and a copy across it.
+    unsigned long wide_len = CHUNK + CHUNK / 4;
+    unsigned char *wide = mmap((void *)(2 * CHUNK), wide_len);
+    check(wide == (unsigned char *)(2 * CHUNK), "a mapping bigger than one memory", (unsigned long)wide);
+    unsigned long base = (unsigned long)wide;
+    check(base / CHUNK != (base + wide_len - 1) / CHUNK, "and it covers a seam",
+          (base + wide_len - 1) / CHUNK - base / CHUNK);
+    unsigned long seam = (base / CHUNK + 1) * CHUNK;
+    *(volatile unsigned long *)(seam - 4) = 0x1122334455667788UL;
+    check(*(volatile unsigned long *)(seam - 4) == 0x1122334455667788UL,
+          "a store that starts in one memory and ends in the next", *(unsigned long *)(seam - 4));
+    __asm__ volatile("movi v2.2d, #0\n\t"
+                     "mov v2.d[0], %1\n\t"
+                     "mov v2.d[1], %2\n\t"
+                     "str q2, [%0]\n\t"
+                     "ldr q3, [%0]"
+                     : : "r"(seam - 8), "r"(0x0011223344556677UL), "r"(0x8899aabbccddeeffUL)
+                     : "v2", "v3", "memory");
+    check(*(volatile unsigned long *)(seam - 8) == 0x0011223344556677UL &&
+              *(volatile unsigned long *)seam == 0x8899aabbccddeeffUL,
+          "a 128-bit store across the seam", *(unsigned long *)(seam - 8));
+    for (int i = 0; i < 32; i++) *(volatile unsigned char *)(seam + 16 + i) = (unsigned char)(0x40 + i);
+    for (int i = 0; i < 32; i++) *(volatile unsigned char *)(seam - 16 + i) =
+        *(volatile unsigned char *)(seam + 16 + i);
+    int copied = 1;
+    for (int i = 0; i < 32; i++)
+        copied &= *(volatile unsigned char *)(seam - 16 + i) == (unsigned char)(0x40 + i);
+    check(copied, "a copy that crosses the seam", seam);
+    check(*(volatile unsigned long *)(base + wide_len - 8) == 0,
+          "and the far end of the mapping is there and zero", *(unsigned long *)(base + wide_len - 8));
+    check(munmap(wide, wide_len) == 0, "munmap of a range that crosses a boundary", base);
+
     // Unmapping and mapping again above the boundary works the same way.
     check(munmap(p, 2 * PAGE) == 0, "munmap above 4 GiB", (unsigned long)p);
     unsigned char *again = mmap((void *)HINT, 2 * PAGE);
