@@ -833,7 +833,7 @@ fn emit_chunk_access(
     id
 }
 
-fn prelude(m: &mut Module, cfg: &Config, plan: &Plan) -> Prelude {
+fn prelude(m: &mut Module, cfg: &Config, plan: &Plan, import_helpers: bool) -> Prelude {
     let mut region_params = vec![I64; NR as usize];
     region_params.extend(vec![V128; NVEC as usize]);
     region_params.push(I32); // entry block
@@ -861,11 +861,28 @@ fn prelude(m: &mut Module, cfg: &Config, plan: &Plan) -> Prelude {
         None
     };
 
+    let mut chunks = [0u32; N_ACCESS];
+    // A page translated while the guest runs takes the image's helpers: it is the same code, and
+    // at sixty-four chunks the arms of the jump tables are two thirds of a page module. They are
+    // imported here, before any function is defined, because an import comes first in the function
+    // index space and `add_func` counts the imports that exist when it runs.
+    if plan.chunks > 1 && import_helpers {
+        for acc in ACCESS_SHAPES {
+            let shape = acc.shape();
+            let ty = if shape.store {
+                m.ty(vec![I64, shape.value, I32], vec![])
+            } else {
+                m.ty(vec![I64, I32], vec![shape.value])
+            };
+            let index = m.n_imports();
+            m.imports.push(Import { module: "env".into(), name: helper_name(acc), ty });
+            chunks[acc.index()] = index;
+        }
+    }
     let umulh_id = emit_umulh(m, ty_ii_i64);
     let smulh_id = emit_smulh(m, ty_ii_i64, umulh_id);
-    let mut chunks = [0u32; N_ACCESS];
     let (mut into_scratch, mut out_of_scratch) = (0u32, 0u32);
-    if plan.chunks > 1 {
+    if plan.chunks > 1 && !import_helpers {
         let ty_copy = m.ty(vec![I64, I32], vec![]);
         into_scratch = emit_straddle(m, ty_copy, true, plan.chunks);
         out_of_scratch = emit_straddle(m, ty_copy, false, plan.chunks);
@@ -992,7 +1009,7 @@ pub fn translate(
         m.exports.push(mem_export(k));
     }
 
-    let Prelude { ids, ty_region } = prelude(&mut m, cfg, &plan);
+    let Prelude { ids, ty_region } = prelude(&mut m, cfg, &plan, false);
     let ty_run = m.ty(vec![I32, I64, I32], vec![I32]);
 
     // The dispatch table is built once the regions are emitted, and only the run loop reads its
@@ -1050,6 +1067,12 @@ pub fn translate(
 
     m.exports.push(("run".into(), 0, run_id));
     m.exports.push(("tbl".into(), 1, 0));
+    // What a page translated at run time calls, so that it carries no helpers of its own.
+    if plan.chunks > 1 {
+        for acc in ACCESS_SHAPES {
+            m.exports.push((helper_name(acc), 0, ids.chunks[acc.index()]));
+        }
+    }
 
     let wasm = m.encode();
     unsupported.sort();
@@ -1171,6 +1194,12 @@ struct AccessShape {
     value: u8,
     store: bool,
     vector: bool,
+}
+
+/// The name a chunk helper is exported by the image and imported by a page translated later, so
+/// that no page module carries a copy of every arm.
+fn helper_name(acc: Access) -> String {
+    format!("chunk{}", acc.index())
 }
 
 impl Access {
@@ -7551,7 +7580,7 @@ pub fn translate_page(
     m.mem_imports = (0..plan.chunks)
         .map(|k| ("env".to_string(), if k == 0 { "mem".to_string() } else { format!("g{k}") }))
         .collect();
-    let Prelude { ids, ty_region } = prelude(&mut m, cfg, &plan);
+    let Prelude { ids, ty_region } = prelude(&mut m, cfg, &plan, true);
     let layout = Layout {
         table_mask: 0,
         stack_floor: plan.stack_floor,

@@ -14,6 +14,9 @@ import { join } from "node:path";
 let imageSerial = 0;
 
 const SHADOW_PC = 0x108;
+/// One helper per access shape, which the image exports and a page module imports: `N_ACCESS` in
+/// src/emit.rs.
+const ACCESS_HELPERS = 23;
 const TABLE_SLOT = 8;
 
 /// The pages translated for one image generation, as modules: the same image at the same base
@@ -126,11 +129,21 @@ export class Mach {
 
   instantiate(key, source, base) {
     // The page module imports the same memories the image got: the engine's state in the first and
-    // a chunk of the guest's address space in each of the rest.
+    // a chunk of the guest's address space in each of the rest. It also imports the image's chunk
+    // helpers, which is why it carries none of its own: an arm per chunk in each of twenty-three
+    // functions is most of a page module's bytes at a big address space, and it is dead code in
+    // every page whose code stays below the first memory.
     const env = { ...this.imports, mem: this.kernel.space.memories[0] };
     this.kernel.space.memories.forEach((memory, k) => {
       if (k > 0) env[`g${k}`] = memory;
     });
+    if (this.kernel.space.chunks > 1) {
+      for (let i = 0; i < ACCESS_HELPERS; i++) {
+        const helper = this.instance.exports[`chunk${i}`];
+        if (!helper) throw new Error(`the image exports no chunk${i} helper for a page module`);
+        env[`chunk${i}`] = helper;
+      }
+    }
     const inst = new WebAssembly.Instance(source.module, { env });
     for (let i = 0; i < source.regions.length; i++) {
       this.table.set(base + i, inst.exports[`r${i}`]);

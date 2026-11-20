@@ -41,11 +41,14 @@ so a library the loader maps while it runs executes without being known in advan
   so `addr >> 12` indexes it whatever chunk the address is in), and the arena of every chunk above
   the first is all of it. An access inside the first 4 GiB is the inline sequence; past it the
   chunk number picks the memory, which wasm names in the instruction rather than taking off the
-  stack, so the access becomes a call to one helper per access shape. A mapping is free to cross
-  from one memory into the next, because the chunk comes out of the address and not out of the
-  mapping: the allocator hands out a range only where every chunk it crosses has that part of it
-  free, and the only thing that a boundary breaks is an access that straddles it, which copies its
-  bytes through the engine's scratch one at a time. The default is four chunks.
+  stack, so the access becomes a call to one helper per access shape. A page translated while the
+  guest runs imports those helpers from the image rather than carrying its own copy: the jump table
+  has an arm per chunk, and that, not the page's own code, is what a page module's bytes mostly
+  were. A mapping is free to cross from one memory into the next, because the chunk comes out of
+  the address and not out of the mapping: the allocator hands out a range only where every chunk it
+  crosses has that part of it free, and the only thing that a boundary breaks is an access that
+  straddles it, which copies its bytes through the engine's scratch a byte at a time. The
+  default is four chunks.
 - Translation on demand: `armjit page` reads `page <elf> <base> <address>` requests and answers with a
   module that imports the host's memory and exports the regions it found, plus the block starts of
   each. The host puts those functions in the running image's table, patches the dispatch table with
@@ -159,8 +162,8 @@ records their oracles there) through the translated `ld-linux` and `libc.so.6`, 
 address-check modes; one of them keeps its buffers above 4 GiB and fills and reads them from a
 library, so the pages translated while it runs are the ones that reach past the first memory and
 across the seam between two. `bash tests/shell.sh` runs Debian's own `dash` under 50 `-c` scripts,
-translated and inside `chroot` on a container's kernel, and compares stdout, stderr and exit status
-of each.
+translated and inside `chroot` on a container's kernel, and compares stdout, stderr and exit
+status of each.
 
 The toolchain is the other test, because it is the thing that exercises every instruction the way
 real code does. `apt-get install` unpacks and configures Debian's own packages inside the guest -
@@ -197,10 +200,22 @@ module compilation. Run it on an idle machine: contention moved every number her
 The chunk a program is not using costs nothing at run time. Every access carries one compare
 against 4 GiB when there is more than one chunk, and the branch predictor never misses it, so the
 rows above are flat from 1 to 8 chunks within the noise this machine measures at (the same
-configuration moves by 10% between runs). What does grow is the module: 49 KiB at one chunk, 57 at
-four, 66 at eight, for the arms of the helpers' jump tables and the byte-at-a-time path across a
-boundary. The absolute numbers here are slower than the run that stood in this table before, on a
-busier machine; the shape is what it measures.
+configuration moves by 10% between runs). What grows is the image: 46 KiB at one chunk, 55 at
+four, 64 at eight and 191 at sixty-four, for the arms of the helpers' jump tables and the
+byte-at-a-time path across a boundary. That is one module, compiled once at startup.
+
+A page translated while the guest runs does not grow with the chunk count, because it calls the
+image's helpers instead of carrying a copy of them. One Python workload, 652 page modules, mean
+page module and wall time:
+
+| chunks | page module | run |
+|---|---|---|
+| 4 | 63 KiB, from 71 | 4424 ms, from 4549 |
+| 64 | 64 KiB, from 207 | 4558 ms, from 7347 |
+
+A page now costs what its own code costs at any chunk count, and 256 GiB of address space runs 3%
+slower than 16 GiB where it used to run 61% slower. The absolute numbers here are slower than the
+run that stood in this table before, on a busier machine; the shape is what it measures.
 
 Translation cost: 161 instructions of 1 region in 0.7 ms, 43 KB of wasm from 37 KB of guest. V8
 compiles that module in 0.2 ms. Most of the 0.7 ms is one pass over the 1 MiB page table, which is a
