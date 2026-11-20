@@ -121,9 +121,12 @@ function makeTerminal({ viaTty = false, sink = (bytes) => process.stdout.write(b
   data: Buffer.alloc(0),
   closed: false,
   live: false,
+  /// Where the bytes the device sends go: the host's own output for the console, the master end for
+  /// a pseudo-terminal.
+  sink,
   /// Whether the input is a terminal rather than a pipe. A terminal echoes what is typed at it; a
   /// pipe's bytes are not typed at anything, and echoing them would print a script twice.
-  viaTty: false,
+  viaTty,
   /// Whether the guest has turned off canonical input and echo, which is what a line editor does
   /// before it reads one keystroke at a time and draws them itself.
   raw: false,

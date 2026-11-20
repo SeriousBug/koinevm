@@ -79,4 +79,35 @@ for mode in $MODES; do
     echo "ok   console bounds=$mode"
 done
 
+# The console with a terminal behind it. A piped run's bytes are not typed at anything, so the
+# guest's line discipline does not echo them; a run at a terminal does, and the echo is what has
+# nowhere to go if the console has no sink. `script(1)` is what gives the host a terminal of its own.
+if script -q /dev/null true > /dev/null 2>&1; then
+    tty="$work/tty.wasm"
+    if ./target/release/armjit translate rootfs/debian/bin/bash -o "$tty" \
+            --rootfs=rootfs/debian --argv="/bin/bash,-i" \
+            --env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,HOME=/root" \
+            --bounds=check > "$work/tty-translate.log" 2>&1; then
+        printf 'echo hi\nexit\n' |
+            script -q /dev/null env ARMJIT_ROOTFS=rootfs/debian ARMJIT_CONSOLE=1 \
+                timeout 120 node run.mjs "$tty" > "$work/tty.out" 2>&1
+        ttycode=$?
+        if ! grep -q '^hi' "$work/tty.out"; then
+            echo "FAIL console at a terminal: no output"
+            cat -v "$work/tty.out" | tail -10
+            fail=1
+        elif [ "$ttycode" != 0 ]; then
+            echo "FAIL console at a terminal, exit $ttycode"
+            cat -v "$work/tty.out" | tail -10
+            fail=1
+        else
+            echo "ok   console at a terminal"
+        fi
+    else
+        echo "FAIL console at a terminal, translate:"; cat "$work/tty-translate.log"; fail=1
+    fi
+else
+    echo "skip console at a terminal: no script(1) that takes a command"
+fi
+
 [ "$fail" -eq 0 ]
