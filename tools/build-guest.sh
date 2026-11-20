@@ -101,6 +101,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/rusage.c -o tests/guest/rusage.o
 python3 tools/minilink.py tests/guest/rusage.o tests/guest/rusage.elf _start
 
+echo "== guest: futex (a wait that times out, a wake, and the requeue that moves waiters) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
+    -c tests/guest/futex.c -o tests/guest/futex.o
+python3 tools/minilink.py tests/guest/futex.o tests/guest/futex.elf _start
+
 echo "== guest: smc (a guest that writes an instruction into its own text and runs it) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/smc.c -o tests/guest/smc.o

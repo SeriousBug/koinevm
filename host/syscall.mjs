@@ -35,8 +35,13 @@ export const ECHILD = 10;
 export const ENOEXEC = 8;
 export const EINTR = 4;
 export const EPERM = 1;
+export const ETIMEDOUT = 110;
 const ENODATA = 61;
 const ENOTSUP = 95;
+
+/// The clock a FUTEX_WAIT_BITSET's deadline is read on, which is the only bit above the command
+/// that this kernel has to read: the private forms differ from the shared ones in nothing here.
+const FUTEX_CLOCK_REALTIME = 0x100;
 
 const MAP_ANONYMOUS = 0x20;
 /// `struct epoll_event` here is the mask, four bytes of padding, and the guest's own eight-byte value:
@@ -190,6 +195,8 @@ export class Kernel {
     this.net = options.net ?? new Net({ wake: this.wake });
     /// Called to wake the threads asleep on a futex word; answers how many woke.
     this.futexWake = options.futexWake ?? (() => 0);
+    /// Called to move the waiters a wake did not take onto another word; answers how many moved.
+    this.futexRequeue = options.futexRequeue ?? (() => 0);
     this.register();
     // A signalfd's readiness is this process's queue, so the table asks the kernel it belongs to.
     this.files.signalReady = (desc) => this.signalWaiting(desc);
@@ -2133,25 +2140,63 @@ export class Kernel {
       if (!k.inBounds(k.addr(at), SIGFRAME.FPSIMD + 16 + 32 * 16)) return k.fail(EFAULT);
       return k.ask({ kind: "sigreturn", frame: k.addr(at) });
     });
-    this.on(98, (k, uaddr, op, val) => {
+    // A futex timeout is a `struct timespec`, and which clock it is read on is the call's to say: a
+    // plain FUTEX_WAIT gives a length, FUTEX_WAIT_BITSET a point on CLOCK_MONOTONIC, and only
+    // FUTEX_CLOCK_REALTIME makes that point a wall clock time. The host deadlines are on its own
+    // clock, so the answer here is the wall clock time the wait ends at.
+    const futexDeadline = (k, timeout, absolute, monotonic) => {
+      const at = Number(timeout);
+      if (at === 0) return 0;
+      if (!k.inBounds(at, 16)) return -EFAULT;
+      const sec = Number(k.u64(at));
+      const nsec = Number(k.u64(at + 8));
+      if (sec < 0 || nsec < 0 || nsec >= 1e9) return -EINVAL;
+      const want = sec * 1e3 + nsec / 1e6;
+      const left = absolute ? want - Number(clockNow(monotonic ? 1 : 0)) / 1e6 : want;
+      // A wait whose deadline has gone by is answered without parking at all, which is what a
+      // timeout of zero is and what a clock that moved backwards would make of one.
+      return Date.now() + Math.max(0, left);
+    };
+
+    this.on(98, (k, uaddr, op, val, timeout, uaddr2, val3) => {
       // The private flag and the realtime clock are bits above the command, and the bitset forms
-      // wait and wake on the same word as the plain ones do.
-      const cmd = Number(op) & 0x7f;
+      // wait and wake on the same word as the plain ones do: nothing here has a second bitset.
+      const bits = Number(op);
+      const cmd = bits & 0x7f;
       const at = k.addr(uaddr);
+      const num = (v) => Number(BigInt.asIntN(32, BigInt.asUintN(32, v)));
       if (cmd === 0 || cmd === 9) {
         // FUTEX_WAIT: the host checks the word and parks the thread, so that a wake that arrives
         // between the check and the sleep cannot be lost.
-        return k.ask({ kind: "futex", addr: at, value: Number(BigInt.asIntN(32, BigInt.asUintN(32, val))) });
+        const deadline = futexDeadline(k, timeout, cmd === 9, (bits & FUTEX_CLOCK_REALTIME) === 0);
+        if (deadline < 0) return k.fail(-deadline);
+        return k.ask({ kind: "futex", addr: at, value: num(val), deadline });
       }
       if (cmd === 1 || cmd === 10) {
         // FUTEX_WAKE
-        const want = Number(BigInt.asIntN(32, BigInt.asUintN(32, val)));
+        const want = num(val);
         return [BigInt(k.futexWake(at, want < 0 ? -1 : want)), 0];
       }
-      if (cmd === 2 || cmd === 3) return [0n, 0]; // FUTEX_FD / FUTEX_REQUEUE: nothing to do
+      // FUTEX_REQUEUE and FUTEX_CMP_REQUEUE: the waiters a wake cannot take move to the second
+      // word, where the next wake finds them. The fourth argument is the count to move, not a
+      // timespec, and the compare form answers EAGAIN when the word is not the value expected.
+      if (cmd === 3 || cmd === 4) {
+        const wake = num(val);
+        const move = num(timeout);
+        if (cmd === 4 && num(val3) !== new DataView(k.memory.buffer).getInt32(at, true)) {
+          return k.fail(EAGAIN);
+        }
+        return [
+          BigInt(k.futexRequeue(at, k.addr(uaddr2), wake < 0 ? -1 : wake, move < 0 ? -1 : move)),
+          0,
+        ];
+      }
       return k.fail(ENOSYS);
     });
-    this.on(233, () => [0n, 0]); // madvise
+    this.on(233, (k, addr, len, advice) => [
+      BigInt(k.space.madvise(k.addr(addr), Number(len), Number(advice))),
+      0,
+    ]);
     this.on(324, () => [0n, 0]); // membarrier: one thread, nothing to synchronise
     this.on(124, () => [0n, 0]); // sched_yield
   }

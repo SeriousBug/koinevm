@@ -13,7 +13,7 @@
 
 import { randomFillSync } from "node:crypto";
 import fs from "node:fs";
-import { Kernel, ECHILD, EBADF, EFAULT, ESRCH, EINTR } from "./syscall.mjs";
+import { Kernel, ECHILD, EBADF, EFAULT, ESRCH, EINTR, ETIMEDOUT } from "./syscall.mjs";
 import { ENOENT, EACCES, ELOOP } from "./files.mjs";
 import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
@@ -80,6 +80,9 @@ export class Session {
       state: "runnable",
       code: null,
       threads: [],
+      /// Which thread of the process the last pick handed the CPU to, so the next one starts
+      /// after it.
+      nextThread: 0,
       current: null,
       usage: new Usage(),
     };
@@ -156,6 +159,7 @@ export class Session {
       signal: (request) => this.signal(request),
       wake: () => this.poll(),
       futexWake: (addr, n) => this.futexWake(proc, addr, n),
+      futexRequeue: (addr, addr2, wake, move) => this.futexRequeue(proc, addr, addr2, wake, move),
     });
     for (const image of proc.meta.images ?? []) proc.kernel.space.images.push(image);
     // A page the guest changes is a page this process has to translate again.
@@ -218,13 +222,16 @@ export class Session {
   }
 
   /// Whether any thread is parked on something the host has to wait for: a packet that may arrive,
-  /// or a deadline a timer will pass.
+  /// a futex whose wait has a deadline, or a deadline a timer will pass.
   waiting() {
     return this.processes.some((p) =>
       p.threads.some(
         (t) =>
           t.state === "blocked" &&
-          (t.waitingFor === "socket" || t.waitingFor === "sleep" || t.waitingFor === "stdin"),
+          (t.waitingFor === "socket" ||
+            t.waitingFor === "sleep" ||
+            t.waitingFor === "stdin" ||
+            (t.waitingFor === "futex" && t.pending?.deadline > 0)),
       ),
     );
   }
@@ -248,18 +255,21 @@ export class Session {
 
   /// The next thread to run, and the process it belongs to. Threads are what a scheduler picks:
   /// a process whose threads are all waiting is waiting, and one with a runnable thread runs it.
-  /// The next thread to run, from where the last pick left off: a guest that gives the CPU back at
-  /// a poll has to come out behind the one that was waiting for it, or two runnable threads in a
-  /// loop of their own would starve each other exactly as they did before there was a poll.
+  /// Each pick starts where the last one left off, over the processes and over the threads of one,
+  /// because a guest gives the CPU back at a poll for exactly this: two threads that hand a flag
+  /// back and forth starve each other if the turn always comes back to the same one.
   pick() {
     const n = this.processes.length;
     for (let k = 0; k < n; k++) {
       const i = (this.nextPick + k) % n;
       const proc = this.processes[i];
       if (proc.state === "exited") continue;
-      const thread = proc.threads.find((t) => t.state === "runnable");
-      if (thread) {
+      const threads = proc.threads;
+      for (let j = 0; j < threads.length; j++) {
+        const thread = threads[(proc.nextThread + j) % threads.length];
+        if (thread.state !== "runnable") continue;
         this.nextPick = i + 1;
+        proc.nextThread = (proc.nextThread + j + 1) % threads.length;
         return { proc, thread };
       }
     }
@@ -705,6 +715,7 @@ export class Session {
       state: "runnable",
       code: null,
       threads: [],
+      nextThread: 0,
       current: null,
       /// A child starts with no CPU of its own behind it, which is what a fork in a kernel gives it.
       usage: new Usage(),
@@ -786,8 +797,8 @@ export class Session {
   /// A thread waiting for the host: it does not run again until something wakes it, and a request
   /// with a deadline is looked at again then even if nothing arrived. The timer keeps the deadline
   /// from depending on traffic: a `poll` on a socket nobody sends to still has to time out.
-  park(thread, request, deadline, waitingFor = "socket") {
-    this.block(thread, request.fd ?? 0, waitingFor);
+  park(thread, request, deadline, waitingFor = "socket", on = request.fd ?? 0) {
+    this.block(thread, on, waitingFor);
     thread.pending = request;
     if (!deadline) return;
     const timer = setTimeout(() => {
@@ -912,16 +923,22 @@ export class Session {
   /// FUTEX_WAIT and FUTEX_WAKE, which is how one thread of a process waits for another.
   futex(proc, thread, request) {
     const view = new DataView(proc.memory.buffer);
+    // A waiter a wake answered is running the wait's success, not its failure: the word has
+    // changed, which is the reason it was woken, and a kernel reports that as a wait that ended
+    // rather than as EAGAIN - the error that answers a caller whose word was already wrong.
+    if (thread.futexWoken) {
+      thread.futexWoken = false;
+      return this.resume(proc, thread, 0);
+    }
     if (view.getInt32(request.addr, true) !== request.value) {
-      return this.resume(proc, thread, -11); // EAGAIN: the value changed before the wait
+      return this.resume(proc, thread, -EAGAIN); // EAGAIN: the value changed before the wait
     }
-    thread.state = "blocked";
-    thread.blockedOn = request.addr;
-    thread.waitingFor = "futex";
-    thread.pending = request;
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
-      console.error(`futex: ${proc.pid}/${thread.tid} waits on 0x${request.addr.toString(16)}`);
+    // A wait with a timeout answers ETIMEDOUT when it runs out, and one whose deadline has already
+    // gone by does so without parking at all.
+    if (request.deadline && Date.now() >= request.deadline) {
+      return this.resume(proc, thread, -ETIMEDOUT);
     }
+    this.park(thread, request, request.deadline, "futex", request.addr);
     return 0;
   }
 
@@ -1160,6 +1177,14 @@ export class Session {
           // A sleep cannot be a `setTimeout` alone: the host's event loop does not turn while a
           // guest is spinning, and a poll at a backward branch is the only thing that asks.
           thread.state = "runnable";
+        } else if (
+          thread.waitingFor === "futex" &&
+          thread.pending?.deadline > 0 &&
+          Date.now() >= thread.pending.deadline
+        ) {
+          // The wait is answered by the thread looking at it again, which is where a futex that
+          // ran out of time becomes ETIMEDOUT.
+          thread.state = "runnable";
         }
       }
     }
@@ -1173,6 +1198,7 @@ export class Session {
       if (thread.state !== "blocked" || thread.waitingFor !== "futex") continue;
       if (thread.blockedOn !== addr) continue;
       if (n >= 0 && woken >= n) break;
+      thread.futexWoken = true;
       thread.state = "runnable";
       woken++;
     }
@@ -1180,6 +1206,31 @@ export class Session {
       console.error(`futex wake 0x${addr.toString(16)}: ${woken} thread(s)`);
     }
     return woken;
+  }
+
+  /// Waiters moved off a word rather than woken: a condition variable's producer takes the ones a
+  /// wake can carry and gives the rest to the word its next wake names, so none is lost.
+  futexRequeue(proc, addr, addr2, wake, move) {
+    let woken = 0;
+    let moved = 0;
+    for (const thread of proc.threads) {
+      if (thread.state !== "blocked" || thread.waitingFor !== "futex") continue;
+      if (thread.blockedOn !== addr) continue;
+      if (wake < 0 || woken < wake) {
+        thread.futexWoken = true;
+        thread.state = "runnable";
+        woken++;
+      } else if (move < 0 || moved < move) {
+        thread.blockedOn = addr2;
+        moved++;
+      } else {
+        break;
+      }
+    }
+    if ((woken || moved) && process.env.ARMJIT_TRACE_PROCESSES) {
+      console.error(`futex requeue 0x${addr.toString(16)} -> 0x${addr2.toString(16)}: ${woken} woken, ${moved} moved`);
+    }
+    return woken + moved;
   }
 
   /// A parent waiting for this process, whether for its exit or for the exec that ends a vfork.
