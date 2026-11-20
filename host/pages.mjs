@@ -233,25 +233,28 @@ export class Mach {
   /// Mark every page in `[lo, hi)` as holding what the guest put there rather than what the file
   /// did, as one merged range: the ranges a program names are its arenas.
   markPatched(lo, hi) {
-    const spans = this.patched;
-    let at = 0;
-    while (at < spans.length && spans[at].lo < lo) at++;
-    const merged = [];
+    const out = [];
     let start = lo;
     let end = hi;
-    let i = 0;
-    for (; i < at; i++) merged.push(spans[i]);
-    for (let j = at; j < spans.length; j++) {
-      const span = spans[j];
-      if (span.lo > end) break;
+    let placed = false;
+    for (const span of this.patched) {
+      if (span.hi < lo) {
+        out.push(span);
+        continue;
+      }
+      if (span.lo > end) {
+        if (!placed) {
+          out.push({ lo: start, hi: end });
+          placed = true;
+        }
+        out.push(span);
+        continue;
+      }
       start = Math.min(start, span.lo);
       end = Math.max(end, span.hi);
     }
-    merged.push({ lo: start, hi: end });
-    for (let j = i; j < spans.length; j++) {
-      if (spans[j].lo > end) merged.push(spans[j]);
-    }
-    this.patched = merged;
+    if (!placed) out.push({ lo: start, hi: end });
+    this.patched = out;
   }
 
   /// Without a dispatch word of its own, the first four-byte pc at or after `at`.
