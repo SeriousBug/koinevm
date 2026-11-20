@@ -27,9 +27,11 @@ so a library the loader maps while it runs executes without being known in advan
   `NZCV` state, so `ccmp`, `adcs` and flags live across blocks all work.
 - One wasm function per region, one nested block per guest block, `br_table` on a local pc. Direct
   branches are plain `br`s. Calls, returns and computed jumps return the next pc to a dispatcher
-  that looks the pc up in an open-addressed table (a slot is `pc >> 2`'s tag plus `region, block`),
-  so wasm stack depth is constant, guest recursion is bounded by the guest stack in linear memory,
-  and code from images at unrelated addresses costs nothing extra.
+  that looks it up in an open-addressed table (a slot is `[region, block][u64 tag]`, the tag being
+  the whole `pc >> 2`, so 16 bytes), so wasm stack depth is constant, guest recursion is bounded by
+  the guest stack in linear memory, and code from images at unrelated addresses costs nothing
+  extra. The pc is 64 bits wide everywhere it travels, so a block in the second chunk is a different
+  slot from the one 4 GiB below it.
 - A fixed address space plan, because the guest's whole map is linear memory: control block, the
   dispatch table, images from 4 MiB, heap above the images, `mmap` arena from 1 GiB, a soft page
   table of one byte per 4 KiB page and the stack just below the top. The translator fills in the
@@ -218,6 +220,10 @@ configuration moves by 10% between runs). What grows is the image: 46 KiB at one
 four, 64 at eight and 191 at sixty-four, for the arms of the helpers' jump tables and the
 byte-at-a-time path across a boundary. That is one module, compiled once at startup.
 
+What a dispatch slot holds is the whole pc, so a slot is 16 bytes and the arena is 32 MiB at the
+floor instead of 16: the bench above measures the same numbers with it as without it, because the
+dispatcher runs once per call, return or computed jump and not per instruction.
+
 A page translated while the guest runs does not grow with the chunk count, because it calls the
 image's helpers instead of carrying a copy of them. One Python workload, 652 page modules, mean
 page module and wall time:
@@ -298,7 +304,8 @@ Two things follow.
   branch or a call that leaves the page reaches the dispatcher, which translates the page it lands
   in when the run gets there. `tests/jit.sh` covers a written page made executable, a second write
   to a page that had already run, an RWX page, a branch across a page boundary, a call from
-  generated code into the translated image, and a syscall made from generated code.
+  generated code into the translated image, a syscall made from generated code, and the same code
+  in a page above the first 4 GiB, where the dispatcher key is a different one.
 - **Signals.** A handler of the guest's own runs, with the frame, the mask and the restorer a kernel
   gives it, when a syscall is where the signal can be taken; a signal that arrives while the guest is
   in the middle of a computation waits for the next syscall. A fault is still fatal, so a `SIGSEGV`
@@ -309,12 +316,6 @@ Two things follow.
   state (it says `R` for anything still in the table), and `/dev` has the character devices and the
   terminal links rather than block devices, `loop*`, `tty1..N` or the framebuffer a machine with a
   console would have.
-- **Code has to live below 4 GiB.** A dispatch word is keyed by the low 32 bits of `pc >> 2` and
-  the shadow's pc is 32 bits wide, so a jump above 4 GiB lands in the slot of the address 4 GiB
-  below it. The second memory holds heap, and a heap is not run: a program that maps an
-  executable page at 8 GiB and calls into it does not get there, measured with a page written at 8
-  GiB and called. A JIT whose own code range lands above the boundary would break; node's has not,
-  which is why `tests/jit.sh` passes at every address it uses.
 - **Job control.** One console and one process group: `Ctrl-Z`, `fg`, `jobs`, and a window that is
   resized (`SIGWINCH`) are not there, so a stopped job cannot be resumed. And the console's interrupt
   reaches the processes that take the default action for it: the shell catches it so that it can

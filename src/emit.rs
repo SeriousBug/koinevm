@@ -105,7 +105,7 @@ pub const ENGINE_HI: u64 = 0x1000;
 //   0x00000000  control block: register shadow, trace ring
 //   0x00001000  soft page table, one byte per 4 KiB page (1 MiB, covers 4 GiB)
 //   0x00400000  images: non-PIE ET_EXEC link here, PIE and shared objects are placed here
-//   0x20000000  dispatch table arena (16 MiB: two slots for every block an image may hold)
+//   0x20000000  dispatch table arena (32 MiB: two slots for every block an image may hold)
 //   ...         heap grows up from the end of the images, mmap areas grow down from the stack
 //   mem_size - stack reserve - 4 KiB   stack, growing down
 /// One PTE byte per 4 KiB page.
@@ -115,9 +115,13 @@ pub const PTE_PAGES: u64 = 1 << 20;
 /// table is twice the size of the largest image, and where the images go is the toolchain's to
 /// choose, so the two cannot share a corner of the map.
 pub const TABLE_BASE: u64 = 0x2000_0000;
-/// A dispatch slot is `[u32 payload][u32 tag]`: payload 0 is empty, else `region + 1` in the twenty
-/// bits above the block index, tag is `pc >> 2` plus one so it is never zero.
-pub const TABLE_SLOT: u64 = 8;
+/// A dispatch slot is `[u32 payload][u32 pad][u64 tag]`: payload 0 is empty, else `region + 1` in
+/// the twenty bits above the block index, and the tag is `pc >> 2` plus one, so it is never zero.
+/// The tag holds the whole 64-bit address: a pc above the first chunk is a different block from the
+/// one 4 GiB below it, and a key of 32 bits would make them one slot.
+pub const TABLE_SLOT: u64 = 16;
+/// How far a slot index is shifted to get its address, which the dispatcher does in a wasm shift.
+pub const TABLE_SLOT_SHIFT: u32 = 4;
 /// Bits of the payload the block index takes, below the region. A region is emitted in pieces of at
 /// most 512 blocks, so twelve is eight times what one region can hold.
 pub const BLOCK_BITS: u32 = 12;
@@ -405,14 +409,14 @@ fn build_dispatch_table(regions: &[Region], failed: &[bool]) -> Result<(Vec<u8>,
             return Err(format!("{keep} blocks in one region exceeds the {BLOCK_MASK} a dispatch word holds"));
         }
         for (block_idx, block) in region.blocks.iter().enumerate().take(keep) {
-            let key = (block.addr >> 2) as u32;
-            let mut slot = (key & mask) as usize;
+            let key = block.addr >> 2;
+            let mut slot = (key & mask as u64) as usize;
             loop {
                 let at = slot * TABLE_SLOT as usize;
-                if table[at] == 0 && table[at + 1] == 0 && table[at + 2] == 0 && table[at + 3] == 0 {
+                if u64::from_le_bytes(table[at + 8..at + 16].try_into().unwrap()) == 0 {
                     let payload = (((region_idx as u32) + 1) << BLOCK_BITS) | block_idx as u32;
                     table[at..at + 4].copy_from_slice(&payload.to_le_bytes());
-                    table[at + 4..at + 8].copy_from_slice(&(key + 1).to_le_bytes());
+                    table[at + 8..at + 16].copy_from_slice(&(key + 1).to_le_bytes());
                     break;
                 }
                 slot = (slot + 1) & mask as usize;
@@ -898,7 +902,7 @@ fn prelude(m: &mut Module, cfg: &Config, plan: &Plan, import_helpers: bool) -> P
     region_params.push(I32); // entry block
     let mut region_results = vec![I64; NR as usize];
     region_results.extend(vec![V128; NVEC as usize]);
-    region_results.push(I32);
+    region_results.push(I64);
     let ty_region = m.ty(region_params, region_results);
     let ty_syscall = m.ty(vec![I64; 7], vec![I64, I32]);
     let ty_trap = m.ty(vec![I32, I64, I32], vec![]);
@@ -1069,7 +1073,7 @@ pub fn translate(
     }
 
     let Prelude { ids, ty_region } = prelude(&mut m, cfg, &plan, false);
-    let ty_run = m.ty(vec![I32, I64, I32], vec![I32]);
+    let ty_run = m.ty(vec![I64, I64, I32], vec![I32]);
 
     // The dispatch table is built once the regions are emitted, and only the run loop reads its
     // mask, so the region bodies are emitted with a placeholder.
@@ -1805,11 +1809,11 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     f.locals = vec![I64; 31]; // x0..x30 -> 3..33
     f.locals.push(I64); // nzcv -> 34
     f.locals.push(I32); // idx -> 35
-    f.locals.push(I32); // next -> 36
+    f.locals.push(I64); // next pc -> 36
     f.locals.push(I32); // status -> 37
     f.locals.push(I32); // entry block -> 38
-    f.locals.push(I32); // key: pc >> 2 -> 39
-    f.locals.push(I32); // want tag: key + 1 -> 40
+    f.locals.push(I64); // key: pc >> 2 -> 39
+    f.locals.push(I64); // want tag: key + 1 -> 40
     f.locals.push(I64); // dispatch slot -> 41
     f.locals.push(I32); // slot address -> 42
     f.locals.extend(vec![V128; NVEC as usize]); // v0..v31 -> 43..74
@@ -1841,7 +1845,7 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     f.mem(I64_LOAD, 3, 0);
     f.ls(NZCV);
     f.i32c(SHADOW_PC as i32);
-    f.mem(I32_LOAD, 2, 0);
+    f.mem(I64_LOAD, 3, 0);
     f.ls(PC);
     for r in 0..NVEC {
         f.i32c((SHADOW_V0 + r as u64 * 16) as i32);
@@ -1879,7 +1883,7 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
         }
         f.i32c(SHADOW_PC as i32);
         f.lg(PC);
-        f.mem(I32_STORE, 2, 0);
+        f.mem(I64_STORE, 3, 0);
         // ring[idx & 255] = pc; idx++
         f.i32c(RING as i32);
         f.i32c(RING_IDX as i32);
@@ -1890,6 +1894,7 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
         f.op(I32_MUL);
         f.op(I32_ADD);
         f.lg(PC);
+        f.wrap_i64();
         f.mem(I32_STORE, 2, 0);
         f.i32c(RING_IDX as i32);
         f.i32c(RING_IDX as i32);
@@ -1898,54 +1903,51 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
         f.op(I32_ADD);
         f.mem(I32_STORE, 2, 0);
     }
-    // Dispatch: open addressing on `(pc >> 2) & mask`. A slot holds `[payload][tag]`, the payload
-    // being region + 1 above the block index, and an empty slot reads zero. A pc that no block
+    // Dispatch: open addressing on `(pc >> 2) & mask`. A slot holds `[payload][pad][tag]`, the
+    // payload being region + 1 above the block index and the tag being the whole 64-bit key plus
+    // one, so an empty slot reads zero and two pcs 4 GiB apart are two slots. A pc that no block
     // starts at leaves the slot zero, which reports an untranslated jump.
     f.lg(PC);
-    f.i32c(2);
-    f.op(I32_SHR_U);
+    f.i64c(2);
+    f.op(I64_SHR_U);
     f.lt(KEY); // key
     f.lg(KEY);
-    f.i32c(1);
-    f.op(I32_ADD);
+    f.i64c(1);
+    f.op(I64_ADD);
     f.ls(WANT); // want
     f.lg(KEY);
-    f.i32c(layout.table_mask as i32);
-    f.op(I32_AND);
+    f.i64c(layout.table_mask as i64);
+    f.op(I64_AND);
+    f.wrap_i64();
     f.ls(IDX); // slot
 
     f.block(); // $found
     f.loop_();
     f.i32c(TABLE_BASE as i32);
     f.lg(IDX);
-    f.i32c(3);
+    f.i32c(TABLE_SLOT_SHIFT as i32);
     f.op(I32_SHL);
     f.op(I32_ADD);
     f.lt(SLOTA);
     f.lg(SLOTA);
-    f.mem(I64_LOAD, 3, 0);
+    f.mem(I64_LOAD, 3, 8); // tag, at the top of the slot
     f.lt(SLOTV);
 
     // tag match: the slot is this block
     f.lg(SLOTV);
-    f.i64c(32);
-    f.op(I64_SHR_U);
-    f.wrap_i64();
-    f.lt(KEY);
-    f.lg(KEY);
     f.lg(WANT);
-    f.op(I32_EQ);
+    f.op(I64_EQ);
     f.op(IF);
     f.body.push(0x40);
-    f.lg(SLOTV);
-    f.wrap_i64();
+    f.lg(SLOTA);
+    f.mem(I32_LOAD, 2, 0); // payload
     f.ls(IDX);
     f.br(2); // $found
     f.end();
 
     // empty slot: nothing translated at this pc
-    f.lg(KEY);
-    f.op(I32_EQZ);
+    f.lg(SLOTV);
+    f.op(I64_EQZ);
     f.op(IF);
     f.body.push(0x40);
     f.i32c(0);
@@ -1986,7 +1988,7 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
 
     f.i32c(SHADOW_PC as i32);
     f.lg(PC);
-    f.mem(I32_STORE, 2, 0);
+    f.mem(I64_STORE, 3, 0);
     for i in 0..31u32 {
         f.lg(X0 + i);
     }
@@ -2015,7 +2017,7 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     // host or because it jumped to an address no block starts at. Status 1 says so; 2 is a pc that
     // needs translating.
     f.lg(NEXT);
-    f.op(I32_EQZ);
+    f.op(I64_EQZ);
     f.op(IF);
     f.body.push(0x40);
     f.i32c(1);
@@ -2047,7 +2049,7 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     f.mem(I64_STORE, 3, 0);
     f.i32c(SHADOW_PC as i32);
     f.lg(PC);
-    f.mem(I32_STORE, 2, 0);
+    f.mem(I64_STORE, 3, 0);
     f.lg(STATUS);
     f
 }
@@ -2751,7 +2753,6 @@ impl<'a> RegionEmitter<'a> {
     fn emit_return_const(&mut self, target: u64) {
         self.begin_return();
         self.f.i64c(target as i64);
-        self.f.wrap_i64();
         self.end_return();
     }
 
@@ -2762,7 +2763,6 @@ impl<'a> RegionEmitter<'a> {
         } else {
             self.f.lg(r);
         }
-        self.f.wrap_i64();
         self.end_return();
     }
 
@@ -2811,10 +2811,10 @@ impl<'a> RegionEmitter<'a> {
         // The run stops here, and the host resumes at the target: a pc of zero is what says the
         // guest is not simply jumping there, and the resume address is where it goes either way.
         self.f.i32c(SHADOW_RESUME as i32);
-        self.f.i32c(target as i32);
-        self.f.mem(I32_STORE, 2, 0);
+        self.f.i64c(target as i64);
+        self.f.mem(I64_STORE, 3, 0);
         self.begin_return();
-        self.f.i32c(0);
+        self.f.i64c(0);
         self.end_return();
         self.close_if();
         self.close_if();
@@ -2888,11 +2888,11 @@ impl<'a> RegionEmitter<'a> {
                 // The host side reports which instruction called it, which is how a failing
                 // syscall is traced back to the guest code that asked for it.
                 self.f.i32c(SHADOW_PC as i32);
-                self.f.i32c(addr as i32);
-                self.f.mem(I32_STORE, 2, 0);
+                self.f.i64c(addr as i64);
+                self.f.mem(I64_STORE, 3, 0);
                 self.f.i32c(SHADOW_RESUME as i32);
-                self.f.i32c((addr + 4) as i32);
-                self.f.mem(I32_STORE, 2, 0);
+                self.f.i64c((addr + 4) as i64);
+                self.f.mem(I64_STORE, 3, 0);
                 self.f.lg(8);
                 for i in 0..6u32 {
                     self.f.lg(i);
@@ -2905,7 +2905,7 @@ impl<'a> RegionEmitter<'a> {
                 self.begin_return();
                 // A region that returns a zero next pc is what stops the run loop, and the host
                 // resumes this process with x0 holding the syscall's answer.
-                self.f.i32c(0);
+                self.f.i64c(0);
                 self.end_return();
                 self.close_if();
                 if self.f.body.last() == Some(&UNREACHABLE) {}

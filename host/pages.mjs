@@ -19,7 +19,7 @@ const SHADOW_PC = 0x108;
 /// One helper per access shape, which the image exports and a page module imports: `N_ACCESS` in
 /// src/emit.rs.
 const ACCESS_HELPERS = 23;
-const TABLE_SLOT = 8;
+const TABLE_SLOT = 16;
 /// Bits of a dispatch word's payload the block index takes, and therefore the bits a region slot has
 /// above it: `BLOCK_BITS` in src/emit.rs.
 const BLOCK_BITS = 12;
@@ -178,16 +178,20 @@ export class Mach {
   /// Where a pc's entry is, or the empty slot it would take: open addressing with linear probing,
   /// the same probe the translator uses to build the table. The probe is bounded by the table, so a
   /// table with no room left reports itself instead of searching for an empty slot forever.
+  ///
+  /// A slot's tag is the whole key, and a key is `pc >> 2` for a pc that may be above 4 GiB: the
+  /// arithmetic is a division and a modulo rather than a shift and a mask, because the bitwise
+  /// operators of this host are 32-bit and would fold two pcs 4 GiB apart into one slot.
   probe(pc) {
-    const key = pc >>> 2;
+    const key = Math.floor(pc / 4);
     const want = key + 1;
-    const mask = this.meta.table_mask >>> 0;
-    let at = (key & mask) >>> 0;
-    for (let n = 0; n <= mask; n++) {
+    const slots = (this.meta.table_mask >>> 0) + 1;
+    let at = key % slots;
+    for (let n = 0; n < slots; n++) {
       const addr = this.meta.table_base + at * TABLE_SLOT;
-      const tag = this.view.getUint32(addr + 4, true);
-      if (tag === want || tag === 0) return { addr, tag, want };
-      at = (at + 1) & mask;
+      const tag = this.view.getBigUint64(addr + 8, true);
+      if (tag === BigInt(want) || tag === 0n) return { addr, tag, want };
+      at = (at + 1) % slots;
     }
     throw new Error(`no room in the dispatch table for 0x${pc.toString(16)}`);
   }
@@ -195,14 +199,14 @@ export class Mach {
   /// What the dispatch table says about a pc, for checking an insert against the answer.
   lookup(pc) {
     const { addr, tag, want } = this.probe(pc);
-    return tag === want ? this.view.getUint32(addr, true) : 0;
+    return tag === BigInt(want) ? this.view.getUint32(addr, true) : 0;
   }
 
   dispatch(pc, slot, block) {
     const { addr, tag, want } = this.probe(pc);
-    if (tag === want) return; // another page already claimed this address
+    if (tag === BigInt(want)) return; // another page already claimed this address
     this.view.setUint32(addr, (((slot + 1) << BLOCK_BITS) | block) >>> 0, true);
-    this.view.setUint32(addr + 4, want, true);
+    this.view.setBigUint64(addr + 8, BigInt(want), true);
     if (process.env.ARMJIT_DISPATCH_PC && pc === Number(process.env.ARMJIT_DISPATCH_PC)) {
       console.error(`dispatch 0x${pc.toString(16)} -> slot 0x${slot.toString(16)} block ${block}`);
     }
@@ -211,9 +215,9 @@ export class Mach {
   /// Drop the translation of a block, so the next jump to it goes through the translator again.
   clearDispatch(pc) {
     const { addr, tag, want } = this.probe(pc);
-    if (tag !== want) return;
+    if (tag !== BigInt(want)) return;
     this.view.setUint32(addr, 0, true);
-    this.view.setUint32(addr + 4, 0, true);
+    this.view.setBigUint64(addr + 8, 0n, true);
   }
 
   /// Whether the guest has written to the page at `at` since it was translated.
@@ -305,7 +309,7 @@ export class Mach {
 
   hasDispatch(pc) {
     const { tag, want } = this.probe(pc);
-    return tag === want;
+    return tag === BigInt(want);
   }
 
   growTo(want) {
@@ -402,7 +406,7 @@ export class Mach {
     if (!this.hasDispatch(pc)) {
       throw new Error(`translated 0x${pc.toString(16)} but no block starts there`);
     }
-    const out = this.kernel.usage.run(() => this.instance.exports.run(0, 0n, 1));
+    const out = this.kernel.usage.run(() => this.instance.exports.run(0n, 0n, 1));
     T.push(performance.now());
     if (process.env.ARMJIT_TRACE_PAGES)
       console.error(`  phases ${T.slice(1).map((t, i) => (t - T[i]).toFixed(1)).join(" ")} status ${out}`);

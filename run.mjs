@@ -37,7 +37,7 @@ function state() {
   const regs = [];
   for (let i = 0; i < 31; i++) regs.push(view.getBigInt64(i * 8, true));
   return (
-    `  pc=${where(view.getInt32(0x108, true) >>> 0)} sp=0x${view.getBigUint64(0xf8, true).toString(16)} ` +
+    `  pc=${where(Number(view.getBigUint64(0x108, true)))} sp=0x${view.getBigUint64(0xf8, true).toString(16)} ` +
     `nzcv=0x${view.getBigUint64(0x100, true).toString(16)} tp=0x${view.getBigUint64(0x110, true).toString(16)}\n` +
     `  ${regs.map((v, i) => `x${i}=0x${v.toString(16)}`).join(" ")}`
   );
@@ -212,7 +212,7 @@ function backtrace() {
     if (next <= fp) break;
     fp = next;
   }
-  const lines = [`  #0 at ${where(view.getInt32(0x108, true) >>> 0)} lr=${where(word(30 * 8))}`];
+  const lines = [`  #0 at ${where(Number(view.getBigUint64(0x108, true)))} lr=${where(word(30 * 8))}`];
   for (let depth = 1; depth < fps.length; depth++) {
     const at = fps[depth - 1];
     if (at <= 0x1000) break;
@@ -353,7 +353,7 @@ function makeImports(proc) {
       }
       if (process.env.ARMJIT_TRACE_SYSCALLS) {
         const view = new DataView(memory.buffer);
-        const pc = view.getUint32(0xf8 + 16, true) >>> 0;
+        const pc = Number(view.getBigUint64(0xf8 + 16, true));
         const args = [a0, a1, a2, a3, a4, a5].map((v) => `0x${BigInt(v).toString(16)}`).join(" ");
         console.error(`syscall ${nr} from ${where(pc)}: ${args}`);
       }

@@ -296,8 +296,8 @@ export class Session {
     if (process.env.ARMJIT_TRACE_STEPS) {
       const v = new DataView(proc.memory.buffer);
       console.error(
-        `step: ${proc.pid}/${thread.tid} entry=${thread.entry} pc=0x${v.getUint32(SHADOW_PC, true).toString(16)}` +
-          ` resume=0x${v.getUint32(SHADOW_RESUME, true).toString(16)} x0=0x${v.getBigUint64(0, true).toString(16)}`,
+        `step: ${proc.pid}/${thread.tid} entry=${thread.entry} pc=0x${v.getBigUint64(SHADOW_PC, true).toString(16)}` +
+          ` resume=0x${v.getBigUint64(SHADOW_RESUME, true).toString(16)} x0=0x${v.getBigUint64(0, true).toString(16)}`,
       );
     }
     // A signal is taken before the guest runs again, which is the only moment its whole state is
@@ -326,12 +326,12 @@ export class Session {
     try {
       if (thread.entry) {
         thread.entry = false;
-        status = proc.usage.run(() => proc.instance.exports.run(proc.meta.entry, BigInt(proc.meta.sp), 0));
+        status = proc.usage.run(() => proc.instance.exports.run(BigInt(proc.meta.entry), BigInt(proc.meta.sp), 0));
       } else {
-        status = proc.usage.run(() => proc.instance.exports.run(0, 0n, 1));
+        status = proc.usage.run(() => proc.instance.exports.run(0n, 0n, 1));
       }
       while (status === 2) {
-        const pc = proc.mach.view.getUint32(SHADOW_PC, true) >>> 0;
+        const pc = Number(proc.mach.view.getBigUint64(SHADOW_PC, true));
         if (pc === SIGTRAMP) return this.sigreturnAt(proc, thread);
         // A jump into a page the guest did not map executable is a fault rather than a request to
         // translate: running data is how a program finds out it has a wild function pointer.
@@ -533,7 +533,7 @@ export class Session {
       frame.writeBigUInt64LE(view.getBigUint64(i * 8, true), SIGFRAME.SC_REGS + i * 8);
     }
     frame.writeBigUInt64LE(sp, SIGFRAME.SC_SP);
-    frame.writeUInt32LE(view.getUint32(0x118, true), SIGFRAME.SC_PC); // resume after the `svc`
+    frame.writeBigUInt64LE(view.getBigUint64(0x118, true), SIGFRAME.SC_PC); // after the `svc`
     frame.writeUInt32LE(0, SIGFRAME.SC_PSTATE);
     // `struct fpsimd_context`: the magic the kernel writes there, its size, and the state.
     frame.writeUInt32LE(0x46508001, SIGFRAME.FPSIMD);
@@ -553,7 +553,7 @@ export class Session {
     view.setBigUint64(8, info, true);
     view.setBigUint64(16, info === 0n ? 0n : BigInt(at + SIGFRAME.UC), true);
     view.setBigUint64(30 * 8, BigInt(this.restorerFor(act)), true);
-    view.setUint32(0x108, handler >>> 0, true);
+    view.setBigUint64(0x108, BigInt(handler), true);
     const bit = 1n << BigInt(entry.sig - 1);
     kernel.sigblock = BigInt.asUintN(64, kernel.sigblock | BigInt.asUintN(64, act.mask) | bit);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
@@ -591,7 +591,7 @@ export class Session {
   /// had in a register has changed, so only the pc has to be put back.
   resumeAt(proc, thread) {
     const view = proc.mach.view;
-    view.setUint32(SHADOW_PC, view.getUint32(SHADOW_RESUME, true), true);
+    view.setBigUint64(SHADOW_PC, view.getBigUint64(SHADOW_RESUME, true), true);
     thread.state = "runnable";
     return 0;
   }
@@ -615,7 +615,7 @@ export class Session {
         new Uint8Array(proc.memory.buffer, from, 16),
       );
     }
-    view.setUint32(0x118, view.getUint32(at + SIGFRAME.SC_PC, true), true);
+    view.setBigUint64(0x118, view.getBigUint64(at + SIGFRAME.SC_PC, true), true);
     return this.resume(proc, thread, view.getBigUint64(at + SIGFRAME.SC_REGS, true));
   }
 
@@ -706,11 +706,11 @@ export class Session {
     const view = new DataView(proc.memory.buffer);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
       console.error(
-        `resume: ${proc.pid} x0=${value} at 0x${view.getUint32(SHADOW_RESUME, true).toString(16)}`,
+        `resume: ${proc.pid} x0=${value} at 0x${view.getBigUint64(SHADOW_RESUME, true).toString(16)}`,
       );
     }
     view.setBigInt64(SHADOW, BigInt.asIntN(64, BigInt(value)), true);
-    view.setUint32(SHADOW_PC, view.getUint32(SHADOW_RESUME, true), true);
+    view.setBigUint64(SHADOW_PC, view.getBigUint64(SHADOW_RESUME, true), true);
     thread.state = "runnable";
     return 0;
   }
@@ -742,7 +742,7 @@ export class Session {
     const from = new DataView(parent.memory.buffer);
     const view = new DataView(child.memory.buffer);
     view.setBigInt64(SHADOW, 0n, true);
-    view.setUint32(SHADOW_PC, view.getUint32(SHADOW_RESUME, true), true);
+    view.setBigUint64(SHADOW_PC, view.getBigUint64(SHADOW_RESUME, true), true);
     childThread.regs.set(new Uint8Array(child.memory.buffer).subarray(0, THREAD_STATE));
     if (request.flags & CLONE_CHILD_SETTID && request.ctid) {
       child.kernel.put32(request.ctid, child.pid);
@@ -753,7 +753,7 @@ export class Session {
     this.processes.push(child);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
       console.error(
-        `fork: ${parent.pid} -> ${child.pid} at 0x${from.getUint32(SHADOW_RESUME, true).toString(16)}` +
+        `fork: ${parent.pid} -> ${child.pid} at 0x${from.getBigUint64(SHADOW_RESUME, true).toString(16)}` +
           ` sp=0x${from.getBigUint64(0xf8, true).toString(16)}`,
       );
     }
@@ -787,7 +787,7 @@ export class Session {
     const regs = new DataView(child.regs.buffer);
     regs.setBigInt64(0, 0n, true);
     regs.setBigUint64(0xf8, BigInt(request.stack), true);
-    regs.setUint32(SHADOW_PC, regs.getUint32(SHADOW_RESUME, true), true);
+    regs.setBigUint64(SHADOW_PC, regs.getBigUint64(SHADOW_RESUME, true), true);
     if (request.flags & CLONE_SETTLS) regs.setBigUint64(0x110, BigInt.asUintN(64, request.tls), true);
     proc.threads.push(child);
     if (request.flags & CLONE_PARENT_SETTID && request.ptid) proc.kernel.put32(request.ptid, tid);

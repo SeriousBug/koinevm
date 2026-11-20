@@ -29,6 +29,10 @@ static inline long sc6(long nr, long a, long b, long c, long d, long e, long f) 
 #define MAP_ANONYMOUS 0x20
 #define PAGE 4096
 
+/// The size of the first wasm memory: the address space past it is a chunk of its own, and a call
+/// into code there is a pc the dispatcher has to tell apart from the one 4 GiB below it.
+#define CHUNK 0x100000000ul
+
 static void *mmap(void *addr, unsigned long len, long prot) {
     return (void *)sc6(222, (long)addr, (long)len, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 }
@@ -166,6 +170,24 @@ int main(void) {
     flush(code, 12);
     check(mprotect(code, PAGE, PROT_READ | PROT_EXEC) == 0, "mprotect the syscall page", 0);
     check(add1(0) > 0, "a syscall from generated code", (unsigned long)add1(0));
+
+    // Code above the first chunk, which is where a runtime with a cage of its own puts what it
+    // compiles. The page is a different mapping from the one below the boundary, and so is every
+    // pc in it: a dispatcher keyed by a 32-bit address would run the block 4 GiB below instead.
+    unsigned int *high = mmap((void *)(2 * CHUNK), PAGE, PROT_READ | PROT_WRITE);
+    check((unsigned long)high == 2 * CHUNK, "mmap for code above 4 GiB", (unsigned long)high);
+    place(high, add_one, 2);
+    flush(high, 8);
+    check(mprotect(high, PAGE, PROT_READ | PROT_EXEC) == 0, "mprotect to execute above 4 GiB", 0);
+    long high_one = ((long (*)(long))high)(41);
+    check(high_one == 42, "code above 4 GiB runs", (unsigned long)high_one);
+    check(mprotect(high, PAGE, PROT_READ | PROT_WRITE) == 0, "mprotect back to write above 4 GiB", 0);
+    place(high, syscall_tid, 3);
+    flush(high, 12);
+    check(mprotect(high, PAGE, PROT_READ | PROT_EXEC) == 0, "mprotect the syscall page above 4 GiB", 0);
+    long high_tid = ((long (*)(long))high)(0);
+    check(high_tid > 0, "a syscall made from above 4 GiB answers", (unsigned long)high_tid);
+    check(munmap(high, PAGE) == 0, "munmap above 4 GiB", 0);
 
     // A page given back and mapped again starts over, the way a fresh mapping does.
     check(munmap(code, PAGE) == 0, "munmap the code page", 0);

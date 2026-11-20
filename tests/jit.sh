@@ -1,7 +1,8 @@
 #!/bin/bash
 # A guest that generates machine code and jumps into it: a page it wrote and then made executable,
 # a second write to a page that had already run, an RWX page, a branch that leaves one page for the
-# next, a call from generated code into the translated image, and a syscall made from generated code.
+# next, a call from generated code into the translated image, a syscall made from generated code, and
+# code in a page above the first 4 GiB, where the pc is a different key in the dispatcher.
 #
 # There is no native oracle: macOS needs `MAP_JIT` and a per-thread write-protect toggle for what a
 # Linux program does with `mprotect`. The guest asserts what a kernel owes a JIT and reports each
