@@ -126,7 +126,7 @@ pub enum Insn {
     VecShiftImm { q: bool, u: bool, immh: u32, immb: u32, op: u32, rn: u32, rd: u32 },
     /// `fmul v0.2d, v0.2d, v2.d[0]` and the rest of the arithmetic a vector lane feeds: the same bits
     /// 28:24 as the shifts, told apart by bit 23 and by bit 10.
-    VecByElement { q: bool, u: bool, size: u32, op: u32, rn: u32, rm: u32, rd: u32 },
+    VecByElement { q: bool, u: bool, size: u32, op: u32, index: u32, rn: u32, rm: u32, rd: u32 },
     /// `dup`, `ins`, `umov`, `smov`: moves between the vector file and the general registers.
     VecCopy { q: bool, op: bool, imm5: u32, imm4: u32, rn: u32, rd: u32 },
     /// The scalar `dup Sd, Vn.T[index]`, which `mov d1, v0.d[1]` is: one lane of the source, and
@@ -884,7 +884,18 @@ fn decode_simd_dp(w: u32) -> Insn {
     // immediate sets it, and the by-element forms have it clear, with `size` where the shifts put
     // the top bit of their `immh` and `Rm` where they put the rest.
     if (w >> 24) & 0x1f == 0b01111 && bit10 == 0 {
-        return Insn::VecByElement { q, u, size, op: (w >> 12) & 0xf, rn, rm, rd };
+        // The lane is named by H (bit 11), L (bit 21) and M (bit 20), highest first, and the lane
+        // width says how many of the three are the index: all three for 16-bit lanes, two for
+        // 32-bit ones and one for 64-bit, so the low bits of the field are the ones dropped.
+        let m = (w >> 20) & 1;
+        let h = (w >> 11) & 1;
+        let field = (h << 2) | (bit21 << 1) | m;
+        let index = match size {
+            2 => field >> 1,
+            3 => field >> 2,
+            _ => field,
+        };
+        return Insn::VecByElement { q, u, size, op: (w >> 12) & 0xf, index, rn, rm: rm & 0xf, rd };
     }
     if (w >> 24) & 0x1f == 0b01111 {
         if (w >> 19) & 0xf != 0 {

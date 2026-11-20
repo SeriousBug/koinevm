@@ -41,6 +41,10 @@ pub const L_V1: u32 = L_V0 + 1;
 pub const L_V2: u32 = L_V1 + 1;
 pub const L_V3: u32 = L_V2 + 1;
 pub const L_V4: u32 = L_V3 + 1;
+/// A vector register number that names `L_V4`, so a value the code built rather than read from the
+/// register file can be an operand of the helpers that take a register: the by-element forms are the
+/// case, where one operand is a lane broadcast and nothing else touches `L_V4`.
+pub const SCRATCH_V: u32 = L_V4 - NVEC0;
 /// Two scalars wide enough that an f32 can go through them exactly, for the sequences that need a
 /// temporary in the middle of a floating point operation.
 pub const L_F0: u32 = L_V4 + 1;
@@ -330,6 +334,9 @@ fn narrows_to_low_half(i: &Insn) -> bool {
             !q && !matches!(op, 0b00010 | 0b00110) && op & 0b10011 != 0b10000
         }
         Insn::VecShiftImm { q, op, .. } => !q && op != 0b10100,
+        // The widening by-element forms write the whole destination too, whichever half of the
+        // source they take.
+        Insn::VecByElement { q, op, .. } => !q && !matches!(op, 0b0010 | 0b1010),
         Insn::FpDupElement { .. } | Insn::ScalarShift { .. } => true,
         _ => false,
     }
@@ -3560,6 +3567,125 @@ impl<'a> RegionEmitter<'a> {
         }
     }
 
+    /// One lane of `r`, broadcast to every lane: the operand a by-element form multiplies by.
+    fn splat_lane(&mut self, r: u32, index: u32, size: u32) {
+        const EXTRACT: [u32; 4] = [
+            simd::I8X16_EXTRACT_LANE_S,
+            simd::I16X8_EXTRACT_LANE_S,
+            simd::I32X4_EXTRACT_LANE,
+            simd::I64X2_EXTRACT_LANE,
+        ];
+        const SPLAT: [u32; 4] = [simd::I8X16_SPLAT, simd::I16X8_SPLAT, simd::I32X4_SPLAT, simd::I64X2_SPLAT];
+        let k = size as usize;
+        self.getv(r);
+        self.f.simd_lane(EXTRACT[k], index as u8);
+        self.f.simd(SPLAT[k]);
+    }
+
+    /// The by-element forms: one lane of `rm`, broadcast, is one operand of the elementwise
+    /// operation and `rn` is the other. `size` is the lane width (8, 16, 32 or 64-bit) and `index`
+    /// the lane, named by the instruction's H, L and M bits.
+    fn vec_by_element(
+        &mut self,
+        addr: u64,
+        q: bool,
+        u: bool,
+        size: u32,
+        op: u32,
+        index: u32,
+        rn: u32,
+        rm: u32,
+        rd: u32,
+    ) -> Result<(), String> {
+        let lane = index & ((16 >> size) - 1);
+        self.splat_lane(rm, lane, size);
+        self.f.ls(L_V4);
+        // The FP group takes 32-bit lanes when size is 2 and 64-bit ones when it is 3, and the U bit
+        // is part of the opcode there: that is what tells fmulx from fmul.
+        let double = size & 1 == 1;
+        match (size, op, u) {
+            (2 | 3, 0b0001, false) => {
+                let add = if double { simd::F64X2_ADD } else { simd::F32X4_ADD };
+                self.vec_mac_fp(rn, SCRATCH_V, rd, double, add);
+            }
+            (2 | 3, 0b0101, false) => {
+                let sub = if double { simd::F64X2_SUB } else { simd::F32X4_SUB };
+                self.vec_mac_fp(rn, SCRATCH_V, rd, double, sub);
+            }
+            // fmulx is fmul except for zero times infinity, as in the elementwise form.
+            (2 | 3, 0b1001, false) | (2 | 3, 0b1001, true) => {
+                let mul = if double { simd::F64X2_MUL } else { simd::F32X4_MUL };
+                self.vec3_fp(rn, SCRATCH_V, rd, double, mul, &[]);
+            }
+            (1 | 2 | 3, 0b1000, false) => {
+                let mul = self.lanes_op(size, [0, simd::I16X8_MUL, simd::I32X4_MUL, simd::I64X2_MUL]);
+                let Some(mul) = mul.filter(|m| *m != 0) else {
+                    return self.refuse(format!("8-bit by-element multiply at 0x{addr:x}"));
+                };
+                self.vec3(rn, SCRATCH_V, rd, mul);
+            }
+            (1 | 2, 0b0000, true) | (1 | 2, 0b0100, true) => {
+                let mls = op == 0b0100;
+                let mul = self.lanes_op(size, [0, simd::I16X8_MUL, simd::I32X4_MUL, 0]).unwrap_or(0);
+                let (add, sub) = if size == 1 {
+                    (simd::I16X8_ADD, simd::I16X8_SUB)
+                } else {
+                    (simd::I32X4_ADD, simd::I32X4_SUB)
+                };
+                if mul == 0 {
+                    return self.refuse(format!("unsupported by-element {op:04b} at 0x{addr:x}"));
+                }
+                if mls {
+                    // mls is rd - rn*rm: the destination is the minuend.
+                    self.getv(rd);
+                    self.getv(rn);
+                    self.getv(SCRATCH_V);
+                    self.f.simd(mul);
+                    self.f.simd(sub);
+                } else {
+                    self.getv(rn);
+                    self.getv(SCRATCH_V);
+                    self.f.simd(mul);
+                    self.getv(rd);
+                    self.f.simd(add);
+                }
+                self.setv(rd);
+            }
+            // smull, umull and the accumulating pair: the lane is in every half of the broadcast, so
+            // the widening multiply reads the one the q bit asks for.
+            (1 | 2, 0b1010, _) | (1 | 2, 0b0010, _) => {
+                let accumulate = op == 0b0010;
+                let (mul, acc) = match (size, q, u) {
+                    (1, false, false) => (simd::I32X4_EXTMUL_LOW_I16X8_S, simd::I32X4_ADD),
+                    (1, true, false) => (simd::I32X4_EXTMUL_HIGH_I16X8_S, simd::I32X4_ADD),
+                    (1, false, true) => (simd::I32X4_EXTMUL_LOW_I16X8_U, simd::I32X4_ADD),
+                    (1, true, true) => (simd::I32X4_EXTMUL_HIGH_I16X8_U, simd::I32X4_ADD),
+                    (2, false, false) => (simd::I64X2_EXTMUL_LOW_I32X4_S, simd::I64X2_ADD),
+                    (2, true, false) => (simd::I64X2_EXTMUL_HIGH_I32X4_S, simd::I64X2_ADD),
+                    (2, false, true) => (simd::I64X2_EXTMUL_LOW_I32X4_U, simd::I64X2_ADD),
+                    (_, true, true) => (simd::I64X2_EXTMUL_HIGH_I32X4_U, simd::I64X2_ADD),
+                    _ => return self.refuse(format!("by-element long multiply of size {size} at 0x{addr:x}")),
+                };
+                self.getv(rn);
+                self.getv(SCRATCH_V);
+                self.f.simd(mul);
+                if accumulate {
+                    self.f.ls(L_V0);
+                    self.getv(rd);
+                    self.f.lg(L_V0);
+                    self.f.simd(acc);
+                }
+                self.setv(rd);
+            }
+            _ => {
+                return self.refuse(format!(
+                    "unsupported by-element form {op:04b} u={u} size={size} at 0x{addr:x}"
+                ))
+            }
+        }
+        Ok(())
+    }
+
     /// One unary vector FP operation, on the same terms.
     fn vec2_fp(&mut self, rn: u32, rd: u32, double: bool, op: u32) {
         self.fpcr_flag(FPCR_FZ | FPCR_DN);
@@ -4852,8 +4978,8 @@ impl<'a> RegionEmitter<'a> {
             // The terminator table handles a syscall: it ends the block it is in.
             Insn::Svc => return Err(format!("syscall at 0x{addr:x} is not a block end")),
             Insn::Undefined => return self.refuse(format!("undecoded instruction at 0x{addr:x}")),
-            Insn::VecByElement { .. } => {
-                return self.refuse(format!("the by-element forms are not translated at 0x{addr:x}"))
+            Insn::VecByElement { q, u, size, op, index, rn, rm, rd } => {
+                return self.vec_by_element(addr, q, u, size, op, index, rn, rm, rd)
             }
             Insn::Crypto => {
                 return self.refuse(format!("the crypto extensions are not translated at 0x{addr:x}"))

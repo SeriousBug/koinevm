@@ -565,6 +565,39 @@ static void setup(void) {
     X(fmla_2d, "fmla 2d", "mov v2.16b, v3.16b\n fmla v2.2d, v0.2d, v1.2d")                      \
     X(fmls_4s, "fmls 4s", "mov v2.16b, v3.16b\n fmls v2.4s, v0.4s, v1.4s")
 
+/* The by-element forms: the operations above with one lane of the second operand broadcast, and a
+ * lane written out for every shape whose lane count allows it, so the three bits that name the lane
+ * are checked at both ends of their range. */
+#define BE_CASES(X)                                                                             \
+    X(be_mul_8h, "mul 8h, h[4]", "mul v2.8h, v0.8h, v1.h[4]")                                   \
+    X(be_mul_4s, "mul 4s, s[1]", "mul v2.4s, v0.4s, v1.s[1]")                                   \
+    X(be_mul_4s3, "mul 4s, s[3]", "mul v2.4s, v0.4s, v1.s[3]")                                  \
+    X(be_mla_8h, "mla 8h, h[1]", "mov v2.16b, v3.16b\n mla v2.8h, v0.8h, v1.h[1]")              \
+    X(be_mla_4s, "mla 4s, s[2]", "mov v2.16b, v3.16b\n mla v2.4s, v0.4s, v1.s[2]")              \
+    X(be_mls_8h, "mls 8h, h[3]", "mov v2.16b, v3.16b\n mls v2.8h, v0.8h, v1.h[3]")              \
+    X(be_mls_4s, "mls 4s, s[3]", "mov v2.16b, v3.16b\n mls v2.4s, v0.4s, v1.s[3]")              \
+    X(be_smull_4s, "smull 4s, h[1]", "smull v2.4s, v0.4h, v1.h[1]")                             \
+    X(be_smull2_4s, "smull2 4s, h[2]", "smull2 v2.4s, v0.8h, v1.h[2]")                          \
+    X(be_umull_4s, "umull 4s, h[3]", "umull v2.4s, v0.4h, v1.h[3]")                             \
+    X(be_smlal_4s, "smlal 4s, h[0]", "mov v2.16b, v3.16b\n smlal v2.4s, v0.4h, v1.h[0]")        \
+    X(be_umlal_4s, "umlal 4s, h[1]", "mov v2.16b, v3.16b\n umlal v2.4s, v0.4h, v1.h[1]")        \
+    X(be_umlal2_4s, "umlal2 4s, h[2]", "mov v2.16b, v3.16b\n umlal2 v2.4s, v0.8h, v1.h[2]")     \
+    X(be_smull_2d, "smull 2d, s[1]", "smull v2.2d, v0.2s, v1.s[1]")                             \
+    X(be_smlal_2d, "smlal 2d, s[0]", "mov v2.16b, v3.16b\n smlal v2.2d, v0.2s, v1.s[0]")
+
+/* The FP by-element forms, which are arithmetic on values: every input comes from a pattern row
+ * that holds no NaN, because a NaN result is the one thing a native kernel and a wasm engine are
+ * allowed to disagree on. */
+#define BE_FP_CASES(X)                                                                          \
+    X(befp_mul_4s, "fmul 4s, s[3]", "fmul v2.4s, v0.4s, v1.s[3]")                               \
+    X(befp_mul_2s, "fmul 2s, s[1]", "fmul v2.2s, v0.2s, v1.s[1]")                               \
+    X(befp_mul_2d, "fmul 2d, d[1]", "fmul v2.2d, v0.2d, v1.d[1]")                               \
+    X(befp_mulx_4s, "fmulx 4s, s[2]", "fmulx v2.4s, v0.4s, v1.s[2]")                            \
+    X(befp_mla_4s, "fmla 4s, s[1]", "mov v2.16b, v3.16b\n fmla v2.4s, v0.4s, v1.s[1]")          \
+    X(befp_mla_2d, "fmla 2d, d[1]", "mov v2.16b, v3.16b\n fmla v2.2d, v0.2d, v1.d[1]")          \
+    X(befp_mls_4s, "fmls 4s, s[3]", "mov v2.16b, v3.16b\n fmls v2.4s, v0.4s, v1.s[3]")          \
+    X(befp_mls_2s, "fmls 2s, s[0]", "mov v2.16b, v3.16b\n fmls v2.2s, v0.2s, v1.s[0]")
+
 /* Scalar floating point: moves between the GPR and FP register files, the integer conversions, and
  * the forms that work on the bit patterns rather than on the values. Arithmetic on the values
  * (fadd, fcvt, ...) is not translated yet, so it is not here. */
@@ -674,15 +707,22 @@ L_CASES(B_DEF)
 U_CASES(U_DEF)
 X_CASES(X_DEF)
 B_CASES(B_DEF)
+BE_CASES(B_DEF)
+BE_FP_CASES(B_DEF)
 FP_CASES(F_DEF)
 
 static const struct vcase wide_cases[] = {L_CASES(B_ENTRY)};
 static const struct vcase unary_cases[] = {U_CASES(U_ENTRY)};
 static const struct vcase binary_cases[] = {B_CASES(B_ENTRY)};
+static const struct vcase by_element_cases[] = {BE_CASES(B_ENTRY)};
+static const struct vcase by_element_fp_cases[] = {BE_FP_CASES(B_ENTRY)};
 static const struct xcase gpr_cases[] = {X_CASES(X_ENTRY)};
 static const struct fcase fp_cases[] = {FP_CASES(F_ENTRY)};
 
 static const unsigned char pairs[][2] = {{0, 1}, {2, 3}, {4, 0}, {4, 3}};
+
+/* The rows a value can come from without being a NaN: 0, -0 and the denormal patterns. */
+static const unsigned char value_pairs[][2] = {{0, 2}, {2, 3}, {3, 0}, {0, 3}, {3, 2}, {2, 0}};
 
 struct fp_in {
     unsigned int f;
@@ -743,6 +783,28 @@ __attribute__((used)) void GUEST_ENTRY(void) {
             zero_results();
             binary_cases[n].fn();
             put_tag(binary_cases[n].name, pairs[p][0], pairs[p][1]);
+            put_results(2);
+        }
+    }
+
+    for (n = 0; n < sizeof by_element_cases / sizeof by_element_cases[0]; n++) {
+        for (p = 0; p < sizeof pairs / sizeof pairs[0]; p++) {
+            pa = patr + 32 * pairs[p][0];
+            pb = patr + 32 * pairs[p][1];
+            zero_results();
+            by_element_cases[n].fn();
+            put_tag(by_element_cases[n].name, pairs[p][0], pairs[p][1]);
+            put_results(2);
+        }
+    }
+
+    for (n = 0; n < sizeof by_element_fp_cases / sizeof by_element_fp_cases[0]; n++) {
+        for (p = 0; p < sizeof value_pairs / sizeof value_pairs[0]; p++) {
+            pa = patr + 32 * value_pairs[p][0];
+            pb = patr + 32 * value_pairs[p][1];
+            zero_results();
+            by_element_fp_cases[n].fn();
+            put_tag(by_element_fp_cases[n].name, value_pairs[p][0], value_pairs[p][1]);
             put_results(2);
         }
     }
