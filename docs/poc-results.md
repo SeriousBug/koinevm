@@ -91,7 +91,7 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `call` | recursion (`fib(20)`), a function pointer table called through `blr`, `stp`/`ldp` frames, signed division, printing | exact, exit 7 |
 | `flags` | `tst`/`ccmp` chains, `adcs`/`sbc` multi-word arithmetic, `csel`/`cset` over a matrix, `b.hi` | exact |
 | `simd` | load/store widths, three-same, two-misc, across, three-different, shifts by immediate, copy/permute/`tbl`/`tbx`/`ext`, every conversion between general and FP registers and every rounding on the way back, the vector rounding family, the minimums and maximums, the narrowing and widening float conversions, and the one-lane scalar forms | exact |
-| `bits` | `rbit`, `clz`, `cls`, `rev`, `rev32`, `rev16` over 76 patterns, and the `rbit; clz; lsr #2` sequence glibc finds a byte with | exact |
+| `bits` | `rbit`, `clz`, `cls`, `rev`, `rev32`, `rev16`, every shift and `ror` by an immediate and by a register, over 76 patterns, and the `rbit; clz; lsr #2` sequence glibc finds a byte with | exact |
 | `stack` | frames sized at run time: `sub sp, sp, xN` in the shifted and extended forms, `and sp, xn, #-16`, `alloca` with calls while the frame is open, recursion with a buffer per level | exact |
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
@@ -106,10 +106,12 @@ process reaching a spinning guest (`tests/poll.sh`), a guest patching its own co
 the console an interactive shell reads (`tests/console.sh`), a pseudo-terminal a program makes for a
 child of its own (`tests/pty.sh`), a counted wakeup one process writes and another reads
 (`tests/eventfd.sh`), the bytes `/dev/random`, `/dev/urandom` and `getrandom` hand out
-(`tests/random.sh`), the CPU a process, a thread and its children have used (`tests/rusage.sh`), an
-editor on top of the whole stack (`tests/nvim.sh`), and the socket,
-epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all
-115; `tests/nvim.sh` skips when the image has no `neovim` in it.
+(`tests/random.sh`), the CPU a process, a thread and its children have used (`tests/rusage.sh`), the
+SHA-3 instructions of Keccak's round (`tests/sha3.sh`, which has no oracle because a Mac has no
+`FEAT_SHA3`, so the reference is the definitions in scalar C), an editor on top of the whole stack
+(`tests/nvim.sh`), and the socket, epoll, signal and resolver paths, each in both address-check
+modes. `bash tests/run.sh` runs all 116; `tests/nvim.sh` skips when the image has no `neovim` in
+it.
 
 The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
@@ -307,6 +309,12 @@ Two things follow.
   state (it says `R` for anything still in the table), and `/dev` has the character devices and the
   terminal links rather than block devices, `loop*`, `tty1..N` or the framebuffer a machine with a
   console would have.
+- **Code has to live below 4 GiB.** A dispatch word is keyed by the low 32 bits of `pc >> 2` and
+  the shadow's pc is 32 bits wide, so a jump above 4 GiB lands in the slot of the address 4 GiB
+  below it. The second memory holds heap, and a heap is not run: a program that maps an
+  executable page at 8 GiB and calls into it does not get there, measured with a page written at 8
+  GiB and called. A JIT whose own code range lands above the boundary would break; node's has not,
+  which is why `tests/jit.sh` passes at every address it uses.
 - **Job control.** One console and one process group: `Ctrl-Z`, `fg`, `jobs`, and a window that is
   resized (`SIGWINCH`) are not there, so a stopped job cannot be resumed. And the console's interrupt
   reaches the processes that take the default action for it: the shell catches it so that it can

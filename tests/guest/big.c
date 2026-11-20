@@ -46,6 +46,7 @@ static long madvise(void *addr, unsigned long len, long advice) {
 
 static long sysinfo(void *buf) { return sc6(179, (long)buf, 0, 0, 0, 0, 0); }
 
+
 static void guest_exit(long code) {
     register long x8 __asm__("x8") = 93;
     register long x0 __asm__("x0") = code;
@@ -86,6 +87,17 @@ static unsigned long field64(const unsigned char *buf, int off) {
     unsigned long v = 0;
     for (int i = 7; i >= 0; i--) v = (v << 8) | buf[off + i];
     return v;
+}
+
+#define CLOCK_MONOTONIC 1
+
+static void clock_gettime(long clock, void *ts) { sc6(113, clock, (long)ts, 0, 0, 0, 0); }
+
+/// Nanoseconds since the clock's origin, from the `struct timespec` the call fills in.
+static unsigned long now_ns(void) {
+    unsigned char ts[16];
+    clock_gettime(CLOCK_MONOTONIC, ts);
+    return field64(ts, 0) * 1000000000UL + field64(ts, 8);
 }
 
 __attribute__((used)) void _start(void) {
@@ -175,7 +187,12 @@ __attribute__((used)) void _start(void) {
     check(copied, "a copy that crosses the seam", seam);
     check(*(volatile unsigned long *)(base + wide_len - 8) == 0,
           "and the far end of the mapping is there and zero", *(unsigned long *)(base + wide_len - 8));
+    // Freeing it is work per page that holds a translation, not per word the range covers: a range
+    // of gigabytes that is walked word by word takes longer than the program that freed it lives.
+    unsigned long freed_at = now_ns();
     check(munmap(wide, wide_len) == 0, "munmap of a range that crosses a boundary", base);
+    unsigned long freed_in = now_ns() - freed_at;
+    check(freed_in < 5000000000UL, "and freeing it is not a walk over every word (us)", freed_in / 1000);
 
     // Unmapping and mapping again above the boundary works the same way.
     check(munmap(p, 2 * PAGE) == 0, "munmap above 4 GiB", (unsigned long)p);
