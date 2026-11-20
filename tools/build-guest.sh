@@ -61,7 +61,7 @@ EOF
 done
 
 # The memory syscalls have no oracle: tests/mem.sh requires the guest's own checks to pass.
-echo "== guest: mem (mmap/munmap/mprotect/brk) =="
+echo "== guest: mem (mmap/munmap/mprotect/brk/madvise/sysinfo) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/mem.c -o tests/guest/mem.o
 python3 tools/minilink.py tests/guest/mem.o tests/guest/mem.elf _start

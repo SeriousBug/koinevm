@@ -1,4 +1,5 @@
-/* Guest that exercises the memory side of the ABI: mmap, munmap, mprotect and brk.
+/* Guest that exercises the memory side of the ABI: mmap, munmap, mprotect, brk, madvise, and what
+ * `sysinfo` is allowed to say about the memory a run has.
  *
  * No native oracle can run this: the syscall numbers and the initial map are Linux's, and the host
  * supplies them. So the guest asserts the properties a kernel has to provide and reports each one,
@@ -34,6 +35,30 @@ static long munmap(void *addr, unsigned long len) { return sc6(215, (long)addr, 
 
 static long mprotect(void *addr, unsigned long len, long prot) {
     return sc6(226, (long)addr, (long)len, prot, 0, 0, 0);
+}
+
+#define MADV_NORMAL 0
+#define MADV_WILLNEED 3
+#define MADV_DONTNEED 4
+#define MADV_FREE 8
+
+static long madvise(void *addr, unsigned long len, long advice) {
+    return sc6(233, (long)addr, (long)len, advice, 0, 0, 0);
+}
+
+/// `struct sysinfo` is 112 bytes on this ABI, and the fields this guest reads are at offsets that
+/// no alignment rule moves.
+static long sysinfo(void *buf) { return sc6(179, (long)buf, 0, 0, 0, 0, 0); }
+
+static unsigned long field64(const unsigned char *buf, int off) {
+    unsigned long v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | buf[off + i];
+    return v;
+}
+
+static unsigned long field32(const unsigned char *buf, int off) {
+    return (unsigned long)buf[off] | ((unsigned long)buf[off + 1] << 8) |
+           ((unsigned long)buf[off + 2] << 16) | ((unsigned long)buf[off + 3] << 24);
 }
 
 static void guest_exit(long code) {
@@ -129,6 +154,38 @@ __attribute__((used)) void _start(void) {
     unsigned char *fixed = (void *)sc6(222, (long)((unsigned long)again + 16 * PAGE), PAGE,
                                       PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | 0x10, -1, 0);
     check(fixed == again + 16 * PAGE, "mmap MAP_FIXED", (unsigned long)fixed);
+
+    // madvise: a page given back reads as a fresh mapping of the same thing, which for anonymous
+    // memory is zeros. A program that frees memory this way sees whatever a stale page held if the
+    // kernel only answers zero.
+    unsigned char *gone = mmap(0, 2 * PAGE);
+    fill(gone, 2 * PAGE, 9);
+    check(madvise(gone, 2 * PAGE, MADV_DONTNEED) == 0, "madvise MADV_DONTNEED", (unsigned long)gone);
+    zero = 1;
+    for (unsigned long i = 0; i < 2 * PAGE; i++) zero &= gone[i] == 0;
+    check(zero, "a discarded page reads as zeros", (unsigned long)gone);
+    fill(gone, 2 * PAGE, 13);
+    check(madvise(gone, PAGE, MADV_FREE) == 0, "madvise MADV_FREE", (unsigned long)gone);
+    zero = 1;
+    for (unsigned long i = 0; i < PAGE; i++) zero &= gone[i] == 0;
+    check(zero, "and so does the free form", (unsigned long)gone);
+    check(same(gone + PAGE, PAGE, 13), "while the page it did not name keeps its bytes",
+          (unsigned long)gone);
+    check(madvise(gone, 2 * PAGE, MADV_WILLNEED) == 0, "an advice that is only a hint", MADV_WILLNEED);
+    check(madvise(gone, 2 * PAGE, MADV_NORMAL) == 0, "and the one for no advice at all", MADV_NORMAL);
+
+    // sysinfo: what a program sizes itself by has to be memory a run can back. The whole guest is
+    // one wasm memory of at most 4 GiB, so a total above that is a promise this machine cannot
+    // keep, and the free part has to be inside it.
+    unsigned char info[112];
+    check(sysinfo(info) == 0, "sysinfo", (unsigned long)info);
+    unsigned long total = field64(info, 32);
+    unsigned long free = field64(info, 40);
+    check(field64(info, 0) <= 1UL << 20, "sysinfo uptime is seconds, not a random word",
+          field64(info, 0));
+    check(field32(info, 104) == 1, "sysinfo counts in bytes", field32(info, 104));
+    check(total > 0 && total <= (1UL << 32), "sysinfo total is inside the address space", total);
+    check(free > 0 && free <= total, "sysinfo free is inside the total", free);
 
     put(failures ? "mem: FAILURES\n" : "mem: all checks passed\n");
     guest_exit(failures ? 1 : 0);

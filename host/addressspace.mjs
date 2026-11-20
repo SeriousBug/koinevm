@@ -5,6 +5,8 @@
 // virtual addresses are linear-memory offsets, so mapping a range is bookkeeping plus the bytes the
 // range starts with.
 
+import fs from "node:fs";
+
 export const PAGE = 4096;
 
 export const PTE = {
@@ -20,6 +22,10 @@ export const PROT = { READ: 1, WRITE: 2, EXEC: 4 };
 export const MAP = { SHARED: 0x01, PRIVATE: 0x02, FIXED: 0x10, ANONYMOUS: 0x20, POPULATE: 0x8000 };
 
 export const MREMAP = { MAYMOVE: 1, FIXED: 2, DONTUNMAP: 4 };
+
+/// The advices this kernel acts on, which are the ones that let it take a page back.
+export const MADV = { DONTNEED: 4, FREE: 8, REMOVE: 9, DONTNEED_LOCKED: 24 };
+const DROP = new Set(Object.values(MADV));
 
 export const EINVAL = 22;
 export const ENOMEM = 12;
@@ -213,6 +219,60 @@ export class AddressSpace {
       this.ptes[p] = this.protBits(prot);
     }
     return 0;
+  }
+
+  /// madvise(2). The advices a kernel acts on are the ones that give a page back, and what the page
+  /// reads as afterwards is what a fresh mapping of the same thing holds: zeros for anonymous
+  /// memory, the file for a page of one. The rest are hints, with nothing here to hint at.
+  madvise(addr, len, advice) {
+    if (!DROP.has(advice)) return 0;
+    if (len < 0 || addr % PAGE !== 0) return -EINVAL;
+    const hi = Math.min(addr + roundUp(len, PAGE), this.memory.buffer.byteLength);
+    for (let p = addr >> 12; p < hi >> 12; p++) {
+      // A page that is not writable is code or a read-only mapping of a file: a program cannot
+      // have changed it, so there is nothing to give back.
+      if ((this.ptes[p] & (PTE.MAPPED | PTE.WRITABLE)) !== (PTE.MAPPED | PTE.WRITABLE)) continue;
+      const at = p * PAGE;
+      const back = this.imageBytes(this.imageOf(at), at);
+      if (back) this.bytes(at, PAGE).set(back);
+      else this.bytes(at, PAGE).fill(0);
+      // Giving a page back that held translated code changes what is there, which is the same
+      // reason a `mprotect` that makes a page writable drops it.
+      if (this.ptes[p] & PTE.TRANSLATED) {
+        this.ptes[p] &= ~PTE.TRANSLATED;
+        this.forget(at, at + PAGE);
+      }
+    }
+    return 0;
+  }
+
+  /// The file's own bytes for a page of an image, which is what a page given back and faulted again
+  /// shows. A page past the end of the file, or one whose file is gone, reads as zeros either way.
+  imageBytes(image, at) {
+    if (!image || !image.host) return null;
+    const off = at - image.base;
+    if (off < 0) return null;
+    try {
+      const fd = fs.openSync(image.host, "r");
+      try {
+        const buf = Buffer.alloc(PAGE);
+        fs.readSync(fd, buf, 0, PAGE, off);
+        return buf;
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  /// What `sysinfo` can say about this machine's memory: the ranges a program may still grow into,
+  /// which are the heap up to its limit and the arena `mmap` fills, and how much of them is free.
+  /// Not `memory`: that name is the wasm memory this space is the map of.
+  capacity() {
+    let free = Math.max(0, this.brkLimit - this.brk);
+    for (const s of this.free) free += s.hi - s.lo;
+    return { total: this.brkLimit - this.brkBase + (this.arenaHi - this.arenaLo), free };
   }
 
   /// brk(2): the break is a byte address, not a page address, and moving it maps or unmaps pages.

@@ -42,14 +42,16 @@ so a library the loader maps while it runs executes without being known in advan
   runs, so this is the only way a `libc.so.6` mapped by `ld.so` can be executed.
 - Syscall boundary shaped like a Linux ABI layer: number in x8, args in x0-x5, result or `-errno` in
   x0, unknown numbers answer `-ENOSYS` and say so once on stderr with `ARMJIT_SYSCALLS=1`. Memory:
-  `brk`, `mmap` (anonymous and file-backed, `MAP_FIXED`), `munmap`, `mprotect`, with a free-span
-  allocator and the page table maintained in guest memory. Files: `openat`, `close`, `read`,
-  `pread64`, `readv`, `preadv`, `write`, `writev`, `lseek`, `fstat`, `newfstatat`, `readlinkat`,
-  `faccessat`, `getcwd`, `ioctl`, resolved inside a root filesystem directory. Waiting and counting:
-  `pipe2`, `eventfd`/`eventfd2`, `signalfd4`, `ppoll`, `epoll_*`, `futex`, `getrusage`, `times`.
-  Start-up: `set_tid_address`, `set_robust_list`, `uname`, `clock_gettime`, `clock_getres`,
-  `getrandom`, `prlimit64`, `sched_getaffinity`, `getuid` family, `rt_sigaction`, `rt_sigprocmask`,
-  `madvise`, `membarrier`, `sched_yield`.
+  `brk`, `mmap` (anonymous and file-backed, `MAP_FIXED`), `munmap`, `mprotect`, `madvise` (the
+  advices that take a page back zero it, or read it from the file again), with a free-span allocator
+  and the page table maintained in guest memory, and `sysinfo` answering the ranges a run can still
+  allocate. Files: `openat`, `close`, `read`, `pread64`, `readv`, `preadv`, `write`, `writev`,
+  `lseek`, `fstat`, `newfstatat`, `readlinkat`, `faccessat`, `getcwd`, `ioctl`, resolved inside a
+  root filesystem directory. Waiting and counting: `pipe2`, `eventfd`/`eventfd2`, `signalfd4`,
+  `ppoll`, `epoll_*`, `futex` with both shapes of deadline and the requeue forms, `getrusage`,
+  `times`. Start-up: `set_tid_address`, `set_robust_list`, `uname`, `clock_gettime`,
+  `clock_getres`, `getrandom`, `prlimit64`, `sched_getaffinity`, `getuid` family, `rt_sigaction`,
+  `rt_sigprocmask`, `membarrier`, `sched_yield`.
 
 ## Correctness
 
@@ -67,9 +69,10 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Thirty-five more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
-memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`, which makes two names that
-differ only in case and checks they stay two files), the pages a guest may not touch
+checks on and off. Thirty-seven more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+memory syscalls (`tests/mem.sh`), a wait that times out and the wake that ends one
+(`tests/futex.sh`), the file syscalls (`tests/files.sh`, which makes two names that differ only in
+case and checks they stay two files), the pages a guest may not touch
 (`tests/faults.sh`), the handler a caught signal runs (`tests/sighandler.sh`), a signal and another
 process reaching a spinning guest (`tests/poll.sh`), a guest patching its own code (`tests/smc.sh`),
 the console an interactive shell reads (`tests/console.sh`), a pseudo-terminal a program makes for a
@@ -78,7 +81,7 @@ child of its own (`tests/pty.sh`), a counted wakeup one process writes and anoth
 (`tests/random.sh`), the CPU a process, a thread and its children have used (`tests/rusage.sh`), an
 editor on top of the whole stack (`tests/nvim.sh`), and the socket,
 epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all
-115; `tests/nvim.sh` skips when the image has no `neovim` in it.
+117; `tests/nvim.sh` skips when the image has no `neovim` in it.
 
 The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own

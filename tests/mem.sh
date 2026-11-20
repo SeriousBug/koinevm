@@ -1,5 +1,5 @@
 #!/bin/bash
-# The memory syscalls: mmap, munmap, mprotect, brk.
+# The memory syscalls: mmap, munmap, mprotect, brk, madvise, and the totals `sysinfo` reports.
 #
 # There is no native oracle for these: the numbers and the initial map are Linux's, and the host
 # provides them. The guest asserts the properties a kernel owes it and reports each one, so the test

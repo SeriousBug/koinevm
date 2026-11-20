@@ -501,16 +501,17 @@ export class Kernel {
     this.on(172, (k) => [BigInt(k.pid), 0]); // getpid
     this.on(173, (k) => [BigInt(k.ppid), 0]); // getppid
     this.on(179, (k, buf) => {
-      // What `sysconf(_SC_PHYS_PAGES)` and a progress bar read. The guest's memory is the wasm
-      // memory it was given, so that is the whole of it, and a program that sizes a buffer by
-      // the free part has to hear something a run can back.
+      // What `sysconf(_SC_PHYS_PAGES)` and a program that sizes its heap by the machine reads. The
+      // guest's memory is the linear memory it was given, less what the engine, the images and the
+      // stack hold, so what it hears is what a run can back: the ranges it may grow into, and how
+      // much of them is free now.
       const at = BigInt(k.addr(buf));
       if (!k.inBounds(Number(at), 112)) return k.fail(EFAULT);
-      const total = BigInt(k.memory.buffer.byteLength);
+      const { total, free } = k.space.capacity();
       k.put64(at, 1n); // uptime, in seconds
       for (let i = 0; i < 3; i++) k.put64(at + BigInt(8 + i * 8), 0n);
-      k.put64(at + 32n, total);
-      k.put64(at + 40n, total / 2n); // freeram
+      k.put64(at + 32n, BigInt(total));
+      k.put64(at + 40n, BigInt(free));
       k.put64(at + 48n, 0n);
       k.put64(at + 56n, 0n);
       k.put64(at + 64n, 0n);
