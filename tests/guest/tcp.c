@@ -1,5 +1,6 @@
 /* Guest that exercises the connection side of the ABI: a client against a host that answers, the
- * same client without blocking, and a listener of its own that a forked child connects to.
+ * same client without blocking, and a listener of its own that a forked child connects to, then one
+ * the same process connects to, whose bytes go out as two iovecs.
  *
  * tests/net.sh starts a TCP echo server and hands its port over as argv[1]. The checks are the same
  * on a real kernel, which is what the run compares against. */
@@ -53,6 +54,11 @@ struct timespec {
     long nsec;
 };
 
+struct iovec {
+    void *base;
+    unsigned long len;
+};
+
 static long socket_(long domain, long type, long protocol) { return sc6(198, domain, type, protocol, 0, 0, 0); }
 static long bind_(long fd, const void *addr, long len) { return sc6(200, fd, (long)addr, len, 0, 0, 0); }
 static long listen_(long fd, long backlog) { return sc6(201, fd, backlog, 0, 0, 0, 0); }
@@ -73,6 +79,7 @@ static long ppoll_(struct pollfd *fds, long n, long ms) {
 }
 static long write_(long fd, const void *buf, unsigned long n) { return sc6(64, fd, (long)buf, n, 0, 0, 0); }
 static long read_(long fd, void *buf, unsigned long n) { return sc6(63, fd, (long)buf, n, 0, 0, 0); }
+static long writev_(long fd, const struct iovec *iov, long n) { return sc6(66, fd, (long)iov, n, 0, 0, 0); }
 static long close_(long fd) { return sc6(57, fd, 0, 0, 0, 0, 0); }
 static long fork_(void) { return sc6(220, 17, 0, 0, 0, 0, 0); } /* SIGCHLD */
 static long wait4_(long pid, int *status) { return sc6(260, pid, (long)status, 0, 0, 0, 0); }
@@ -244,6 +251,35 @@ void run(unsigned long *sp) {
 
     int status = -1;
     check(wait4_(pid, &status) == pid && status == 0, "the child exited with zero");
+
+    // The same process on both ends, which is the shape every server has: the connection arrives
+    // while nothing is waiting in `accept`, so the listener is what a program watches for it.
+    long client = socket_(AF_INET, SOCK_STREAM, 0);
+    check(client >= 0, "a socket to connect from");
+    check(connect_(client, &self, sizeof(self)) == 0, "a connection to the guest's own listener");
+    one.fd = (int)server;
+    one.events = POLLIN;
+    one.revents = 0;
+    check(ppoll_(&one, 1, 5000) == 1 && (one.revents & POLLIN) != 0,
+          "a listener with a connection waiting is readable");
+    len = sizeof(from);
+    conn = accept_(server, &from, &len);
+    check(conn >= 0, "accept answers a connection nothing was waiting for");
+
+    // A write of more than one piece, which is what a header and a body are: every iovec goes out,
+    // and the peer reads one stream of them.
+    struct iovec parts[2];
+    parts[0].base = (void *)"part-one\n";
+    parts[0].len = 9;
+    parts[1].base = (void *)"part-two\n";
+    parts[1].len = 9;
+    check(writev_(client, parts, 2) == 18, "writev on a socket sends every iovec");
+    got = read_fully(conn, buf, 18);
+    check(got == 18 && bytes_equal(buf, "part-one\npart-two\n", 18),
+          "the peer reads them as one stream");
+    check(close_(conn) == 0, "close of that connection");
+    check(close_(client) == 0, "close of the client end");
+
     check(close_(server) == 0, "close of the listener");
 
     // A socket that was never told to listen cannot accept.

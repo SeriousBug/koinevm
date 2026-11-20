@@ -721,13 +721,7 @@ export class Kernel {
     this.on(64, (k, fd, buf, count) => {
       const bytes = k.read(buf, Math.min(Number(count), 0x7ffff000));
       if (bytes === null) return k.fail(EFAULT);
-      const entry = k.files.get(Number(fd));
-      if (entry && entry.kind === "socket") {
-        return [BigInt(entry.desc.send(Buffer.from(bytes), null)), 0];
-      }
-      const wrote = k.files.write(Number(fd), Buffer.from(bytes));
-      if (wrote > 0) k.wake();
-      return [BigInt(wrote), 0];
+      return [BigInt(writeBytes(k, Number(fd), Buffer.from(bytes))), 0];
     });
 
     // `signalfd4`: a descriptor a program reads its signals from instead of installing a handler.
@@ -744,6 +738,18 @@ export class Kernel {
       }
       return [BigInt(k.files.add({ kind: "signalfd", desc: { mask: set, nonblock: (Number(flags) & 0x800) !== 0 }, cloexec: (Number(flags) & 0x80000) !== 0 })), 0];
     });
+
+    // What a write of some bytes does to a descriptor, whichever syscall asked for it: a socket
+    // sends them to its peer, and everything else goes to the file table. `writev` reaches this the
+    // same way `write` does, because a program that answers on a socket writes a header and a body
+    // as two iovecs and a path that only knew files would refuse it.
+    const writeBytes = (k, fd, bytes) => {
+      const entry = k.files.get(fd);
+      if (entry && entry.kind === "socket") return entry.desc.send(bytes, null);
+      const wrote = k.files.write(fd, bytes);
+      if (wrote > 0) k.wake();
+      return wrote;
+    };
 
     this.on(66, (k, fd, iov, count) => {
       const n = Number(count);
@@ -762,7 +768,7 @@ export class Kernel {
         }
         if (process.env.ARMJIT_TRACE_SYSCALLS)
           console.error(`  writev fd=${Number(fd)} ${JSON.stringify(Buffer.from(bytes).toString("latin1"))}`);
-        const wrote = k.files.write(Number(fd), Buffer.from(bytes));
+        const wrote = writeBytes(k, Number(fd), Buffer.from(bytes));
         if (typeof wrote === "number" && wrote < 0) return [BigInt(wrote), 0];
         total += wrote;
       }

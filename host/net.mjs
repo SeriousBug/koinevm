@@ -688,7 +688,9 @@ class Stream {
 
   status() {
     return {
-      read: this.queue.length > 0 || this.ended,
+      // A listener is readable when a connection is waiting for `accept`, which is what a program
+      // watching it polls for; a connection is readable when it holds bytes or its peer is done.
+      read: this.listener ? this.accepted.length > 0 : this.queue.length > 0 || this.ended,
       // A connecting socket is not writable yet, which is how a guest waiting on a non-blocking
       // connect learns that it finished.
       write: this.state === "connected",
@@ -698,7 +700,8 @@ class Stream {
   }
 
   pending() {
-    return this.queued();
+    // The bytes a receive would take: a listener accepts rather than reads, so it holds none.
+    return this.listener ? 0 : this.queued();
   }
 
   addressPending() {
@@ -1078,7 +1081,11 @@ export const nodeNetwork = {
       },
       close() {
         try {
-          socket.destroy();
+          // A close sends what was already written and then the end of the stream, which is what a
+          // peer of a kernel's `close` reads. Destroying the socket drops the bytes queued for it,
+          // and a program that answers and closes loses the answer.
+          if (socket.destroyed || socket.writableEnded) socket.destroy();
+          else socket.end(() => socket.destroy());
         } catch {}
       },
     };

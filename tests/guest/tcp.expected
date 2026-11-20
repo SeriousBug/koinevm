@@ -32,6 +32,14 @@ ok   the accepted connection has the bytes
 ok   and then the end of the child's stream
 ok   close of an accepted connection
 ok   the child exited with zero
+ok   a socket to connect from
+ok   a connection to the guest's own listener
+ok   a listener with a connection waiting is readable
+ok   accept answers a connection nothing was waiting for
+ok   writev on a socket sends every iovec
+ok   the peer reads them as one stream
+ok   close of that connection
+ok   close of the client end
 ok   close of the listener
 ok   accept without listen is EINVAL
 ok   close of it
