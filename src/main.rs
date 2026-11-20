@@ -516,8 +516,12 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     _ => reply.push_str("{\"ok\":false,\"error\":\"bad request\"}"),
                 }
-                println!("{reply}");
-                std::io::stdout().flush().map_err(|e| e.to_string())?;
+                // The host may be gone: a reply that goes into a closed pipe ends this process
+                // quietly, which is what a helper whose owner has exited should do.
+                let mut out = std::io::stdout();
+                if writeln!(out, "{reply}").is_err() || out.flush().is_err() {
+                    return Ok(());
+                }
             }
         }
         "gaps" => {
