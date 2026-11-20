@@ -96,6 +96,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/poll.c -o tests/guest/poll.o
 python3 tools/minilink.py tests/guest/poll.o tests/guest/poll.elf _start
 
+echo "== guest: rusage (getrusage for the process, a thread and the children, and times) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
+    -c tests/guest/rusage.c -o tests/guest/rusage.o
+python3 tools/minilink.py tests/guest/rusage.o tests/guest/rusage.elf _start
+
 echo "== guest: smc (a guest that writes an instruction into its own text and runs it) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/smc.c -o tests/guest/smc.o

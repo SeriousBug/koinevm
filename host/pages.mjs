@@ -299,7 +299,7 @@ export class Mach {
     if (!this.hasDispatch(pc)) {
       throw new Error(`translated 0x${pc.toString(16)} but no block starts there`);
     }
-    const out = this.instance.exports.run(0, 0n, 1);
+    const out = this.kernel.usage.run(() => this.instance.exports.run(0, 0n, 1));
     T.push(performance.now());
     if (process.env.ARMJIT_TRACE_PAGES)
       console.error(`  phases ${T.slice(1).map((t, i) => (t - T[i]).toFixed(1)).join(" ")} status ${out}`);

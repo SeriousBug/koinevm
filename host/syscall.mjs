@@ -8,6 +8,7 @@ import { randomFillSync } from "node:crypto";
 import fs from "node:fs";
 import { AddressSpace, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
 import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK, O_WRONLY, O_RDWR, terminal } from "./files.mjs";
+import { Usage, rusageBytes, tmsBytes } from "./usage.mjs";
 import {
   Net,
   decodeSockaddr,
@@ -158,6 +159,9 @@ export class Kernel {
     /// a package manager's own sandbox work rather than argue with it.
     this.ids = { uid: 0, euid: 0, gid: 0, egid: 0, groups: [0] };
     this.table = new Map();
+    /// The CPU this process has used. The process owns it rather than this kernel: an exec builds a
+    /// new kernel, and the time the program before it spent is still the process's.
+    this.usage = options.usage ?? new Usage();
     // What a syscall that cannot finish inside the guest's wasm call leaves for the host: the run
     // returns, this is served, and the process is resumed with x0 as the answer.
     this.pending = null;
@@ -1967,6 +1971,31 @@ export class Kernel {
         if (!k.put(tz, Buffer.alloc(8))) return k.fail(EFAULT);
       }
       return [0n, 0];
+    });
+
+    // getrusage: what the guest's own code and this kernel have cost it, which is the split a
+    // shell's `time` builtin subtracts a pair of readings for. `RUSAGE_CHILDREN` is only what has
+    // been waited for, and the session adds a child's time to its parent when the child is reaped.
+    this.on(165, (k, who, buf) => {
+      // The answer includes the run this call is in, which has not returned yet.
+      k.usage.flush();
+      const which = Number(BigInt.asIntN(32, BigInt.asUintN(64, who)));
+      let user, sys;
+      if (which === 0) [user, sys] = [k.usage.user, k.usage.sys];
+      else if (which === -1) [user, sys] = [k.usage.childUser, k.usage.childSys];
+      else if (which === 1) [user, sys] = [k.usage.thread?.user ?? k.usage.user, k.usage.thread?.sys ?? k.usage.sys];
+      else return k.fail(EINVAL);
+      if (k.addr(buf) === 0 || !k.put(buf, rusageBytes(user, sys))) return k.fail(EFAULT);
+      return [0n, 0];
+    });
+
+    // times: the same accounting in the ticks the ABI fixes at 100 per second, plus a return value
+    // that is only ever subtracted from another one. A null `buf` is legal and the value is all the
+    // caller wanted.
+    this.on(153, (k, buf) => {
+      k.usage.flush();
+      if (k.addr(buf) !== 0 && !k.put(buf, tmsBytes(k.usage))) return k.fail(EFAULT);
+      return [k.usage.ticksNow(), 0];
     });
 
     this.on(278, (k, buf, len) => {

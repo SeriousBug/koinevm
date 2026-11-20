@@ -355,7 +355,11 @@ function makeImports(proc) {
         const args = [a0, a1, a2, a3, a4, a5].map((v) => `0x${BigInt(v).toString(16)}`).join(" ");
         console.error(`syscall ${nr} from ${where(pc)}: ${args}`);
       }
+      const mark = proc.usage.mark();
       const answer = kernel.call(nr, a0, a1, a2, a3, a4, a5);
+      // A syscall is the kernel's work on the guest's behalf, so the time inside it is its system
+      // time. The run brackets it with the same clock and takes it back off the user time.
+      proc.usage.charge(mark);
       if (Array.isArray(answer)) return [answer[0], answer[1]];
       // The host has to act, which it cannot do from inside this call: the run returns and the
       // scheduler resumes it with x0 holding the answer.
@@ -364,7 +368,10 @@ function makeImports(proc) {
     },
     poll: () => {
       enter(proc);
-      return session.pollPoint(proc);
+      const mark = proc.usage.mark();
+      const answer = session.pollPoint(proc);
+      proc.usage.charge(mark);
+      return answer;
     },
     trap: (kind, addr, at) => {
       enter(proc);

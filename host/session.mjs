@@ -19,6 +19,7 @@ import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
 import { Mach } from "./pages.mjs";
 import { PTE } from "./addressspace.mjs";
+import { Usage, rusageBytes } from "./usage.mjs";
 import { SIGFRAME, SA_ONSTACK, SA_SIGINFO, SA_RESTORER, SI_USER, SS_DISABLE } from "./syscall.mjs";
 
 const SHADOW = 0x0;
@@ -80,6 +81,7 @@ export class Session {
       code: null,
       threads: [],
       current: null,
+      usage: new Usage(),
     };
     this.instantiate(proc);
     this.seedRandom(proc);
@@ -104,6 +106,9 @@ export class Session {
       pending: null,
       regs: new Uint8Array(THREAD_STATE),
       vecs: new Uint8Array(16 * NVEC),
+      /// A thread's own CPU time, which `RUSAGE_THREAD` asks for. The process's is the sum, since
+      /// only one thread runs at a time here.
+      usage: { user: 0n, sys: 0n },
     };
   }
 
@@ -145,6 +150,7 @@ export class Session {
       pid: proc.pid,
       ppid: proc.ppid,
       files,
+      usage: proc.usage,
       net: this.net,
       resolver: this.resolver,
       signal: (request) => this.signal(request),
@@ -263,6 +269,7 @@ export class Session {
   /// One entry into the guest, run until it exits, asks the host, or jumps somewhere untranslated.
   async step(proc, thread) {
     this.switchTo(proc, thread);
+    proc.usage.thread = thread.usage;
     if (process.env.ARMJIT_TRACE_STEPS) {
       const v = new DataView(proc.memory.buffer);
       console.error(
@@ -290,15 +297,15 @@ export class Session {
     if (thread.pending) {
       const request = thread.pending;
       thread.pending = null;
-      return this.answer(proc, thread, request);
+      return this.charged(proc, () => this.answer(proc, thread, request));
     }
     let status;
     try {
       if (thread.entry) {
         thread.entry = false;
-        status = proc.instance.exports.run(proc.meta.entry, BigInt(proc.meta.sp), 0);
+        status = proc.usage.run(() => proc.instance.exports.run(proc.meta.entry, BigInt(proc.meta.sp), 0));
       } else {
-        status = proc.instance.exports.run(0, 0n, 1);
+        status = proc.usage.run(() => proc.instance.exports.run(0, 0n, 1));
       }
       while (status === 2) {
         const pc = proc.mach.view.getUint32(SHADOW_PC, true) >>> 0;
@@ -326,10 +333,26 @@ export class Session {
       if (e && e.kind !== undefined && e.signal) return this.faulted(proc, thread, e);
       throw e;
     }
-    if (status === 1) return this.serve(proc, thread);
+    if (status === 1) return this.charged(proc, () => this.serve(proc, thread));
     if (status === 0) return this.exitedBySyscall(proc, thread, proc.kernel.exited ?? 0);
     console.error(`armjit: pid ${proc.pid} stopped with status ${status}`);
     return 1;
+  }
+
+  /// What the host does for a syscall is the guest's system time, whether it answers now or after a
+  /// wait: one charge here means neither the syscall nor the scheduler has to remember to make it.
+  charged(proc, body) {
+    const mark = proc.usage.mark();
+    let answer;
+    try {
+      answer = body();
+    } catch (e) {
+      proc.usage.charge(mark);
+      throw e;
+    }
+    if (answer && typeof answer.then === "function") return answer.finally(() => proc.usage.charge(mark));
+    proc.usage.charge(mark);
+    return answer;
   }
 
   /// A syscall gave up the wasm call: do what it asked, then answer it.
@@ -683,6 +706,8 @@ export class Session {
       code: null,
       threads: [],
       current: null,
+      /// A child starts with no CPU of its own behind it, which is what a fork in a kernel gives it.
+      usage: new Usage(),
     };
     this.instantiate(child);
     child.kernel.adopt(parent.kernel.forkState());
@@ -997,14 +1022,16 @@ export class Session {
       ];
       program = script.interp;
     }
-    const answer = await (async () => {
+    // The image is translated and compiled here, which a natively running program does not pay for:
+    // the charge around this syscall stops for the duration, so it lands in neither counter.
+    const answer = await proc.usage.suspend(async () => {
       try {
         return await this.translator.image(host, argv, request.envp);
       } catch (e) {
         if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${program}: ${e.message}`);
         return { ok: false, error: e.message };
       }
-    })();
+    });
     if (!answer.ok) {
       console.error(`armjit: cannot run ${program}: ${answer.error}`);
       return this.resume(proc, thread, -ENOEXEC);
@@ -1014,14 +1041,16 @@ export class Session {
     // address space, the page tables and every translation in them do not.
     const files = proc.kernel.files;
     files.keepAcrossExec();
-    proc.module = new WebAssembly.Module(answer.wasm);
-    proc.meta = meta;
     // The ids are the process's, not the address space's: a program that dropped privileges stays
     // dropped when it execs.
     const ids = proc.kernel.ids;
     // A caught signal is back to its default after an exec, and an ignored one stays ignored.
     const ignored = new Map([...proc.kernel.signals].filter(([, how]) => how === "ignore"));
-    this.instantiate(proc, files);
+    proc.usage.suspend(() => {
+      proc.module = new WebAssembly.Module(answer.wasm);
+      proc.meta = meta;
+      this.instantiate(proc, files);
+    });
     this.seedRandom(proc);
     proc.kernel.ids = ids;
     proc.kernel.signals = ignored;
@@ -1167,7 +1196,13 @@ export class Session {
   reap(parent, child, request) {
     const view = new DataView(parent.memory.buffer);
     if (request.wstatus) view.setInt32(request.wstatus, this.statusOf(child), true);
-    if (request.rusage) new Uint8Array(parent.memory.buffer).fill(0, request.rusage, request.rusage + 144);
+    if (request.rusage) {
+      parent.kernel.put(request.rusage, rusageBytes(child.usage.user, child.usage.sys));
+    }
+    // `RUSAGE_CHILDREN` is what a shell's `time` subtracts a pair of readings of around a command,
+    // and it counts a child only once it has been waited for, its own children included.
+    parent.usage.childUser += child.usage.user + child.usage.childUser;
+    parent.usage.childSys += child.usage.sys + child.usage.childSys;
     child.reaped = true;
     if (process.env.ARMJIT_TRACE_PROCESSES) {
       console.error(
