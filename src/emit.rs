@@ -652,17 +652,25 @@ fn emit_straddle(m: &mut Module, ty: u32, to_scratch: bool, chunks: u32) -> u32 
         f.op(IF);
         f.body.push(0x40);
         // The offset inside that chunk's memory.
-        f.lg(0);
-        f.lg(2);
-        f.op(I64_EXTEND_I32_U);
-        f.op(I64_ADD);
-        f.wrap_i64();
         if to_scratch {
+            // The scratch is where the byte goes, so its address is pushed first: a store takes the
+            // value off the stack before the address.
             f.i32c(SCRATCH as i32);
             f.lg(2);
             f.op(I32_ADD);
+            f.lg(0);
+            f.lg(2);
+            f.op(I64_EXTEND_I32_U);
+            f.op(I64_ADD);
+            f.wrap_i64();
             f.mem_at(chunk, I32_LOAD8_U, 0, 0);
+            f.mem_at(0, I32_STORE8, 0, 0);
         } else {
+            f.lg(0);
+            f.lg(2);
+            f.op(I64_EXTEND_I32_U);
+            f.op(I64_ADD);
+            f.wrap_i64();
             f.i32c(SCRATCH as i32);
             f.lg(2);
             f.op(I32_ADD);

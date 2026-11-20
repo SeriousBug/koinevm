@@ -81,7 +81,7 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Thirty-seven more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+checks on and off. Thirty-five more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
 memory syscalls (`tests/mem.sh`), a wait that times out and the wake that ends one
 (`tests/futex.sh`), an address space of more than 4 GiB (`tests/big.sh`, every access width past the
 boundary), the file syscalls (`tests/files.sh`, which makes two names that differ only in case and
@@ -94,7 +94,7 @@ child of its own (`tests/pty.sh`), a counted wakeup one process writes and anoth
 (`tests/random.sh`), the CPU a process, a thread and its children have used (`tests/rusage.sh`), an
 editor on top of the whole stack (`tests/nvim.sh`), and the socket,
 epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all
-119; `tests/nvim.sh` skips when the image has no `neovim` in it.
+115; `tests/nvim.sh` skips when the image has no `neovim` in it.
 
 The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
@@ -153,11 +153,14 @@ through a null `loop` - a crash nowhere near the syscall that was missing. `read
 file is read, and `clock_getres` left `errno` at `ENOSYS`, which made the next failure the program
 reported name the wrong thing entirely.
 
-Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs a
-`printf`-and-`strlen` program built against bookworm's glibc (`tools/build-dyn-guest.sh` builds it in
-a container and records the oracle there) through the translated `ld-linux` and `libc.so.6`, in both
-address-check modes. `bash tests/shell.sh` runs Debian's own `dash` under 50 `-c` scripts, translated
-and inside `chroot` on a container's kernel, and compares stdout, stderr and exit status of each.
+Two suites are about a real libc rather than about a fixture. `bash tests/fmt.sh` runs thirteen
+programs built against bookworm's glibc (`tools/build-dyn-guest.sh` builds them in a container and
+records their oracles there) through the translated `ld-linux` and `libc.so.6`, in both
+address-check modes; one of them keeps its buffers above 4 GiB and fills and reads them from a
+library, so the pages translated while it runs are the ones that reach past the first memory and
+across the seam between two. `bash tests/shell.sh` runs Debian's own `dash` under 50 `-c` scripts,
+translated and inside `chroot` on a container's kernel, and compares stdout, stderr and exit status
+of each.
 
 The toolchain is the other test, because it is the thing that exercises every instruction the way
 real code does. `apt-get install` unpacks and configures Debian's own packages inside the guest -
