@@ -277,6 +277,10 @@ pub struct Output {
     pub unsupported: Vec<(u64, String)>,
     /// Where the dynamic loader was placed, or zero when the program has none.
     pub interp_base: u64,
+    /// The image pages that hold a block, sorted: the ones whose dispatch words this translation
+    /// wrote. A page the guest makes writable afterwards has to have those words cleared, and only
+    /// the translator knows where a block starts, so the list travels with the module.
+    pub pages: Vec<u64>,
     /// The map the host has to maintain: where the page table is, where the heap and `mmap` areas
     /// start, and where the stack ends. The host reports these rather than assuming them.
     pub map: MapInfo,
@@ -1131,7 +1135,14 @@ pub fn translate(
 
     let wasm = m.encode();
     unsupported.sort();
+    let mut pages: Vec<u64> = regions
+        .iter()
+        .flat_map(|r| r.blocks.iter().map(|b| b.addr & !0xfff))
+        .collect();
+    pages.sort_unstable();
+    pages.dedup();
     Ok(Output {
+        pages,
         entry,
         sp,
         mem_pages: cfg.mem_pages,
@@ -4348,6 +4359,22 @@ impl<'a> RegionEmitter<'a> {
         self.setv(rd);
     }
 
+    /// Rotate each 64-bit lane of the vector on the stack right by `right`: the two shifts of the
+    /// count and its complement, or nothing at all for a count of none.
+    fn rotate_right(&mut self, right: u32) {
+        if right == 0 {
+            return;
+        }
+        self.f.ls(L_V0);
+        self.f.lg(L_V0);
+        self.f.i32c(right as i32);
+        self.f.simd(simd::I64X2_SHR_U);
+        self.f.lg(L_V0);
+        self.f.i32c((64 - right) as i32);
+        self.f.simd(simd::I64X2_SHL);
+        self.f.simd(simd::V128_OR);
+    }
+
     /// `fmax`/`fmin` and their `nm` pair, lane by lane. A lane with a NaN on both sides keeps the
     /// first of them in the order the architecture passes NaN operands on, quieted - a signalling
     /// one before a quiet one, and the first operand before the second - and the two forms part
@@ -4984,6 +5011,40 @@ impl<'a> RegionEmitter<'a> {
             Insn::Crypto => {
                 return self.refuse(format!("the crypto extensions are not translated at 0x{addr:x}"))
             }
+            Insn::Sha3 { op, imm6, rn, rm, ra, rd } => {
+                match op {
+                    Sha3Op::Eor3 => {
+                        self.getv(rn);
+                        self.getv(rm);
+                        self.f.simd(simd::V128_XOR);
+                        self.getv(ra);
+                        self.f.simd(simd::V128_XOR);
+                    }
+                    Sha3Op::Bcax => {
+                        self.getv(rm);
+                        self.getv(ra);
+                        self.f.simd(simd::V128_ANDNOT);
+                        self.getv(rn);
+                        self.f.simd(simd::V128_XOR);
+                    }
+                    // `xar` rotates the exclusive or of its two sources and `rax1` rotates the
+                    // second source alone: the rotate is of one 64-bit lane at a time, and wasm
+                    // shifts a vector by a count the same way.
+                    Sha3Op::Xar => {
+                        self.getv(rn);
+                        self.getv(rm);
+                        self.f.simd(simd::V128_XOR);
+                        self.rotate_right(imm6);
+                    }
+                    Sha3Op::Rax1 => {
+                        self.getv(rm);
+                        self.rotate_right(63);
+                        self.getv(rn);
+                        self.f.simd(simd::V128_XOR);
+                    }
+                }
+                self.setv(rd);
+            }
             Insn::Adr { rd, imm } => {
                 if rd != 31 {
                     self.f.i64c((addr as i64).wrapping_add(imm));
@@ -5286,11 +5347,11 @@ impl<'a> RegionEmitter<'a> {
                     (8, true) => I64_SHL,
                     (9, true) => I64_SHR_U,
                     (10, true) => I64_SHR_S,
-                    (_, true) => I64_ROTL,
+                    (11, true) => I64_ROTR,
                     (8, false) => I32_SHL,
                     (9, false) => I32_SHR_U,
                     (10, false) => I32_SHR_S,
-                    (_, false) => I32_ROTL,
+                    _ => I32_ROTR,
                 });
                 self.set(rd, sf);
             }

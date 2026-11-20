@@ -168,3 +168,10 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fpie -nostdlib \
     -c tests/guest/hello.c -o tests/guest/hello_pie.o
 python3 tools/minilink.py tests/guest/hello_pie.o tests/guest/hello_pie.elf _start \
     --type=dyn --base=0 --interp=/lib/ld-fake.so
+
+# The SHA-3 group is an extension a Mac does not have, so there is no oracle: tests/sha3.sh
+# requires the guest's own checks against the definitions to pass.
+echo "== guest: sha3 (eor3, bcax, xar, rax1) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_FP -march=armv8.2-a+sha3 -fno-pic -nostdlib \
+    -c tests/guest/sha3.c -o tests/guest/sha3.o
+python3 tools/minilink.py tests/guest/sha3.o tests/guest/sha3.elf _start

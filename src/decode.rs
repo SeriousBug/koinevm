@@ -53,6 +53,18 @@ pub enum PairMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sha3Op {
+    /// `D = N ^ M ^ A`, byte by byte.
+    Eor3,
+    /// `D = N ^ (M & ~A)`, byte by byte.
+    Bcax,
+    /// `D = N ^ ror(M, imm6)`, each 64-bit lane on its own.
+    Xar,
+    /// `D = N ^ rol(M, 1)`, each 64-bit lane on its own.
+    Rax1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Insn {
     Adr { rd: u32, imm: i64 },
     Adrp { rd: u32, imm: i64 },
@@ -129,6 +141,10 @@ pub enum Insn {
     VecByElement { q: bool, u: bool, size: u32, op: u32, index: u32, rn: u32, rm: u32, rd: u32 },
     /// `dup`, `ins`, `umov`, `smov`: moves between the vector file and the general registers.
     VecCopy { q: bool, op: bool, imm5: u32, imm4: u32, rn: u32, rd: u32 },
+    /// The SHA-3 group: `eor3` and `bcax` combine three registers bitwise, `xar` rotates one of them
+    /// before the exclusive or, and `rax1` rotates by one. `imm6` is the rotation of `xar`, `ra` the
+    /// third source of the two three-register forms.
+    Sha3 { op: Sha3Op, imm6: u32, rn: u32, rm: u32, ra: u32, rd: u32 },
     /// The scalar `dup Sd, Vn.T[index]`, which `mov d1, v0.d[1]` is: one lane of the source, and
     /// the rest of the register zero.
     FpDupElement { size: u32, index: u32, rn: u32, rd: u32 },
@@ -936,7 +952,13 @@ fn decode_simd_dp(w: u32) -> Insn {
         return Insn::VecThreeDiff { q, u, size, op, rn, rm, rd };
     }
     if bit10 == 1 {
-        return Insn::VecCopy { q, op: u, imm5: (w >> 16) & 0x1f, imm4: (w >> 11) & 0xf, rn, rd };
+        // The lane width is imm5's lowest set bit and the index is the field above it, so a word
+        // that sets none of the low four bits names no width a register has.
+        let imm5 = (w >> 16) & 0x1f;
+        if imm5 & 0xf == 0 {
+            return Insn::Undefined;
+        }
+        return Insn::VecCopy { q, op: u, imm5, imm4: (w >> 11) & 0xf, rn, rd };
     }
     // `ext` shares this space with the permutes and with the table forms: it is the only instruction
     // here with bit 15 clear and U set, and its imm4 occupies bits 14:11.
@@ -978,6 +1000,32 @@ fn crypto(w: u32) -> Option<Insn> {
     ];
     if two.contains(&(w & 0xffff_fc00)) {
         return Some(Insn::Crypto);
+    }
+    // The SHA-3 group is the whole of the space whose top byte is `1100 1110`: bits 23:21 name the
+    // operation, and only the 128-bit form of each exists. Keccak's round is written with these,
+    // and the vector data-processing decoder would otherwise read them as copies and permutes.
+    if w >> 24 == 0xce && (w >> 30) & 1 == 1 {
+        let rn = (w >> 5) & 31;
+        let rd = w & 31;
+        let rm = (w >> 16) & 31;
+        let ra = (w >> 10) & 31;
+        let imm6 = (w >> 10) & 0x3f;
+        let bit15 = (w >> 15) & 1 == 1;
+        let op = match ((w >> 21) & 7, bit15) {
+            (0b000, false) => Sha3Op::Eor3,
+            (0b001, false) => Sha3Op::Bcax,
+            (0b011, _) if imm6 == 0b100011 => Sha3Op::Rax1,
+            (0b100, _) => Sha3Op::Xar,
+            _ => return Some(Insn::Undefined),
+        };
+        return Some(Insn::Sha3 {
+            op,
+            imm6: if op == Sha3Op::Xar { imm6 } else { 0 },
+            rn,
+            rm,
+            ra: if matches!(op, Sha3Op::Eor3 | Sha3Op::Bcax) { ra } else { 0 },
+            rd,
+        });
     }
     None
 }

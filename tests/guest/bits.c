@@ -95,6 +95,10 @@ static const unsigned long pat[] = {
     X(ror_w_31, "ror w #31", "ror %w0, %w1, #31")                                              \
     X(ror_x_13, "ror x #13", "ror %0, %1, #13")                                                \
     X(ror_x_63, "ror x #63", "ror %0, %1, #63")                                                \
+    /* The count as a register, which is what a compiler emits for a rotate by a value it does not
+     * know: `ror` and not `rol`, and the direction is the whole answer. */                       \
+    X(rorv_x, "ror x register", "ror %0, %1, %1")                                              \
+    X(rorv_w, "ror w register", "ror %w0, %w1, %w1")                                           \
     X(extr_w_5, "extr w #5 of two", "lsl %w0, %w1, #3\n extr %w0, %w1, %w0, #5")           \
     X(extr_x_9, "extr x #9 of two", "lsl %0, %1, #3\n extr %0, %1, %0, #9")                \
     /* The form OpenSSL's montgomery square uses to shift a carry into the top bit: register 31 is
