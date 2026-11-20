@@ -8,6 +8,9 @@
 import fs from "node:fs";
 
 export const PAGE = 4096;
+/// The size of one guest memory. A wasm32 memory holds at most this, so the guest's address space
+/// is a sequence of them and the top bits of an address name the one it is in.
+export const CHUNK = 2 ** 32;
 
 export const PTE = {
   /// There is a mapping on the page, whatever it allows: `PROT_NONE` is mapped and nothing else.
@@ -31,20 +34,37 @@ export const EINVAL = 22;
 export const ENOMEM = 12;
 export const EFAULT = 14;
 
-const roundUp = (x, a) => (x + a - 1) & ~(a - 1);
+/// Rounding and page numbers are arithmetic, not shifts and masks: an address above 4 GiB does not
+/// fit in the 32 bits those keep.
+const roundUp = (x, a) => Math.ceil(x / a) * a;
+const pageOf = (addr) => Math.floor(Number(addr) / PAGE);
 
 export class AddressSpace {
-  constructor(memory, map) {
-    this.memory = memory;
+  constructor(memories, map) {
+    /// The guest's memories, low chunk first. The first also holds the engine's own state, which is
+    /// why everything that is not guest data is written through `memory` and never `memoryOf`.
+    this.memories = memories;
+    this.memory = memories[0];
+    this.chunks = memories.length;
     this.pteBase = map.pte_base;
     this.brkBase = map.heap_base;
     this.brkLimit = map.heap_limit;
     this.brk = map.heap_base;
     this.arenaLo = map.mmap_base;
     this.arenaHi = map.stack_floor;
-    // Everything from mmap_base to the stack is available for mmap. Freed ranges go back here.
-    this.free = [{ lo: map.mmap_base, hi: map.stack_floor }];
-    this.ptes = new Uint8Array(memory.buffer, this.pteBase, 1 << 20);
+    // Everything from mmap_base to the page table is available for mmap, and every chunk above the
+    // first is all of it: the stack and the page table live at the top of the first, so a mapping
+    // never has to cross into another memory.
+    this.free = [{ lo: map.mmap_base, hi: map.pte_base }];
+    for (let k = 1; k < this.chunks; k++) this.free.push({ lo: k * CHUNK, hi: (k + 1) * CHUNK });
+    /// What a program may allocate over the whole run: the heap up to its limit, the first chunk's
+    /// arena up to the page table, and every chunk above the first. It does not move as things are
+    /// mapped, which is what a program sizing itself by the machine asks for.
+    this.total = map.pte_base - map.mmap_base + (map.heap_limit - map.heap_base);
+    for (let k = 1; k < this.chunks; k++) this.total += memories[k].buffer.byteLength;
+    // One table for every chunk: a chunk is exactly 2^20 pages, so an address indexes it with
+    // `addr >> 12` and the high bits are already that chunk's part of it.
+    this.ptes = new Uint8Array(this.memory.buffer, this.pteBase, this.chunks << 20);
     // Which file each mapping came from. A jump into one of these is a page this machine has not
     // translated yet, and the file is what it has to translate it from.
     this.images = [];
@@ -53,8 +73,58 @@ export class AddressSpace {
     this.forget = () => {};
   }
 
+  /// The memory an address is in. Everything a guest can touch lives in one chunk, because a
+  /// chunk is the largest range the address space holds contiguously.
+  memoryOf(addr) {
+    return this.memories[Math.floor(Number(addr) / CHUNK)];
+  }
+
+  /// A view of `len` bytes at `addr`, which has to be inside one chunk.
   bytes(addr, len) {
-    return new Uint8Array(this.memory.buffer, Number(addr), len);
+    const at = Number(addr);
+    return new Uint8Array(this.memoryOf(at).buffer, at % CHUNK, len);
+  }
+
+  /// A copy of the guest's bytes, wherever they are: what a syscall argument is read through.
+  copyOut(addr, len) {
+    const out = Buffer.alloc(len);
+    let done = 0;
+    while (done < len) {
+      const at = Number(addr) + done;
+      const room = Math.min(CHUNK - (at % CHUNK), len - done);
+      out.set(new Uint8Array(this.memoryOf(at).buffer, at % CHUNK, room), done);
+      done += room;
+    }
+    return out;
+  }
+
+  /// The same the other way, for what a syscall writes into the guest's memory.
+  copyIn(addr, bytes) {
+    let done = 0;
+    while (done < bytes.length) {
+      const at = Number(addr) + done;
+      const room = Math.min(CHUNK - (at % CHUNK), bytes.length - done);
+      new Uint8Array(this.memoryOf(at).buffer, at % CHUNK, room).set(bytes.subarray(done, done + room));
+      done += room;
+    }
+  }
+
+  /// Fills a range with zeros, page by page across the chunks it spans.
+  zero(addr, len) {
+    let done = 0;
+    while (done < len) {
+      const at = Number(addr) + done;
+      const room = Math.min(CHUNK - (at % CHUNK), len - done);
+      new Uint8Array(this.memoryOf(at).buffer, at % CHUNK, room).fill(0);
+      done += room;
+    }
+  }
+
+  /// The whole guest address space, which is what a 64-bit address is checked against.
+  get size() {
+    let total = 0;
+    for (const memory of this.memories) total += memory.buffer.byteLength;
+    return total;
   }
 
   protBits(prot) {
@@ -100,16 +170,19 @@ export class AddressSpace {
   }
 
   setPtes(lo, hi, bits) {
-    for (let p = lo >> 12; p < roundUp(hi, PAGE) >> 12; p++) this.ptes[p] |= bits;
+    for (let p = pageOf(lo); p < pageOf(roundUp(hi, PAGE)); p++) this.ptes[p] |= bits;
   }
 
   clearPtes(lo, hi) {
-    for (let p = lo >> 12; p < roundUp(hi, PAGE) >> 12; p++) this.ptes[p] = 0;
+    for (let p = pageOf(lo); p < pageOf(roundUp(hi, PAGE)); p++) this.ptes[p] = 0;
   }
 
   /// Take `len` bytes of the free list, at `addr` when it is fixed, else as low as it fits.
   reserve(len, addr, fixed) {
+    if (len > CHUNK) return -ENOMEM;
     if (addr !== 0 && fixed) {
+      // The range has to stay inside one memory, and a chunk boundary is where one ends.
+      if (Math.floor(addr / CHUNK) !== Math.floor((addr + len - 1) / CHUNK)) return -EINVAL;
       // MAP_FIXED puts the mapping where it says even when something else is already there, which
       // is how a loader maps each segment over the reservation it just made for the whole library.
       if (addr < this.arenaLo || addr + len > this.arenaHi) return -ENOMEM;
@@ -143,9 +216,8 @@ export class AddressSpace {
     if (len <= 0) return -EINVAL;
     const at = this.reserve(len, addr, flags & MAP.FIXED);
     if (at < 0) return at;
-    const view = this.bytes(at, len);
-    view.fill(0);
-    if (contents) view.set(contents.subarray(0, Math.min(contents.length, len)));
+    this.zero(at, len);
+    if (contents) this.copyIn(at, contents.subarray(0, Math.min(contents.length, len)));
     this.setPtes(at, at + len, this.protBits(prot));
     return at;
   }
@@ -185,7 +257,7 @@ export class AddressSpace {
       if (tail && tail.lo + (newLen - oldLen) <= tail.hi) {
         this.reserve(newLen - oldLen, oldAddr + oldLen, true);
         this.bytes(oldAddr + oldLen, newLen - oldLen).fill(0);
-        this.setPtes(oldAddr + oldLen, oldAddr + newLen, this.ptes[oldAddr >> 12] & ~PTE.TRANSLATED);
+        this.setPtes(oldAddr + oldLen, oldAddr + newLen, this.ptes[pageOf(oldAddr)] & ~PTE.TRANSLATED);
         return oldAddr;
       }
     }
@@ -196,7 +268,7 @@ export class AddressSpace {
     const view = this.bytes(at, newLen);
     view.fill(0);
     view.set(this.bytes(oldAddr, keep));
-    this.setPtes(at, at + newLen, this.ptes[oldAddr >> 12] & ~PTE.TRANSLATED);
+    this.setPtes(at, at + newLen, this.ptes[pageOf(oldAddr)] & ~PTE.TRANSLATED);
     this.munmap(oldAddr, oldLen);
     return at;
   }
@@ -204,18 +276,18 @@ export class AddressSpace {
   mprotect(addr, len, prot) {
     if (addr % PAGE !== 0) return -EINVAL;
     len = roundUp(len, PAGE);
-    for (let p = addr >> 12; p < (addr + len) >> 12; p++) {
+    for (let p = pageOf(addr); p < pageOf(addr + len); p++) {
       if (!(this.ptes[p] & PTE.MAPPED)) return -ENOMEM;
     }
     // A page that was executable and is asked to be writable is a guest that means to change its
     // own code, which is the one thing a translation cannot survive: drop it and translate again
     // when the page is next run.
     let writable = false;
-    for (let p = addr >> 12; p < (addr + len) >> 12; p++) {
+    for (let p = pageOf(addr); p < pageOf(addr + len); p++) {
       if (this.ptes[p] & PTE.TRANSLATED) writable = true;
     }
     if (writable && prot & PROT.WRITE) this.forget(addr, addr + len);
-    for (let p = addr >> 12; p < (addr + len) >> 12; p++) {
+    for (let p = pageOf(addr); p < pageOf(addr + len); p++) {
       this.ptes[p] = this.protBits(prot);
     }
     return 0;
@@ -227,8 +299,8 @@ export class AddressSpace {
   madvise(addr, len, advice) {
     if (!DROP.has(advice)) return 0;
     if (len < 0 || addr % PAGE !== 0) return -EINVAL;
-    const hi = Math.min(addr + roundUp(len, PAGE), this.memory.buffer.byteLength);
-    for (let p = addr >> 12; p < hi >> 12; p++) {
+    const hi = Math.min(addr + roundUp(len, PAGE), this.size);
+    for (let p = pageOf(addr); p < pageOf(hi); p++) {
       // A page that is not writable is code or a read-only mapping of a file: a program cannot
       // have changed it, so there is nothing to give back.
       if ((this.ptes[p] & (PTE.MAPPED | PTE.WRITABLE)) !== (PTE.MAPPED | PTE.WRITABLE)) continue;
@@ -272,7 +344,7 @@ export class AddressSpace {
   capacity() {
     let free = Math.max(0, this.brkLimit - this.brk);
     for (const s of this.free) free += s.hi - s.lo;
-    return { total: this.brkLimit - this.brkBase + (this.arenaHi - this.arenaLo), free };
+    return { total: this.total, free };
   }
 
   /// brk(2): the break is a byte address, not a page address, and moving it maps or unmaps pages.

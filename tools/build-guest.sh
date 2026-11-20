@@ -106,6 +106,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/futex.c -o tests/guest/futex.o
 python3 tools/minilink.py tests/guest/futex.o tests/guest/futex.elf _start
 
+echo "== guest: big (an address space of more than 4 GiB, every access width past the boundary) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_FP -fno-pic -nostdlib \
+    -c tests/guest/big.c -o tests/guest/big.o
+python3 tools/minilink.py tests/guest/big.o tests/guest/big.elf _start
+
 echo "== guest: smc (a guest that writes an instruction into its own text and runs it) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/smc.c -o tests/guest/smc.o

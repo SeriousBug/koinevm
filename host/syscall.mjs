@@ -6,7 +6,7 @@
 
 import { randomFillSync } from "node:crypto";
 import fs from "node:fs";
-import { AddressSpace, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
+import { AddressSpace, CHUNK, EFAULT, ENOMEM, EINVAL } from "./addressspace.mjs";
 import { Files, AT_FDCWD, ENOENT, WOULD_BLOCK, O_WRONLY, O_RDWR, terminal } from "./files.mjs";
 import { Usage, rusageBytes, tmsBytes } from "./usage.mjs";
 import {
@@ -62,8 +62,8 @@ const WNOHANG = 1;
 /// unreadable without the paths.
 function traceArg(k, v) {
   const a = Number(BigInt.asUintN(64, v));
-  if (a === 0 || a + 2 > k.memory.buffer.byteLength) return null;
-  const view = new Uint8Array(k.memory.buffer, a, Math.min(256, k.memory.buffer.byteLength - a));
+  if (a === 0 || a + 2 > k.space.size) return null;
+  const view = k.space.copyOut(a, Math.min(256, k.space.size - a));
   let end = 0;
   while (end < view.length && view[end] !== 0) end++;
   if (end < 2 || end === view.length) return null;
@@ -146,12 +146,14 @@ const onConsole = (k, fd) => {
 const KERNEL_TERMIOS = 36;
 
 export class Kernel {
-  constructor(memory, meta, options = {}) {
-    this.memory = memory;
+  /// `memories` is the guest's address space, low chunk first: the first of them also holds the
+  /// engine's own state, which is what `this.memory` is.
+  constructor(memories, meta, options = {}) {
+    this.memory = memories[0];
     this.meta = meta;
     this.pid = options.pid ?? 1;
     this.ppid = options.ppid ?? 0;
-    this.space = new AddressSpace(memory, meta);
+    this.space = new AddressSpace(memories, meta);
     this.files =
       options.files ??
       new Files(options.rootfs, { virtual: options.resolver?.files(options.rootfs), pid: this.pid });
@@ -212,7 +214,15 @@ export class Kernel {
   }
 
   inBounds(a, len) {
-    return a >= 0 && a + len <= this.memory.buffer.byteLength;
+    return a >= 0 && a + len <= this.space.size;
+  }
+
+  /// The guest's memory as seen from `x`: offset zero of the view is `x` itself. A structure a
+  /// syscall reads or writes is always inside one chunk, which is what makes this the copy-free
+  /// path; anything that can span chunks goes through the address space's own copies.
+  dv(x) {
+    const at = this.addr(x);
+    return new DataView(this.space.memoryOf(at).buffer, at % CHUNK);
   }
 
   read(x, len) {
@@ -220,50 +230,46 @@ export class Kernel {
     if (!this.inBounds(a, len)) return null;
     // A copy, because the guest may move the memory out from under it, and a Buffer because callers
     // read numbers out of one: a `setsockopt`'s value is an int in the guest's own byte order.
-    return Buffer.from(new Uint8Array(this.memory.buffer, a, len));
+    return this.space.copyOut(a, len);
   }
 
   put(x, bytes) {
     const a = this.addr(x);
     if (!this.inBounds(a, bytes.length)) return false;
-    new Uint8Array(this.memory.buffer, a, bytes.length).set(bytes);
+    this.space.copyIn(a, bytes);
     return true;
   }
 
   /// A NUL-terminated string at a guest address, read as the guest wrote it.
   str(x) {
-    const a = this.addr(x);
-    const view = new Uint8Array(this.memory.buffer);
-    let end = a;
-    while (end < view.length && view[end] !== 0) end++;
-    return new TextDecoder().decode(view.subarray(a, end));
-  }
-
-  u32(x) {
-    return new DataView(this.memory.buffer).getUint32(this.addr(x), true);
+    return new TextDecoder().decode(this.strBytes(x));
   }
 
   /// The bytes of a string the guest passes, without a character set in the way: `execve` hands
   /// over whatever it was given.
   strBytes(x) {
     const a = this.addr(x);
-    const view = new Uint8Array(this.memory.buffer);
-    let end = a;
-    while (end < view.length && view[end] !== 0) end++;
-    return view.subarray(a, end);
+    const room = Math.min(4096, Math.max(0, this.space.size - a));
+    const bytes = this.space.copyOut(a, room);
+    const end = bytes.indexOf(0);
+    return end < 0 ? bytes : bytes.subarray(0, end);
+  }
+
+  u32(x) {
+    return this.dv(x).getUint32(0, true);
   }
 
   u64(x) {
-    return new DataView(this.memory.buffer).getBigUint64(this.addr(x), true);
+    return this.dv(x).getBigUint64(0, true);
   }
 
   put32(x, v) {
-    new DataView(this.memory.buffer).setUint32(this.addr(x), v >>> 0, true);
+    this.dv(x).setUint32(0, v >>> 0, true);
     return true;
   }
 
   put64(x, v) {
-    new DataView(this.memory.buffer).setBigUint64(this.addr(x), BigInt(v), true);
+    this.dv(x).setBigUint64(0, BigInt(v), true);
     return true;
   }
 
@@ -1074,16 +1080,16 @@ export class Kernel {
   epollEvent(addr) {
     const at = this.addr(addr);
     if (!this.inBounds(at, EPOLL_EVENT)) return null;
-    const view = new DataView(this.memory.buffer);
-    return { events: view.getUint32(at, true), data: view.getBigUint64(at + 8, true) };
+    const view = this.dv(at);
+    return { events: view.getUint32(0, true), data: view.getBigUint64(8, true) };
   }
 
   /// The events a caller asked for, written where it asked for them.
   epollDeliver(ready, at) {
-    const view = new DataView(this.memory.buffer);
     ready.forEach((event, i) => {
-      view.setUint32(at + i * EPOLL_EVENT, event.events, true);
-      view.setBigUint64(at + i * EPOLL_EVENT + 8, event.data, true);
+      const view = this.dv(at + i * EPOLL_EVENT);
+      view.setUint32(0, event.events, true);
+      view.setBigUint64(8, event.data, true);
     });
     return ready.length;
   }
@@ -1251,11 +1257,11 @@ export class Kernel {
     const at = this.addr(addr);
     if (at !== 0) {
       const limit =
-        this.addr(lenp) === 0 ? bytes.length : new DataView(this.memory.buffer).getInt32(this.addr(lenp), true);
+        this.addr(lenp) === 0 ? bytes.length : this.dv(lenp).getInt32(0, true);
       if (limit < 0) return false;
       if (!this.put(at, bytes.subarray(0, Math.min(limit, bytes.length)))) return false;
     }
-    if (this.addr(lenp) !== 0) new DataView(this.memory.buffer).setInt32(this.addr(lenp), bytes.length, true);
+    if (this.addr(lenp) !== 0) this.dv(lenp).setInt32(0, bytes.length, true);
     return true;
   }
 
@@ -1331,7 +1337,7 @@ export class Kernel {
     if (typeof desc === "number") return desc;
     if (!this.inBounds(msg, Kernel.MSGHDR)) return -EFAULT;
     const name = Number(this.u64(msg));
-    const namelen = new DataView(this.memory.buffer).getUint32(msg + 8, true);
+    const namelen = this.dv(Number(msg) + 8).getUint32(0, true);
     const to = this.socketAddr(desc, name, namelen);
     if (typeof to === "number") return to;
     const iovs = this.iovecs(msg);
@@ -1423,9 +1429,9 @@ export class Kernel {
     if (this.addr(addr) === 0) return -1;
     const at = this.addr(addr);
     if (!this.inBounds(at, 16)) return null;
-    const view = new DataView(this.memory.buffer);
-    const sec = Number(view.getBigInt64(at, true));
-    const nsec = Number(view.getBigInt64(at + 8, true));
+    const view = this.dv(at);
+    const sec = Number(view.getBigInt64(0, true));
+    const nsec = Number(view.getBigInt64(8, true));
     return Math.max(0, Math.ceil(sec * 1000 + nsec / 1e6));
   }
 
@@ -1487,15 +1493,15 @@ export class Kernel {
 
   /// One non-blocking pass of `poll` over the guest's own array of `struct pollfd`.
   pollOnce(fds, nfds) {
-    const view = new DataView(this.memory.buffer);
     let ready = 0;
     for (let i = 0; i < nfds; i++) {
       const at = fds + i * 8;
-      const fd = view.getInt32(at, true);
-      const events = view.getUint16(at + 4, true);
+      const view = this.dv(at);
+      const fd = view.getInt32(0, true);
+      const events = view.getUint16(4, true);
       let revents = 0;
       if (fd < 0) {
-        view.setUint16(at + 6, 0, true);
+        view.setUint16(6, 0, true);
         continue;
       }
       const entry = this.files.get(fd);
@@ -1507,7 +1513,7 @@ export class Kernel {
         if (state.err) revents |= 0x08;
         if (state.hup) revents |= 0x10;
       }
-      view.setUint16(at + 6, revents, true);
+      view.setUint16(6, revents, true);
       if (revents) ready++;
     }
     return ready;
@@ -1877,7 +1883,7 @@ export class Kernel {
       if (n < 0 || n > 65536) return k.fail(EINVAL);
       const groups = [];
       for (let i = 0; i < n; i++) {
-        const gid = new DataView(k.memory.buffer).getUint32(k.addr(list) + i * 4, true);
+        const gid = k.dv(k.addr(list) + i * 4).getUint32(0, true);
         groups.push(gid);
       }
       k.ids = { ...k.ids, groups };
@@ -1944,8 +1950,8 @@ export class Kernel {
     // host's timer is the whole of it.
     const sleep = (k, at, absolute, clock) => {
       if (k.addr(at) === 0 || !k.inBounds(k.addr(at), 16)) return k.fail(EFAULT);
-      const view = new DataView(k.memory.buffer);
-      const asked = view.getBigInt64(k.addr(at), true) * 1_000_000_000n + view.getBigInt64(k.addr(at) + 8, true);
+      const view = k.dv(at);
+      const asked = view.getBigInt64(0, true) * 1_000_000_000n + view.getBigInt64(8, true);
       const remaining = absolute ? asked - clockNow(Number(clock) & 7) : asked;
       if (remaining <= 0n) return [0n, 0];
       const ms = Number(remaining / 1_000_000n) + (remaining % 1_000_000n > 0n ? 1 : 0);
@@ -2184,7 +2190,7 @@ export class Kernel {
       if (cmd === 3 || cmd === 4) {
         const wake = num(val);
         const move = num(timeout);
-        if (cmd === 4 && num(val3) !== new DataView(k.memory.buffer).getInt32(at, true)) {
+        if (cmd === 4 && num(val3) !== k.dv(at).getInt32(0, true)) {
           return k.fail(EAGAIN);
         }
         return [

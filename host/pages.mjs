@@ -125,9 +125,13 @@ export class Mach {
   }
 
   instantiate(key, source, base) {
-    const inst = new WebAssembly.Instance(source.module, {
-      env: { ...this.imports, mem: this.memory },
+    // The page module imports the same memories the image got: the engine's state in the first and
+    // a chunk of the guest's address space in each of the rest.
+    const env = { ...this.imports, mem: this.kernel.space.memories[0] };
+    this.kernel.space.memories.forEach((memory, k) => {
+      if (k > 0) env[`g${k}`] = memory;
     });
+    const inst = new WebAssembly.Instance(source.module, { env });
     for (let i = 0; i < source.regions.length; i++) {
       this.table.set(base + i, inst.exports[`r${i}`]);
     }

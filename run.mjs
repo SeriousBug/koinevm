@@ -163,7 +163,9 @@ function dumpAddress({ reg, at, off }) {
 const watchMem = process.env.ARMJIT_WATCH_MEM ? parseInt(process.env.ARMJIT_WATCH_MEM, 16) : null;
 let watchedValue = null;
 function watchWrite(pc) {
-  const value = new DataView(memory.buffer).getBigUint64(watchMem, true);
+  const bytes = kernel.read(watchMem, 8);
+  if (bytes === null) return;
+  const value = bytes.readBigUInt64LE(0);
   if (watchedValue === null) watchedValue = value;
   else if (value !== watchedValue) {
     console.error(
@@ -197,21 +199,24 @@ function where(pc) {
 // return address, which is how a wrapped `bl` can still be named.
 function backtrace() {
   const view = new DataView(memory.buffer);
-  const size = memory.buffer.byteLength;
-  const fps = [Number(view.getBigUint64(29 * 8, true))];
+  const word = (at) => {
+    const bytes = kernel.read(at, 8);
+    return bytes === null ? 0 : Number(bytes.readBigUInt64LE(0));
+  };
+  const fps = [word(29 * 8)];
   let fp = fps[0];
   for (let depth = 1; depth < 32; depth++) {
-    if (fp <= 0x1000 || fp + 16 > size) break;
-    const next = Number(view.getBigUint64(fp, true));
+    if (fp <= 0x1000) break;
+    const next = word(fp);
     fps.push(next);
     if (next <= fp) break;
     fp = next;
   }
-  const lines = [`  #0 at ${where(view.getInt32(0x108, true) >>> 0)} lr=${where(Number(view.getBigUint64(30 * 8, true)))}`];
+  const lines = [`  #0 at ${where(view.getInt32(0x108, true) >>> 0)} lr=${where(word(30 * 8))}`];
   for (let depth = 1; depth < fps.length; depth++) {
     const at = fps[depth - 1];
-    if (at <= 0x1000 || at + 16 > size) break;
-    const ret = Number(view.getBigUint64(at + 8, true));
+    if (at <= 0x1000) break;
+    const ret = word(at + 8);
     lines.push(`  #${depth} from ${where(ret)}`);
     if (ret === 0) break;
   }
@@ -221,12 +226,12 @@ function backtrace() {
 // A guest string, when the word it starts at is plausibly one, so an argument that is a format
 // string reads as text.
 function cstr(at) {
-  if (at < 0x1000 || at + 1 > memory.buffer.byteLength) return null;
-  const bytes = new Uint8Array(memory.buffer);
-  let end = at;
-  while (end < bytes.length && end - at < 200 && bytes[end] !== 0) end++;
-  if (end === bytes.length) return null;
-  const text = Buffer.from(bytes.subarray(at, end));
+  if (at < 0x1000) return null;
+  const bytes = kernel.read(at, 200);
+  if (bytes === null) return null;
+  const end = bytes.indexOf(0);
+  if (end < 0) return null;
+  const text = bytes.subarray(0, end);
   const printable = text.every((b) => b === 9 || b === 10 || (b >= 32 && b < 127));
   return printable ? JSON.stringify(text.toString("latin1")) : null;
 }
@@ -245,20 +250,18 @@ function hot(n) {
 
 // The memory named by ARMJIT_WATCH_DUMP, for a report of any kind.
 function memory_dump() {
-  const view = new DataView(memory.buffer);
-  const bytes = new Uint8Array(memory.buffer);
   let out = "";
   for (const range of watchRanges) {
     const from = dumpAddress(range);
-    const slice = bytes.subarray(from, from + range.len);
-    out += `\n  mem 0x${from.toString(16)}: ${Buffer.from(slice).toString("hex")} ${JSON.stringify(Buffer.from(slice).toString("latin1"))}`;
+    const slice = kernel.read(from, range.len);
+    if (slice === null) continue;
+    out += `\n  mem 0x${from.toString(16)}: ${slice.toString("hex")} ${JSON.stringify(slice.toString("latin1"))}`;
   }
   return out;
 }
 
 function report(pc) {
   const view = new DataView(memory.buffer);
-  const bytes = new Uint8Array(memory.buffer);
   const args = [];
   for (let i = 0; i < 8; i++) args.push(view.getBigUint64(i * 8, true));
   console.error(`watch at ${where(pc)} hit ${watches.find((w) => w.pc === pc).hits} sp=0x${view.getBigUint64(0xf8, true).toString(16)}`);
@@ -269,10 +272,9 @@ function report(pc) {
   }
   for (const range of watchRanges) {
     const from = dumpAddress(range);
-    const slice = bytes.subarray(from, from + range.len);
-    const hex = Buffer.from(slice).toString("hex");
-    const text = Buffer.from(slice).toString("latin1");
-    console.error(`  mem 0x${from.toString(16)}: ${hex} ${JSON.stringify(text)}`);
+    const slice = kernel.read(from, range.len);
+    if (slice === null) continue;
+    console.error(`  mem 0x${from.toString(16)}: ${slice.toString("hex")} ${JSON.stringify(slice.toString("latin1"))}`);
   }
   console.error(state());
   // The FP argument and result of a conversion is what a report of the integer registers leaves out.
@@ -408,12 +410,11 @@ const session = new Session({ translator, rootfs, makeImports });
 const root = session.spawn({ module, meta });
 enter(root);
 if (process.env.ARMJIT_DUMP_STACK) {
-  const view = new DataView(memory.buffer);
   const at = Number(BigInt(meta.sp));
   for (let i = 0; i < 16; i++) {
-    const w = view.getBigUint64(at + i * 8, true);
-    const ascii = Buffer.from(new Uint8Array(memory.buffer, at + i * 8, 8)).toString("latin1");
-    console.error(`sp+${i * 8}: 0x${w.toString(16)} ${JSON.stringify(ascii)}`);
+    const bytes = kernel.read(at + i * 8, 8);
+    if (bytes === null) break;
+    console.error(`sp+${i * 8}: 0x${bytes.readBigUInt64LE(0).toString(16)} ${JSON.stringify(bytes.toString("latin1"))}`);
   }
 }
 

@@ -622,7 +622,7 @@ fn emit_chunk_access(m: &mut Module, ty: u32, shape: &AccessShape, plan: &Plan) 
     let emit_trap = |f: &mut Func, kind: i32| {
         f.i32c(kind);
         f.lg(0);
-        f.lt(pc);
+        f.lg(pc);
         f.call(1);
         f.op(UNREACHABLE);
     };
@@ -637,7 +637,9 @@ fn emit_chunk_access(m: &mut Module, ty: u32, shape: &AccessShape, plan: &Plan) 
     emit_trap(f, trap::RANGE);
     f.end();
 
-    for _ in 1..plan.chunks {
+    // One block per chunk the address space has above the first, and one more for the default arm,
+    // because a branch needs a label of its own to land on.
+    for _ in 0..plan.chunks {
         f.block();
     }
     f.lg(0);
@@ -702,6 +704,7 @@ fn emit_chunk_access(m: &mut Module, ty: u32, shape: &AccessShape, plan: &Plan) 
         f.ret();
     }
     // The default of the jump table: an address in a chunk this machine does not have.
+    f.end();
     emit_trap(f, trap::RANGE);
     id
 }

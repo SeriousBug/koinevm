@@ -18,7 +18,7 @@ import { ENOENT, EACCES, ELOOP } from "./files.mjs";
 import { Net, EAGAIN } from "./net.mjs";
 import { Resolver } from "./dns.mjs";
 import { Mach } from "./pages.mjs";
-import { PTE } from "./addressspace.mjs";
+import { CHUNK, PTE } from "./addressspace.mjs";
 import { Usage, rusageBytes } from "./usage.mjs";
 import { SIGFRAME, SA_ONSTACK, SA_SIGINFO, SA_RESTORER, SI_USER, SS_DISABLE } from "./syscall.mjs";
 
@@ -146,9 +146,17 @@ export class Session {
     const imports = this.makeImports(proc);
     const instance = new WebAssembly.Instance(proc.module, { env: imports });
     proc.instance = instance;
-    proc.memory = instance.exports.mem;
+    // The guest's address space is one memory per 4 GiB chunk: the first also holds the engine's
+    // own state, and everything here that is not about guest data works on that one.
+    proc.memories = [instance.exports.mem];
+    for (let k = 1; ; k++) {
+      const next = instance.exports[`g${k}`];
+      if (!next) break;
+      proc.memories.push(next);
+    }
+    proc.memory = proc.memories[0];
     proc.imports = imports;
-    proc.kernel = new Kernel(proc.memory, proc.meta, {
+    proc.kernel = new Kernel(proc.memories, proc.meta, {
       rootfs: this.rootfs,
       pid: proc.pid,
       ppid: proc.ppid,
@@ -736,10 +744,10 @@ export class Session {
     view.setUint32(SHADOW_PC, view.getUint32(SHADOW_RESUME, true), true);
     childThread.regs.set(new Uint8Array(child.memory.buffer).subarray(0, THREAD_STATE));
     if (request.flags & CLONE_CHILD_SETTID && request.ctid) {
-      view.setUint32(request.ctid, child.pid, true);
+      child.kernel.put32(request.ctid, child.pid);
     }
     if (request.flags & CLONE_PARENT_SETTID && request.ptid) {
-      from.setUint32(request.ptid, child.pid, true);
+      parent.kernel.put32(request.ptid, child.pid);
     }
     this.processes.push(child);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
@@ -781,9 +789,8 @@ export class Session {
     regs.setUint32(SHADOW_PC, regs.getUint32(SHADOW_RESUME, true), true);
     if (request.flags & CLONE_SETTLS) regs.setBigUint64(0x110, BigInt.asUintN(64, request.tls), true);
     proc.threads.push(child);
-    const view = new DataView(proc.memory.buffer);
-    if (request.flags & CLONE_PARENT_SETTID && request.ptid) view.setUint32(request.ptid, tid, true);
-    if (request.flags & CLONE_CHILD_SETTID && request.ctid) view.setUint32(request.ctid, tid, true);
+    if (request.flags & CLONE_PARENT_SETTID && request.ptid) proc.kernel.put32(request.ptid, tid);
+    if (request.flags & CLONE_CHILD_SETTID && request.ctid) proc.kernel.put32(request.ctid, tid);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
       const at = (a) => (a ? view.getUint32(a, true) : "none");
       console.error(
@@ -922,7 +929,7 @@ export class Session {
 
   /// FUTEX_WAIT and FUTEX_WAKE, which is how one thread of a process waits for another.
   futex(proc, thread, request) {
-    const view = new DataView(proc.memory.buffer);
+    const view = proc.kernel.dv(request.addr);
     // A waiter a wake answered is running the wait's success, not its failure: the word has
     // changed, which is the reason it was woken, and a kernel reports that as a wait that ended
     // rather than as EAGAIN - the error that answers a caller whose word was already wrong.
@@ -930,7 +937,7 @@ export class Session {
       thread.futexWoken = false;
       return this.resume(proc, thread, 0);
     }
-    if (view.getInt32(request.addr, true) !== request.value) {
+    if (view.getInt32(0, true) !== request.value) {
       return this.resume(proc, thread, -EAGAIN); // EAGAIN: the value changed before the wait
     }
     // A wait with a timeout answers ETIMEDOUT when it runs out, and one whose deadline has already
@@ -942,18 +949,19 @@ export class Session {
     return 0;
   }
 
-  /// The whole of the parent's memory that exists: the engine area, which holds the control block
-  /// and the page table, and every page the page table says is mapped. Rest is zero in both.
+  /// The whole of the parent's memory that exists: the engine block, the page table, and every page
+  /// the page table says is mapped, in whichever of the guest's memories it is in. Rest is zero in
+  /// both.
   ///
-  /// The engine area is copied first and by hand, because it is not mapped for the guest: the child
+  /// The engine block is copied first and by hand, because it is not mapped for the guest: the child
   /// resumes from the shadow the parent left, and a page the parent mapped at run time is one the
   /// child's own copy of the table has to say is there.
   copyMemory(from, to) {
-    const src = new Uint8Array(from.memory.buffer);
-    const dst = new Uint8Array(to.memory.buffer);
     const pteBase = from.meta.pte_base;
-    dst.set(src.subarray(0, pteBase + (1 << 20)), 0);
-    const ptes = new Uint8Array(from.memory.buffer, pteBase, 1 << 20);
+    const chunks = from.kernel.space.chunks;
+    const engine = new Uint8Array(from.memory.buffer, 0, pteBase + (chunks << 20));
+    new Uint8Array(to.memory.buffer, 0, engine.length).set(engine);
+    const ptes = new Uint8Array(from.memory.buffer, pteBase, chunks << 20);
     let i = 0;
     while (i < ptes.length) {
       if (ptes[i] === 0) {
@@ -962,12 +970,21 @@ export class Session {
       }
       const lo = i;
       while (i < ptes.length && ptes[i] !== 0) i++;
-      // Not a shift: a page index times 4096 passes what a 32-bit shift can hold.
-      const at = lo * 4096;
-      // The page table covers 4 GiB and the memory is a few pages short of it.
-      if (at >= dst.length) break;
-      const len = Math.min((i - lo) * 4096, dst.length - at);
-      dst.set(src.subarray(at, at + len), at);
+      // Pages of one chunk together, because a run of mapped pages never crosses into another
+      // memory: the chunk boundary is where one ends.
+      let page = lo;
+      while (page < i) {
+        const chunk = Math.floor(page / (1 << 20));
+        const stop = Math.min(i, (chunk + 1) << 20);
+        const at = page * 4096;
+        const len = (stop - page) * 4096;
+        const src = from.kernel.space.memoryOf(at);
+        const dst = to.kernel.space.memoryOf(at);
+        const offset = at % CHUNK;
+        const room = Math.min(len, dst.buffer.byteLength - offset);
+        new Uint8Array(dst.buffer, offset, room).set(new Uint8Array(src.buffer, offset, room));
+        page = stop;
+      }
     }
   }
 
@@ -1245,8 +1262,7 @@ export class Session {
 
   /// The wait status a real kernel would give, and the rusage a program that asks for one reads.
   reap(parent, child, request) {
-    const view = new DataView(parent.memory.buffer);
-    if (request.wstatus) view.setInt32(request.wstatus, this.statusOf(child), true);
+    if (request.wstatus) parent.kernel.put32(request.wstatus, this.statusOf(child));
     if (request.rusage) {
       parent.kernel.put(request.rusage, rusageBytes(child.usage.user, child.usage.sys));
     }
@@ -1276,7 +1292,7 @@ export class Session {
     thread.code = code & 0xff;
     thread.signal = signal;
     if (thread.clearTid) {
-      new DataView(proc.memory.buffer).setUint32(thread.clearTid, 0, true);
+      proc.kernel.put32(thread.clearTid, 0);
       this.futexWake(proc, thread.clearTid, -1);
     }
     if (process.env.ARMJIT_TRACE_PROCESSES) {
