@@ -69,7 +69,12 @@ so a library the loader maps while it runs executes without being known in advan
   kernel built them on, `self/maps` from the address space, and the machine's own `cpuinfo`, `stat`,
   `meminfo`, `uptime`, `version`, `loadavg` and `sys/kernel` and `sys/vm`. The resident count is the
   pages the page table has mapped, kept as the table changes, which is what a space that does not
-  swap has. Waiting and counting: `pipe2`, `eventfd`/`eventfd2`, `signalfd4`,
+  swap has. A number in the name is another process of the same run, and survives until its parent
+  reaps it. Waiting and counting: `pipe2`, `eventfd`/`eventfd2`, `signalfd4`,
+  `/dev` is synthesized too: `null`, `zero`, `full`, `random` and `urandom` as the devices they are,
+  `tty` and `console` as the terminal the run was started at, `ptmx` and `pts` for the terminals a
+  program makes, `shm` for the directory it shares memory in, and `fd/N`, `stdin`, `stdout` and
+  `stderr` as the links a program reaches its own descriptors through.
   `ppoll`, `epoll_*`, `futex` with both shapes of deadline and the requeue forms, `getrusage`,
   `times`. Start-up: `set_tid_address`, `set_robust_list`, `uname`, `clock_gettime`,
   `clock_getres`, `getrandom`, `prlimit64`, `sched_getaffinity`, `getuid` family, `rt_sigaction`,
@@ -296,10 +301,12 @@ Two things follow.
   gives it, when a syscall is where the signal can be taken; a signal that arrives while the guest is
   in the middle of a computation waits for the next syscall. A fault is still fatal, so a `SIGSEGV`
   handler does not run.
-- **`/proc` is the files a kernel keeps there, not the tree.** A program that reads one of them
-  gets the shape and the numbers above, and `self/exe` is a link to the path the guest can open. What
-  is missing is the listing: `/proc` and `/proc/self` are not directories here, so `ls` of them
-  finds nothing, and a process cannot see another process's files.
+- **What `/proc` and `/dev` do not have.** Both are trees a program can walk and a process can read
+  another process's files out of, but neither is everything a kernel keeps there: `/proc/<pid>/task`
+  and the `net`, `sys/net` and `fs` subtrees are not there, a process sees no `stat` of a zombie's
+  state (it says `R` for anything still in the table), and `/dev` has the character devices and the
+  terminal links rather than block devices, `loop*`, `tty1..N` or the framebuffer a machine with a
+  console would have.
 - **Job control.** One console and one process group: `Ctrl-Z`, `fg`, `jobs`, and a window that is
   resized (`SIGWINCH`) are not there, so a stopped job cannot be resumed. And the console's interrupt
   reaches the processes that take the default action for it: the shell catches it so that it can

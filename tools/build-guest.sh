@@ -116,6 +116,11 @@ clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/smc.c -o tests/guest/smc.o
 python3 tools/minilink.py tests/guest/smc.o tests/guest/smc.elf _start
 
+echo "== guest: dev (the devices a kernel keeps) =="
+clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
+    -c tests/guest/dev.c -o tests/guest/dev.o
+python3 tools/minilink.py tests/guest/dev.o tests/guest/dev.elf _start
+
 echo "== guest: proc (the machine's own files) =="
 clang --target=aarch64-unknown-linux-gnu $CFLAGS_STATIC -fno-pic -nostdlib \
     -c tests/guest/proc.c -o tests/guest/proc.o

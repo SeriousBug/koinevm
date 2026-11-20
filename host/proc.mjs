@@ -15,13 +15,15 @@ const VERSION = "#1";
 /// The features the guest is told about in `AT_HWCAP`, as `/proc/cpuinfo` lists them.
 const FEATURES = "fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp";
 
-/// Which process a name is about, and which of its files: `/proc/self` is `/proc/<its own pid>`.
-/// Null for a name that is about another process, which this machine does not show.
+/// Which process a name is about: `/proc/self` is this one, and a number is whichever process the
+/// registry knows by it, so a program reads another process's files the way it does on a kernel.
 function subject(kernel, name) {
   const m = /^\/proc\/(self|\d+)(\/.*)?$/.exec(name);
   if (!m) return null;
-  if (m[1] !== "self" && Number(m[1]) !== kernel.pid) return null;
-  return m[2] ?? "";
+  const pid = m[1] === "self" ? kernel.pid : Number(m[1]);
+  const target = pid === kernel.pid ? kernel : (kernel.peers?.(pid) ?? null);
+  if (!target) return null;
+  return { kernel: target, rest: m[2] ?? "" };
 }
 
 /// The argv a process was started with, read back out of the stack a kernel built it on: a program
@@ -327,10 +329,10 @@ const MACHINE = {
 
 /// The contents of a file this machine synthesizes, or null for a name it does not have.
 export function procFile(kernel, name) {
-  const rest = subject(kernel, name);
-  if (rest !== null) {
-    const make = FILES[rest];
-    return make ? Buffer.from(make(kernel), "utf8") : null;
+  const at = subject(kernel, name);
+  if (at) {
+    const make = FILES[at.rest];
+    return make ? Buffer.from(make(at.kernel), "utf8") : null;
   }
   const make = MACHINE[name];
   return make ? Buffer.from(make(kernel), "utf8") : null;
@@ -338,11 +340,49 @@ export function procFile(kernel, name) {
 
 /// Where one of the links a kernel keeps in `/proc` points, or null.
 export function procLink(kernel, name) {
-  const rest = subject(kernel, name);
-  if (rest === null) return null;
-  const program = kernel.space.images[0]?.host;
-  if (rest === "/exe") return program ? guestPath(kernel, program) : null;
-  if (rest === "/cwd") return kernel.files?.cwd ?? "/";
-  if (rest === "/root") return "/";
+  const at = subject(kernel, name);
+  if (!at) return null;
+  const program = at.kernel.space.images[0]?.host;
+  if (at.rest === "/exe") return program ? guestPath(at.kernel, program) : null;
+  if (at.rest === "/cwd") return at.kernel.files?.cwd ?? "/";
+  if (at.rest === "/root") return "/";
+  return null;
+}
+
+const MACHINE_FILES = ["cpuinfo", "loadavg", "meminfo", "stat", "uptime", "version"];
+const PROCESS_FILES = ["cmdline", "environ", "maps", "stat", "statm", "status"];
+const PROCESS_LINKS = ["cwd", "exe", "root"];
+
+/// The names in one of the directories `/proc` has, or null for a name that is not one. `dir` says
+/// which of them are directories themselves, because a listing has to say so.
+export function procEntries(kernel, name) {
+  if (name === "/proc") {
+    const out = MACHINE_FILES.map((n) => ({ name: n, dir: false }));
+    out.push({ name: "self", dir: true }, { name: "sys", dir: true });
+    for (const pid of kernel.pids?.() ?? []) out.push({ name: String(pid), dir: true });
+    return out;
+  }
+  if (name === "/proc/sys") return [{ name: "kernel", dir: true }, { name: "vm", dir: true }];
+  if (name.startsWith("/proc/sys/")) {
+    const dir = `${name}/`;
+    return Object.keys(MACHINE)
+      .filter((n) => n.startsWith(dir) && !n.slice(dir.length).includes("/"))
+      .map((n) => ({ name: n.slice(dir.length), dir: false }));
+  }
+  const at = subject(kernel, name);
+  if (at) {
+    if (at.rest === "") {
+      return [
+        ...PROCESS_FILES.map((n) => ({ name: n, dir: false })),
+        ...PROCESS_LINKS.map((n) => ({ name: n, dir: false })),
+        { name: "fd", dir: true },
+      ];
+    }
+    if (at.rest === "/fd") {
+      const files = at.kernel.files;
+      if (!files) return [];
+      return [...files.map.keys()].map((fd) => ({ name: String(fd), dir: false }));
+    }
+  }
   return null;
 }

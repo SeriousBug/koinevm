@@ -51,6 +51,27 @@ const DEVICES = new Map([
   ["/dev/urandom", { kind: "random", mode: 0o020666, rdev: 0x0109 }],
 ]);
 
+/// The names `/dev` has, and what each one is: a character device with the numbers Linux gives it,
+/// a directory, or a link a program reaches its own descriptors through. `tree` says the directory
+/// is one the filesystem holds, so it is listed here and opened there.
+const DEV_NAMES = new Map([
+  ["null", { char: 0x0103 }],
+  ["zero", { char: 0x0105 }],
+  ["full", { char: 0x0107 }],
+  ["random", { char: 0x0108 }],
+  ["urandom", { char: 0x0109 }],
+  ["tty", { char: 0x0500 }],
+  ["console", { char: 0x0501 }],
+  ["ptmx", { char: 0x0502 }],
+  ["fd", { dir: true }],
+  ["pts", { dir: true, tree: true }],
+  ["shm", { dir: true, tree: true }],
+  ["core", { link: "/proc/kcore" }],
+  ["stdin", { link: "/proc/self/fd/0" }],
+  ["stdout", { link: "/proc/self/fd/1" }],
+  ["stderr", { link: "/proc/self/fd/2" }],
+]);
+
 /// What a pseudo-terminal is to `stat`: a character device whose slave is in the UNIX98 range, so
 /// that a libc can read the number `/dev/pts` names it by out of `st_rdev`.
 function ptyStat(end, id) {
@@ -72,6 +93,7 @@ const O_CREAT = 0x40;
 const O_EXCL = 0x80;
 const O_TRUNC = 0x200;
 const O_APPEND = 0x400;
+const O_NONBLOCK = 0x800;
 const O_DIRECTORY = 0x4000;
 const O_CLOEXEC = 0x80000;
 
@@ -243,6 +265,7 @@ export class Files {
     /// one of them, and `procTarget(name)` answers where one of the links in there points.
     this.proc = options.proc ?? (() => null);
     this.procTarget = options.procTarget ?? (() => null);
+    this.procDir = options.procDir ?? (() => null);
     this.map = new Map();
     this.next = 3;
     this.seed = 1;
@@ -393,6 +416,46 @@ export class Files {
     return this.resolve(name.startsWith("/") ? name : `${base}/${name}`, follow);
   }
 
+  /// What a name in `/dev` is, or null: `/dev` itself is a directory, and the rest is the table
+  /// above. A directory the tree holds answers null, so that opening or statting it finds the tree.
+  devEntry(guestPath) {
+    const name = this.guestPath(guestPath);
+    if (name === "/dev") return { dir: true };
+    if (!name.startsWith("/dev/") || name.indexOf("/", 5) >= 0) return null;
+    const entry = DEV_NAMES.get(name.slice(5));
+    return entry?.tree ? null : (entry ?? null);
+  }
+
+  /// The names in `/dev`, in the shape a directory listing takes.
+  devNames() {
+    return [...DEV_NAMES].map(([name, e]) => ({ name, dir: e.dir === true }));
+  }
+
+  /// The metadata of a name in `/dev`: a character device of mode 0666, a directory, or a link.
+  devStat(guestPath) {
+    const e = this.devEntry(guestPath);
+    if (!e) return null;
+    if (e.dir) return { mode: 0o040555n, nlink: 2n, size: 0n, ino: 7n, dev: 0n, rdev: 0n, blksize: 4096n };
+    if (e.char) {
+      return { mode: 0o020666n, nlink: 1n, size: 0n, ino: 8n, dev: 0n, rdev: BigInt(e.char), blksize: 4096n };
+    }
+    const size = BigInt(Buffer.byteLength(e.link));
+    return { mode: 0o120777n, nlink: 1n, size, ino: 9n, dev: 0n, rdev: 0n, blksize: 4096n };
+  }
+
+  /// The descriptor `/dev/stdin`, `/dev/stdout`, `/dev/stderr` or `/dev/fd/N` names, or null for a
+  /// link that names something else.
+  devTarget(guestPath) {
+    const name = this.guestPath(guestPath);
+    if (!name.startsWith("/dev/")) return null;
+    const m = /^\/dev\/fd\/(\d+)$/.exec(name);
+    if (m) return Number(m[1]);
+    const e = DEV_NAMES.get(name.slice(5));
+    if (!e?.link) return null;
+    const n = /\/fd\/(\d+)$/.exec(e.link);
+    return n ? Number(n[1]) : null;
+  }
+
   /// The contents of a file this kernel synthesizes, or null.
   procFile(guestPath) {
     return this.proc(this.guestPath(guestPath));
@@ -403,6 +466,18 @@ export class Files {
     const bytes = this.procFile(guestPath);
     if (!bytes) return null;
     return { mode: 0o100444n, nlink: 1n, size: BigInt(bytes.length), ino: 4n, dev: 0n, rdev: 0n, blksize: 4096n };
+  }
+
+  /// The names in one of the directories this kernel synthesizes, or null.
+  procEntries(guestPath) {
+    return this.procDir(this.guestPath(guestPath));
+  }
+
+  /// The metadata of one of those directories.
+  procDirStat(guestPath) {
+    const entries = this.procEntries(guestPath);
+    if (!entries) return null;
+    return { mode: 0o40555n, nlink: 2n, size: 0n, ino: 6n, dev: 0n, rdev: 0n, blksize: 4096n };
   }
 
   /// The metadata of one of the links in there, for a name that is a link rather than a file.
@@ -559,6 +634,48 @@ export class Files {
         guest: name,
         size: virtual.length,
         desc: { pos: 0, readable: true, writable: false },
+        cloexec: (flags & O_CLOEXEC) !== 0,
+      });
+    }
+    const dir = this.procEntries(name);
+    if (dir) {
+      if ((flags & O_ACCMODE) !== 0) return -EISDIR;
+      return this.add({
+        kind: "dir",
+        host: null,
+        names: dir,
+        guest: name,
+        size: 0,
+        desc: { pos: 0 },
+        cloexec: (flags & O_CLOEXEC) !== 0,
+      });
+    }
+    // `/dev`: the directory of the character devices, a link to a descriptor of this process, and
+    // the terminal a program opens as `/dev/tty`.
+    const dev = this.devEntry(name);
+    if (dev?.dir) {
+      if ((flags & O_ACCMODE) !== 0) return -EISDIR;
+      return this.add({
+        kind: "dir",
+        host: null,
+        names: this.devNames(),
+        guest: name,
+        size: 0,
+        desc: { pos: 0 },
+        cloexec: (flags & O_CLOEXEC) !== 0,
+      });
+    }
+    const target = this.devTarget(name);
+    if (target !== null) {
+      if (!this.map.has(target)) return -ENOENT;
+      return this.dup(target, 0, (flags & O_CLOEXEC) !== 0);
+    }
+    if (dev?.char === 0x0500 || dev?.char === 0x0501) {
+      // `/dev/tty` and `/dev/console` are the terminal this run was started at: the same one stdin
+      // and stdout are, which is why a program that opens it writes where its output goes.
+      return this.add({
+        kind: "console",
+        desc: { nonblock: (flags & O_NONBLOCK) !== 0, readable: (flags & O_ACCMODE) !== O_WRONLY, writable: (flags & O_ACCMODE) !== 0 },
         cloexec: (flags & O_CLOEXEC) !== 0,
       });
     }
@@ -758,7 +875,7 @@ export class Files {
   /// console has a pipe or a file on those numbers instead, and reading one of them is not a read of
   /// the terminal.
   consoleEntry(entry) {
-    if (entry.kind === "stdin") return true;
+    if (entry.kind === "stdin" || entry.kind === "console") return true;
     return terminal.live && (entry.kind === "stdout" || entry.kind === "stderr");
   }
 
@@ -856,6 +973,12 @@ export class Files {
   dirEntries(entry) {
     if (entry.entries) return entry.entries;
     const out = [];
+    if (entry.names) {
+      out.push({ name: ".", ino: 1n, type: DT.dir }, { name: "..", ino: 1n, type: DT.dir });
+      entry.names.forEach((e, i) => out.push({ name: e.name, ino: BigInt(i + 2), type: e.dir ? DT.dir : DT.reg }));
+      entry.entries = out;
+      return out;
+    }
     // `/dev/pts` holds the pseudo-terminals of the run, which the tree's own directory does not
     // know about. A libc that has no `/proc/self/fd` to ask reads a terminal's name out of a scan of
     // this, comparing `st_rdev`.
@@ -934,8 +1057,8 @@ export class Files {
   write(fd, data) {
     const entry = this.map.get(fd);
     if (!entry) return -EBADF;
-    if (entry.kind === "stdout" || entry.kind === "stderr") {
-      (fd === 1 ? process.stdout : process.stderr).write(data);
+    if (entry.kind === "stdout" || entry.kind === "stderr" || entry.kind === "console") {
+      (fd === 2 ? process.stderr : process.stdout).write(data);
       return data.length;
     }
     if (entry.kind === "pipe") {
@@ -1015,7 +1138,11 @@ export class Files {
   }
 
   statPath(guestPath, dirfd = AT_FDCWD) {
-    const made = this.procStat(guestPath) ?? this.procLinkStat(guestPath);
+    const made =
+      this.procStat(guestPath) ??
+      this.procDirStat(guestPath) ??
+      this.procLinkStat(guestPath) ??
+      this.devStat(guestPath);
     if (made) return made;
     const virtual = this.virtualStat(guestPath);
     if (virtual) return virtual;
@@ -1029,7 +1156,11 @@ export class Files {
   }
 
   statFile(guestPath, dirfd = AT_FDCWD) {
-    const made = this.procStat(guestPath) ?? this.procLinkStat(guestPath);
+    const made =
+      this.procStat(guestPath) ??
+      this.procDirStat(guestPath) ??
+      this.procLinkStat(guestPath) ??
+      this.devStat(guestPath);
     if (made) return made;
     const virtual = this.virtualStat(guestPath);
     if (virtual) return virtual;
@@ -1067,6 +1198,9 @@ export class Files {
       return { mode: 0o140777n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
     }
     if (entry.kind === "pty") return ptyStat(entry.end, entry.desc.id);
+    if (entry.kind === "console") {
+      return { mode: 0o020666n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: BigInt(0x0500), blksize: 4096n };
+    }
     if (entry.kind === "epoll") {
       // An anon inode: a regular file to `fstat`, which is all a program reads it for.
       return { mode: 0o100600n, nlink: 1n, size: 0n, ino: BigInt(fd + 1), dev: 0n, rdev: 0n, blksize: 4096n };
@@ -1096,6 +1230,13 @@ export class Files {
   readlink(guestPath, dirfd = AT_FDCWD) {
     const link = this.procTarget(this.guestPath(guestPath));
     if (link !== null) return link;
+    const dev = this.devEntry(guestPath);
+    if (dev?.link) return dev.link;
+    const fd = this.devTarget(guestPath);
+    if (fd !== null) {
+      const entry = this.map.get(fd);
+      return entry ? this.fdName(entry) : -ENOENT;
+    }
     const proc = this.procFd(guestPath);
     if (proc) return this.fdName(proc.entry);
     const host = this.resolveAt(guestPath, dirfd, false);

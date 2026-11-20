@@ -22,7 +22,11 @@ static inline long sc6(long nr, long a, long b, long c, long d, long e, long f) 
 #define AT_SYMLINK_NOFOLLOW 0x100
 #define O_RDONLY 0
 #define O_WRONLY 1
+#define O_DIRECTORY 0x10000
 #define O_CLOEXEC 0x80000
+#define SIGCHLD 17
+#define WNOHANG 1
+#define DT_DIR 4
 #define S_IFMT 0xf000
 #define S_IFREG 0x8000
 #define S_IFLNK 0xa000
@@ -37,6 +41,11 @@ static long fstatat_(const char *path, void *st, long flags) { return sc6(79, AT
 static long readlinkat_(const char *path, char *buf, unsigned long n) {
     return sc6(78, AT_FDCWD, (long)path, (long)buf, (long)n, 0, 0);
 }
+static long getdents64_(long fd, void *buf, unsigned long n) { return sc6(61, fd, (long)buf, (long)n, 0, 0, 0); }
+static long getpid_(void) { return sc6(172, 0, 0, 0, 0, 0, 0); }
+static long getppid_(void) { return sc6(173, 0, 0, 0, 0, 0, 0); }
+static long clone_(void) { return sc6(220, SIGCHLD, 0, 0, 0, 0, 0); }
+static long wait4_(long pid, int *status, long options) { return sc6(260, pid, (long)status, options, 0, 0, 0); }
 
 static void guest_exit(long code) {
     register long x8 __asm__("x8") = 93;
@@ -91,6 +100,69 @@ static long slurp(const char *path) {
     close_(fd);
     buf[total] = 0;
     return total;
+}
+
+/// The names in a directory, space separated, in `buf`, or a negative errno. `.` and `..` are left
+/// out: what a listing is checked for is the names a program looks up.
+static long list(const char *path) {
+    long fd = openat_(AT_FDCWD, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return fd;
+    long total = 0;
+    static char raw[4096];
+    for (;;) {
+        long got = getdents64_(fd, raw, sizeof raw);
+        if (got < 0) {
+            close_(fd);
+            return got;
+        }
+        if (got == 0) break;
+        for (long at = 0; at < got;) {
+            unsigned short reclen = *(unsigned short *)(raw + at + 16);
+            const char *name = raw + at + 19;
+            at += reclen;
+            if (name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0))) continue;
+            unsigned long k = str_len(name);
+            if (total + (long)k + 2 >= (long)sizeof buf) break;
+            for (unsigned long i = 0; i < k; i++) buf[total++] = name[i];
+            buf[total++] = ' ';
+        }
+    }
+    close_(fd);
+    buf[total] = 0;
+    return total;
+}
+
+/// A number as a decimal string in `out`, which is what a pid is listed as.
+static void dec(long value, char *out) {
+    char digits[24];
+    int n = 0;
+    if (value <= 0) {
+        out[0] = '0';
+        out[1] = 0;
+        return;
+    }
+    while (value > 0) {
+        digits[n++] = (char)('0' + value % 10);
+        value /= 10;
+    }
+    for (int i = 0; i < n; i++) out[i] = digits[n - 1 - i];
+    out[n] = 0;
+}
+
+/// `/proc/<pid>/<file>` in a buffer of its own, so a check can name another process.
+static char path[64];
+
+static const char *pid_path(long pid, const char *file) {
+    char num[24];
+    dec(pid, num);
+    long at = 0;
+    const char *lead = "/proc/";
+    while (*lead) path[at++] = *lead++;
+    for (int i = 0; num[i]; i++) path[at++] = num[i];
+    path[at++] = '/';
+    while (*file) path[at++] = *file++;
+    path[at] = 0;
+    return path;
 }
 
 static int starts_with(const char *s, const char *prefix) {
@@ -252,6 +324,64 @@ int main(void) {
     check(openat_(AT_FDCWD, "/proc/nosuchthing", O_RDONLY) < 0, "/proc of a name with no file", 0);
     check(openat_(AT_FDCWD, "/proc/self/stat", O_WRONLY) < 0, "/proc writes are refused", 0);
     check(openat_(AT_FDCWD, "/proc/1999/stat", O_RDONLY) < 0, "/proc of another pid is not there", 0);
+
+    // The tree: the names a directory lists are the names a program can open behind them.
+    n = list("/proc");
+    check(n > 0 && contains(buf, n, "self "), "/proc lists self", n);
+    check(n > 0 && contains(buf, n, "cpuinfo "), "/proc lists cpuinfo", n);
+    check(n > 0 && contains(buf, n, "meminfo "), "/proc lists meminfo", n);
+    check(n > 0 && contains(buf, n, "sys "), "/proc lists sys", n);
+
+    n = list("/proc/self");
+    check(n > 0 && contains(buf, n, "stat "), "/proc/self lists stat", n);
+    check(n > 0 && contains(buf, n, "cmdline "), "/proc/self lists cmdline", n);
+    check(n > 0 && contains(buf, n, "exe "), "/proc/self lists exe", n);
+    check(n > 0 && contains(buf, n, "fd "), "/proc/self lists fd", n);
+
+    n = list("/proc/self/fd");
+    check(n > 0 && contains(buf, n, "0 "), "/proc/self/fd lists stdin", n);
+    check(n > 0 && contains(buf, n, "1 "), "/proc/self/fd lists stdout", n);
+    check(n > 0 && contains(buf, n, "2 "), "/proc/self/fd lists stderr", n);
+
+    n = list("/proc/sys");
+    check(n > 0 && contains(buf, n, "kernel "), "/proc/sys lists kernel", n);
+    n = list("/proc/sys/kernel");
+    check(n > 0 && contains(buf, n, "ostype "), "/proc/sys/kernel lists ostype", n);
+
+    // The process's own pid is a name in there, with its files behind it.
+    char mine[24];
+    dec(getpid_(), mine);
+    n = list("/proc");
+    check(n > 0 && contains(buf, n, mine), "/proc lists its own pid", n);
+    n = slurp(pid_path(getpid_(), "stat"));
+    check(n > 0 && stat_field(buf, n, 1) == getpid_(), "/proc/<pid>/stat is this process", n);
+    // Another process: a child reads its parent's files, which is what having a tree is for.
+    long child = clone_();
+    if (child == 0) {
+        n = slurp(pid_path(getppid_(), "stat"));
+        check(n > 0 && stat_field(buf, n, 1) == getppid_(), "a child reads the parent's stat", n);
+        check(n > 0 && stat_field(buf, n, 4) == 0, "the parent has no parent of its own", n);
+        n = list("/proc");
+        check(n > 0, "the child lists /proc", n);
+        char theirs[24];
+        dec(getppid_(), theirs);
+        check(contains(buf, n, theirs), "the parent is listed", getppid_());
+        check(contains(buf, n, mine), "the child is listed", getpid_());
+        n = readlinkat_(pid_path(getppid_(), "exe"), buf, sizeof buf - 1);
+        check(n > 0, "the parent's exe is a link", n);
+        guest_exit(failed);
+        __builtin_unreachable();
+    }
+    check(child > 0, "fork", child);
+    static int status;
+    check(wait4_(child, &status, 0) == child, "the child was reaped", 0);
+    check(status == 0, "the child read another process's files", status);
+    dec(child, mine);
+    unsigned long k = str_len(mine);
+    mine[k] = ' ';
+    mine[k + 1] = 0;
+    n = list("/proc");
+    check(n >= 0 && !contains(buf, n, mine), "a reaped process leaves the tree", child);
 
     if (!failed) put("proc: all checks passed\n");
     guest_exit(failed);

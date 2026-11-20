@@ -166,6 +166,9 @@ export class Session {
       usage: proc.usage,
       net: this.net,
       resolver: this.resolver,
+      // A reaped process is gone from `/proc`: a zombie is still there until its parent waits.
+      peers: (pid) => this.processes.find((p) => p.pid === pid && !p.reaped)?.kernel ?? null,
+      pids: () => this.processes.filter((p) => !p.reaped).map((p) => p.pid),
       signal: (request) => this.signal(request),
       wake: () => this.poll(),
       futexWake: (addr, n) => this.futexWake(proc, addr, n),
