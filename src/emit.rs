@@ -161,6 +161,63 @@ pub mod trap {
 pub const DEFAULT_MEM_PAGES: u32 = 65535;
 pub const STACK_RESERVE: u64 = 8 * 1024 * 1024;
 
+/// A wasm32 linear memory holds at most 4 GiB, so a guest address space bigger than that is a
+/// sequence of them: the top bits of an address name the memory and the low 32 bits are the offset
+/// inside it. Every address below `CHUNK_BYTES` is served by the inline path, and the rest go
+/// through a helper, because wasm names the memory in the instruction rather than taking it off
+/// the stack.
+pub const CHUNK_BYTES: u64 = 1 << 32;
+pub const CHUNK_PAGES: u32 = 1 << 16;
+/// The most memories a run has: 64 of them address 256 GiB, and every one past the first costs a
+/// helper call on the paths that reach it.
+pub const CHUNK_MAX: u32 = 64;
+
+/// The name a chunk's memory is exported and imported under: the first is the one the engine keeps
+/// its state in, and the rest are the address space above it.
+fn mem_export(k: u32) -> (String, u8, u32) {
+    let name = if k == 0 { "mem".to_string() } else { format!("g{k}") };
+    (name, 2, k)
+}
+
+fn chunks_of(mem_pages: u32) -> u32 {
+    ((mem_pages + CHUNK_PAGES - 1) / CHUNK_PAGES).max(1)
+}
+
+/// The part of the fixed layout that a page translated while the guest runs has to agree with the
+/// image it joins.
+pub struct Plan {
+    pub chunks: u32,
+    /// The first memory's size: the whole address space when there is one chunk, and a full 4 GiB
+    /// when there are more, because the address that picks a chunk is the boundary itself.
+    pub chunk0_pages: u32,
+    /// The whole guest address space, which is what a 64-bit address is checked against.
+    pub mem_size: u64,
+    pub pte_base: u64,
+    pub stack_floor: u64,
+    pub stack_top: u64,
+}
+
+pub fn plan(cfg: &Config) -> Result<Plan, String> {
+    let chunks = chunks_of(cfg.mem_pages);
+    if chunks > CHUNK_MAX {
+        return Err(format!(
+            "{} pages is {chunks} chunks of 4 GiB, and the most a module declares is {CHUNK_MAX}",
+            cfg.mem_pages
+        ));
+    }
+    let mem_size = cfg.mem_pages as u64 * 65536;
+    // The stack belongs to the first memory, so the pages above it are memory the guest can still
+    // map: an address space that grew does not move the stack.
+    let stack_top = (mem_size.min(CHUNK_BYTES) - 0x1000) & !0xf;
+    let stack_floor = stack_top - STACK_RESERVE;
+    // One byte per 4 KiB page for every chunk, contiguous, because an address picks its entry with
+    // `addr >> 12` whatever chunk it is in: the high bits of the address are already the offset of
+    // that chunk's part of the table. It sits below the stack, out of the arena's reach.
+    let pte_base = (stack_floor - chunks as u64 * PTE_PAGES) & !0xfff;
+    let chunk0_pages = if chunks == 1 { cfg.mem_pages } else { CHUNK_PAGES };
+    Ok(Plan { chunks, chunk0_pages, mem_size, pte_base, stack_floor, stack_top })
+}
+
 pub struct Config {
     pub bounds_check: bool,
     pub mem_pages: u32,
@@ -197,6 +254,9 @@ pub struct Output {
     pub entry: u64,
     pub sp: u64,
     pub mem_pages: u32,
+    /// How many 4 GiB memories the guest's address space is carved into, which is what the host
+    /// creates and what a page translated later has to agree with.
+    pub chunks: u32,
     pub stats: Stats,
     pub code_lo: u64,
     pub code_hi: u64,
@@ -333,8 +393,8 @@ fn build_dispatch_table(regions: &[Region], failed: &[bool]) -> Result<(Vec<u8>,
 
 /// One byte per 4 KiB page for the ranges this translator maps: engine memory, the images and the
 /// stack. `mmap` and `mprotect` maintain the rest of it at run time.
-fn page_table(images: &[&Elf], stack_floor: u64, stack_top: u64) -> Vec<u8> {
-    let mut ptes = vec![0u8; PTE_PAGES as usize];
+fn page_table(images: &[&Elf], stack_floor: u64, stack_top: u64, chunks: u32) -> Vec<u8> {
+    let mut ptes = vec![0u8; chunks as usize * PTE_PAGES as usize];
     let mut set = |lo: u64, hi: u64, bits: u8| {
         let lo_page = (lo >> 12) as usize;
         let hi_page = (((hi + 0xfff) >> 12) as usize).min(ptes.len());
@@ -519,7 +579,134 @@ struct Prelude {
     ty_region: u32,
 }
 
-fn prelude(m: &mut Module, cfg: &Config) -> Prelude {
+/// Every access shape, in the order `Access::index` numbers them.
+const ACCESS_SHAPES: [Access; N_ACCESS] = [
+    Access::Load8U,
+    Access::Load16U,
+    Access::Load32,
+    Access::Load64,
+    Access::Load8S64,
+    Access::Load16S64,
+    Access::Load32S64,
+    Access::Load8S32,
+    Access::Load16S32,
+    Access::Store8,
+    Access::Store16,
+    Access::Store32,
+    Access::Store64,
+    Access::VLoad128,
+    Access::VLoad64,
+    Access::VLoad32,
+    Access::VStore128,
+    Access::VStore64,
+    Access::VStore32,
+    Access::VLoad8Splat,
+    Access::VLoad16Splat,
+    Access::VLoad32Splat,
+    Access::VLoad64Splat,
+];
+
+/// One access to a page past the first memory, as a function of its own.
+///
+/// The chunk number the address carries picks the memory, and each arm of the jump table is the
+/// same test the inline path makes: the page table covers every chunk, and an address indexes it
+/// with `addr >> 12` because the bits above 32 are already that chunk's part of the table. An arm
+/// the address space does not have traps, which is what an address past the end answers with a
+/// single memory too.
+fn emit_chunk_access(m: &mut Module, ty: u32, shape: &AccessShape, plan: &Plan) -> u32 {
+    let id = m.add_func(ty);
+    let f = m.func_mut(id);
+    // The parameters: the address, the value of a store, and the pc the trap reports.
+    let (value, pc) = if shape.store { (1u32, 2u32) } else { (u32::MAX, 1u32) };
+
+    let emit_trap = |f: &mut Func, kind: i32| {
+        f.i32c(kind);
+        f.lg(0);
+        f.lt(pc);
+        f.call(1);
+        f.op(UNREACHABLE);
+    };
+
+    // The same 64-bit bound the inline path checks: an address the address space does not reach is
+    // not a chunk of it.
+    f.lg(0);
+    f.i64c((plan.mem_size - shape.width) as i64);
+    f.op(I64_GT_U);
+    f.op(IF);
+    f.body.push(0x40);
+    emit_trap(f, trap::RANGE);
+    f.end();
+
+    for _ in 1..plan.chunks {
+        f.block();
+    }
+    f.lg(0);
+    f.i64c(32);
+    f.op(I64_SHR_U);
+    f.wrap_i64();
+    f.i32c(1);
+    f.op(I32_SUB);
+    let labels: Vec<u32> = (0..plan.chunks - 1).collect();
+    f.br_table(&labels, plan.chunks - 1);
+
+    for chunk in 1..plan.chunks {
+        f.end();
+        // The page's entry: the first byte of the access, and the byte after the last one when the
+        // access does not stay inside a page. Both have to be mapped, and a store needs them
+        // writable.
+        let need = if shape.store { pte::STORE as i32 } else { pte::LOAD as i32 };
+        // An access that stays inside one page costs one entry; one that does not is two, and the
+        // answer is both of them, which is what the inline path does.
+        let offsets: &[u64] = if shape.width > 1 { &[0, shape.width - 1] } else { &[0] };
+        let mut first = true;
+        for &off in offsets {
+            f.lg(0);
+            if off != 0 {
+                f.i64c(off as i64);
+                f.op(I64_ADD);
+            }
+            f.i64c(12);
+            f.op(I64_SHR_U);
+            f.wrap_i64();
+            f.i32c(plan.pte_base as i32);
+            f.op(I32_ADD);
+            f.mem(I32_LOAD8_U, 0, 0);
+            if !first {
+                f.op(I32_AND);
+            }
+            first = false;
+        }
+        f.i32c(need);
+        f.op(I32_AND);
+        f.i32c(need);
+        f.op(I32_NE);
+        f.op(IF);
+        f.body.push(0x40);
+        emit_trap(f, if shape.store { trap::WRITE } else { trap::READ });
+        f.end();
+
+        f.lg(0);
+        f.wrap_i64();
+        if shape.store {
+            f.lg(value);
+        }
+        if shape.vector {
+            if shape.op == simd::V128_STORE64_LANE || shape.op == simd::V128_STORE32_LANE {
+                f.simd_mem_lane_at(chunk, shape.op, shape.align, 0, 0);
+            } else {
+                f.simd_mem_at(chunk, shape.op, shape.align, 0);
+            }
+        } else {
+            f.mem_at(chunk, shape.op as u8, shape.align, 0);
+        }
+        f.ret();
+    }
+    // The default of the jump table: an address in a chunk this machine does not have.
+    emit_trap(f, trap::RANGE);
+    id
+}
+
+fn prelude(m: &mut Module, cfg: &Config, plan: &Plan) -> Prelude {
     let mut region_params = vec![I64; NR as usize];
     region_params.extend(vec![V128; NVEC as usize]);
     region_params.push(I32); // entry block
@@ -549,6 +736,18 @@ fn prelude(m: &mut Module, cfg: &Config) -> Prelude {
 
     let umulh_id = emit_umulh(m, ty_ii_i64);
     let smulh_id = emit_smulh(m, ty_ii_i64, umulh_id);
+    let mut chunks = [0u32; N_ACCESS];
+    if plan.chunks > 1 {
+        for acc in ACCESS_SHAPES {
+            let shape = acc.shape();
+            let ty = if shape.store {
+                m.ty(vec![I64, shape.value, I32], vec![])
+            } else {
+                m.ty(vec![I64, I32], vec![shape.value])
+            };
+            chunks[acc.index()] = emit_chunk_access(m, ty, &shape, plan);
+        }
+    }
     let ids = Ids {
         syscall: 0,
         trap: 1,
@@ -563,6 +762,7 @@ fn prelude(m: &mut Module, cfg: &Config) -> Prelude {
         poll,
         poll_counter,
         ty_region,
+        chunks,
     };
     Prelude { ids, ty_region }
 }
@@ -580,7 +780,8 @@ pub fn translate(
     }
     let code_lo = ranges.iter().map(|r| r.0).min().unwrap();
     let code_hi = ranges.iter().map(|r| r.1).max().unwrap();
-    let mem_size = cfg.mem_pages as u64 * 65536;
+    let plan = plan(cfg)?;
+    let mem_size = plan.mem_size;
     let entry = images.interp.map(|i| i.entry).unwrap_or(elf.entry);
 
     let loaded: Vec<&Elf> = images.all().collect();
@@ -613,8 +814,8 @@ pub fn translate(
         return Err(format!("{} regions exceeds the dispatch table encoding", regions.len()));
     }
 
-    let stack_top = (mem_size - 0x1000) & !0xf;
-    let stack_floor = stack_top - STACK_RESERVE;
+    let stack_top = plan.stack_top;
+    let stack_floor = plan.stack_floor;
     let heap_base = page_align(elf.image_end().max(IMAGE_BASE));
     if heap_base >= stack_floor {
         return Err("image too large for the fixed layout".into());
@@ -641,7 +842,7 @@ pub fn translate(
         }
     }
 
-    let ptes = page_table(&loaded, stack_floor, stack_top);
+    let ptes = page_table(&loaded, stack_floor, stack_top, plan.chunks);
 
     // AT_BASE is the loader's load address, which after relocation is its own base.
     let interp_base = images.interp.map(|i| i.load_offset()).unwrap_or(0);
@@ -650,9 +851,17 @@ pub fn translate(
     let sp = stack_top - stack_used;
 
     let mut m = Module::new();
-    m.mem_pages = cfg.mem_pages;
+    // One memory per chunk of the guest's address space, and the first of them also holds the
+    // engine's own state. A chunk is a whole 4 GiB except the last of a space that is not a
+    // multiple of it, and the engine's memory is the first: the rest are always whole.
+    m.mem_defs = (0..plan.chunks)
+        .map(|k| if k == 0 { plan.chunk0_pages } else { CHUNK_PAGES })
+        .collect();
+    for k in 0..plan.chunks {
+        m.exports.push(mem_export(k));
+    }
 
-    let Prelude { ids, ty_region } = prelude(&mut m, cfg);
+    let Prelude { ids, ty_region } = prelude(&mut m, cfg, &plan);
     let ty_run = m.ty(vec![I32, I64, I32], vec![I32]);
 
     // The dispatch table is built once the regions are emitted, and only the run loop reads its
@@ -665,6 +874,8 @@ pub fn translate(
         trace_loops: cfg.trace_loops,
         allow_undefined: cfg.allow_undefined,
         mem_size,
+        chunks: plan.chunks,
+        pte_base: plan.pte_base,
     };
 
     if std::env::var("ARMJIT_DUMP_REGIONS").is_ok() {
@@ -701,13 +912,12 @@ pub fn translate(
         }
     }
     push_sparse(&mut m, TABLE_BASE, &table_bytes);
-    push_sparse(&mut m, PTE_BASE, &ptes);
+    push_sparse(&mut m, plan.pte_base, &ptes);
     if !stack_bytes.is_empty() {
         m.data.push((sp, stack_bytes));
     }
 
     m.exports.push(("run".into(), 0, run_id));
-    m.exports.push(("mem".into(), 2, 0));
     m.exports.push(("tbl".into(), 1, 0));
 
     let wasm = m.encode();
@@ -727,8 +937,9 @@ pub fn translate(
         code_hi,
         unsupported,
         wasm,
+        chunks: plan.chunks,
         map: MapInfo {
-            pte_base: PTE_BASE,
+            pte_base: plan.pte_base,
             table_base: TABLE_BASE,
             table_mask,
             heap_base,
@@ -751,6 +962,10 @@ struct Layout {
     trace_loops: bool,
     allow_undefined: bool,
     mem_size: u64,
+    /// How many 4 GiB memories the guest's address space is carved into: one means every access is
+    /// inline, and more mean the ones above the first go through a helper.
+    chunks: u32,
+    pte_base: u64,
 }
 
 struct Ids {
@@ -771,6 +986,134 @@ struct Ids {
     /// memory round trip. It starts and refills at the quantum.
     poll_counter: u32,
     ty_region: u32,
+    /// One function per access shape, for the addresses past the first memory.
+    chunks: [u32; N_ACCESS],
+}
+
+/// Every access a guest makes, as the shape the helper for it is emitted from: wasm names the
+/// memory in the instruction, so the one thing a helper does that the inline path does not is pick
+/// the memory the chunk number names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Load8U,
+    Load16U,
+    Load32,
+    Load64,
+    Load8S64,
+    Load16S64,
+    Load32S64,
+    Load8S32,
+    Load16S32,
+    Store8,
+    Store16,
+    Store32,
+    Store64,
+    VLoad128,
+    VLoad64,
+    VLoad32,
+    VStore128,
+    VStore64,
+    VStore32,
+    VLoad8Splat,
+    VLoad16Splat,
+    VLoad32Splat,
+    VLoad64Splat,
+}
+
+const N_ACCESS: usize = 23;
+
+/// The value a store carries, as the place it can be read from inside a branch.
+#[derive(Clone, Copy)]
+enum StoreValue {
+    Gpr(u32, bool),
+    Vec(u32),
+    /// A lane of a vector register, extracted as the scalar a narrow store writes.
+    Lane(u32, u32, u8),
+}
+
+struct AccessShape {
+    /// The wasm operator, which the scalar group numbers in a byte and SIMD in a word.
+    op: u32,
+    align: u32,
+    width: u64,
+    /// The wasm type the access carries: a load's result, or a store's value.
+    value: u8,
+    store: bool,
+    vector: bool,
+}
+
+impl Access {
+    fn index(self) -> usize {
+        match self {
+            Access::Load8U => 0,
+            Access::Load16U => 1,
+            Access::Load32 => 2,
+            Access::Load64 => 3,
+            Access::Load8S64 => 4,
+            Access::Load16S64 => 5,
+            Access::Load32S64 => 6,
+            Access::Load8S32 => 7,
+            Access::Load16S32 => 8,
+            Access::Store8 => 9,
+            Access::Store16 => 10,
+            Access::Store32 => 11,
+            Access::Store64 => 12,
+            Access::VLoad128 => 13,
+            Access::VLoad64 => 14,
+            Access::VLoad32 => 15,
+            Access::VStore128 => 16,
+            Access::VStore64 => 17,
+            Access::VStore32 => 18,
+            Access::VLoad8Splat => 19,
+            Access::VLoad16Splat => 20,
+            Access::VLoad32Splat => 21,
+            Access::VLoad64Splat => 22,
+        }
+    }
+
+    fn shape(self) -> AccessShape {
+        let scalar = |op, align, width, value, store| AccessShape {
+            op,
+            align,
+            width,
+            value,
+            store,
+            vector: false,
+        };
+        let vector = |op, align, width, store| AccessShape {
+            op,
+            align,
+            width,
+            value: V128,
+            store,
+            vector: true,
+        };
+        match self {
+            Access::Load8U => scalar(I32_LOAD8_U as u32, 0, 1, I32, false),
+            Access::Load16U => scalar(I32_LOAD16_U as u32, 1, 2, I32, false),
+            Access::Load32 => scalar(I32_LOAD as u32, 2, 4, I32, false),
+            Access::Load64 => scalar(I64_LOAD as u32, 3, 8, I64, false),
+            Access::Load8S64 => scalar(I64_LOAD8_S as u32, 0, 1, I64, false),
+            Access::Load16S64 => scalar(I64_LOAD16_S as u32, 1, 2, I64, false),
+            Access::Load32S64 => scalar(I64_LOAD32_S as u32, 2, 4, I64, false),
+            Access::Load8S32 => scalar(I32_LOAD8_S as u32, 0, 1, I32, false),
+            Access::Load16S32 => scalar(I32_LOAD16_S as u32, 1, 2, I32, false),
+            Access::Store8 => scalar(I32_STORE8 as u32, 0, 1, I32, true),
+            Access::Store16 => scalar(I32_STORE16 as u32, 1, 2, I32, true),
+            Access::Store32 => scalar(I32_STORE as u32, 2, 4, I32, true),
+            Access::Store64 => scalar(I64_STORE as u32, 3, 8, I64, true),
+            Access::VLoad128 => vector(simd::V128_LOAD, 4, 16, false),
+            Access::VLoad64 => vector(simd::V128_LOAD64_ZERO, 3, 8, false),
+            Access::VLoad32 => vector(simd::V128_LOAD32_ZERO, 2, 4, false),
+            Access::VStore128 => vector(simd::V128_STORE, 4, 16, true),
+            Access::VStore64 => vector(simd::V128_STORE64_LANE, 3, 8, true),
+            Access::VStore32 => vector(simd::V128_STORE32_LANE, 2, 4, true),
+            Access::VLoad8Splat => vector(simd::V128_LOAD8_SPLAT, 0, 1, false),
+            Access::VLoad16Splat => vector(simd::V128_LOAD16_SPLAT, 1, 2, false),
+            Access::VLoad32Splat => vector(simd::V128_LOAD32_SPLAT, 2, 4, false),
+            Access::VLoad64Splat => vector(simd::V128_LOAD64_SPLAT, 3, 8, false),
+        }
+    }
 }
 
 /// How many backward branches a region runs before it asks the host whether to give up the CPU. A
@@ -1988,7 +2331,7 @@ impl<'a> RegionEmitter<'a> {
         // guard page answers and what holds for a thread's own stack as much as for the process's.
         // A stack that ran off the end of its mapping traps here, at region entry, which every
         // guest call and return passes.
-        self.f.i32c(PTE_BASE as i32);
+        self.f.i32c(self.layout.pte_base as i32);
         self.f.lg(31);
         self.f.i64c(12);
         self.f.op(I64_SHR_U);
@@ -2657,7 +3000,7 @@ impl<'a> RegionEmitter<'a> {
         self.f.wrap_i64();
         self.f.i32c(12);
         self.f.op(I32_SHR_U);
-        self.f.i32c(PTE_BASE as i32);
+        self.f.i32c(self.layout.pte_base as i32);
         self.f.op(I32_ADD);
         self.f.mem(I32_LOAD8_U, 0, 0);
     }
@@ -3596,27 +3939,20 @@ impl<'a> RegionEmitter<'a> {
     /// The same load into a scratch local, for a form whose destination registers are still the
     /// source of the next step.
     fn vload_local(&mut self, width: u32, addr: u32, local: u32) {
-        self.check_access(addr, width as u64, false);
         match width {
             16 | 8 | 4 => {
-                self.f.lg(addr);
-                self.f.wrap_i64();
-                let op = match width {
-                    16 => simd::V128_LOAD,
-                    8 => simd::V128_LOAD64_ZERO,
-                    _ => simd::V128_LOAD32_ZERO,
+                let acc = match width {
+                    16 => Access::VLoad128,
+                    8 => Access::VLoad64,
+                    _ => Access::VLoad32,
                 };
-                self.f.simd_mem(op, width.trailing_zeros(), 0);
+                self.load_access(addr, acc);
             }
             _ => {
+                // The two- and one-byte forms are a scalar load into lane 0, which is the width the
+                // access is even when the register is 128 bits.
                 self.f.v128c([0; 16]);
-                self.f.lg(addr);
-                self.f.wrap_i64();
-                if width == 2 {
-                    self.f.mem(I32_LOAD16_U, 1, 0);
-                } else {
-                    self.f.mem(I32_LOAD8_U, 0, 0);
-                }
+                self.load_access(addr, if width == 2 { Access::Load16U } else { Access::Load8U });
                 self.f.simd_lane(simd::I32X4_REPLACE_LANE, 0);
             }
         }
@@ -3628,32 +3964,20 @@ impl<'a> RegionEmitter<'a> {
     }
 
     fn vstore_local(&mut self, width: u32, addr: u32, local: u32) {
-        self.check_access(addr, width as u64, true);
-        self.f.lg(addr);
-        self.f.wrap_i64();
         match width {
-            16 => {
-                self.f.lg(local);
-                self.f.simd_mem(simd::V128_STORE, 4, 0);
-            }
-            8 => {
-                self.f.lg(local);
-                self.f.simd_mem_lane(simd::V128_STORE64_LANE, 3, 0, 0);
-            }
-            4 => {
-                self.f.lg(local);
-                self.f.simd_mem_lane(simd::V128_STORE32_LANE, 2, 0, 0);
-            }
-            2 => {
-                self.f.lg(local);
-                self.f.simd_lane(simd::I16X8_EXTRACT_LANE_U, 0);
-                self.f.mem(I32_STORE16, 1, 0);
-            }
-            _ => {
-                self.f.lg(local);
-                self.f.simd_lane(simd::I8X16_EXTRACT_LANE_U, 0);
-                self.f.mem(I32_STORE8, 0, 0);
-            }
+            16 => self.store_access(addr, Access::VStore128, StoreValue::Vec(local)),
+            8 => self.store_access(addr, Access::VStore64, StoreValue::Vec(local)),
+            4 => self.store_access(addr, Access::VStore32, StoreValue::Vec(local)),
+            2 => self.store_access(
+                addr,
+                Access::Store16,
+                StoreValue::Lane(local, simd::I16X8_EXTRACT_LANE_U, 0),
+            ),
+            _ => self.store_access(
+                addr,
+                Access::Store8,
+                StoreValue::Lane(local, simd::I8X16_EXTRACT_LANE_U, 0),
+            ),
         }
     }
 
@@ -4140,76 +4464,123 @@ impl<'a> RegionEmitter<'a> {
         self.setv(dst);
     }
 
-    fn emit_load(&mut self, addr: u32, size: u32, opc: u32, rt: u32) {
-        self.check_access(addr, 1u64 << size, false);
+    /// The comparison that says an address is in the first memory, where the access is inline.
+    /// wasm names the memory in the instruction, so an access past the first 4 GiB is a call, and a
+    /// run with one chunk emits none of this.
+    fn chunked_if(&mut self, addr: u32, result: Option<u8>) {
         self.f.lg(addr);
+        self.f.i64c(32);
+        self.f.op(I64_SHR_U);
         self.f.wrap_i64();
-        match (size, opc) {
-            (0, 1) => {
-                self.f.mem(I32_LOAD8_U, 0, 0);
-                self.set(rt, false);
+        self.f.op(I32_EQZ);
+        self.f.op(IF);
+        self.f.body.push(result.unwrap_or(0x40));
+        self.open += 1;
+    }
+
+    fn inline_mem(&mut self, memory: u32, acc: Access) {
+        let shape = acc.shape();
+        if shape.vector {
+            if shape.op == simd::V128_STORE64_LANE || shape.op == simd::V128_STORE32_LANE {
+                self.f.simd_mem_lane_at(memory, shape.op, shape.align, 0, 0);
+            } else {
+                self.f.simd_mem_at(memory, shape.op, shape.align, 0);
             }
-            (1, 1) => {
-                self.f.mem(I32_LOAD16_U, 1, 0);
-                self.set(rt, false);
-            }
-            (2, 1) => {
-                self.f.mem(I32_LOAD, 2, 0);
-                self.set(rt, false);
-            }
-            (3, 1) => {
-                self.f.mem(I64_LOAD, 3, 0);
-                self.set(rt, true);
-            }
-            // opc 2 sign-extends to the full register and opc 3 to 32 bits, which zeroes the top
-            // half: an `ldrsb x` whose sign stops at bit 31 puts 0x00000000ffffffff in a register
-            // where the guest expects 0xffffffffffffffff, and every index built from it is wrong.
-            (0, 2) => {
-                self.f.mem(I64_LOAD8_S, 0, 0);
-                self.set(rt, true);
-            }
-            (1, 2) => {
-                self.f.mem(I64_LOAD16_S, 1, 0);
-                self.set(rt, true);
-            }
-            (2, 2) => {
-                self.f.mem(I64_LOAD32_S, 2, 0);
-                self.set(rt, true);
-            }
-            (0, 3) => {
-                self.f.mem(I32_LOAD8_S, 0, 0);
-                self.set(rt, false);
-            }
-            (1, 3) => {
-                self.f.mem(I32_LOAD16_S, 1, 0);
-                self.set(rt, false);
-            }
-            _ => unreachable!("load size/opc {size}/{opc}"),
+        } else {
+            self.f.mem_at(memory, shape.op as u8, shape.align, 0);
         }
     }
 
-    fn emit_store(&mut self, addr: u32, size: u32, rt: u32) {
-        self.check_access(addr, 1u64 << size, true);
-        self.f.lg(addr);
-        self.f.wrap_i64();
-        match size {
-            0 => {
-                self.get(rt, false);
-                self.f.mem(I32_STORE8, 0, 0);
+    /// The value a store carries, pushed inside each branch of the chunk test: a block cannot
+    /// reach a value below itself, so the value is read from where it already is rather than
+    /// stacked.
+    fn push_value(&mut self, value: StoreValue) {
+        match value {
+            StoreValue::Gpr(r, sf) => self.get(r, sf),
+            StoreValue::Vec(local) => {
+                self.f.lg(local);
             }
-            1 => {
-                self.get(rt, false);
-                self.f.mem(I32_STORE16, 1, 0);
-            }
-            2 => {
-                self.get(rt, false);
-                self.f.mem(I32_STORE, 2, 0);
-            }
-            _ => {
-                self.get(rt, true);
-                self.f.mem(I64_STORE, 3, 0);
+            StoreValue::Lane(local, extract, lane) => {
+                self.f.lg(local);
+                self.f.simd_lane(extract, lane);
             }
         }
+    }
+
+    fn load_access(&mut self, addr: u32, acc: Access) {
+        let shape = acc.shape();
+        if self.layout.chunks == 1 {
+            self.check_access(addr, shape.width, false);
+            self.f.lg(addr);
+            self.f.wrap_i64();
+            self.inline_mem(0, acc);
+            return;
+        }
+        self.chunked_if(addr, Some(shape.value));
+        self.check_access(addr, shape.width, false);
+        self.f.lg(addr);
+        self.f.wrap_i64();
+        self.inline_mem(0, acc);
+        self.f.op(ELSE);
+        self.f.lg(addr);
+        self.f.i32c(self.cur_pc as i32);
+        self.f.call(self.ids.chunks[acc.index()]);
+        self.close_if();
+    }
+
+    fn store_access(&mut self, addr: u32, acc: Access, value: StoreValue) {
+        let shape = acc.shape();
+        if self.layout.chunks == 1 {
+            self.check_access(addr, shape.width, true);
+            self.f.lg(addr);
+            self.f.wrap_i64();
+            self.push_value(value);
+            self.inline_mem(0, acc);
+            return;
+        }
+        self.chunked_if(addr, None);
+        self.check_access(addr, shape.width, true);
+        self.f.lg(addr);
+        self.f.wrap_i64();
+        self.push_value(value);
+        self.inline_mem(0, acc);
+        self.f.op(ELSE);
+        self.f.lg(addr);
+        self.push_value(value);
+        self.f.i32c(self.cur_pc as i32);
+        self.f.call(self.ids.chunks[acc.index()]);
+        self.close_if();
+    }
+
+    fn emit_load(&mut self, addr: u32, size: u32, opc: u32, rt: u32) {
+        // opc 2 sign-extends to the full register and opc 3 to 32 bits, which zeroes the top half:
+        // an `ldrsb x` whose sign stops at bit 31 puts 0x00000000ffffffff in a register where the
+        // guest expects 0xffffffffffffffff, and every index built from it is wrong.
+        let (acc, wide) = match (size, opc) {
+            (0, 1) => (Access::Load8U, false),
+            (1, 1) => (Access::Load16U, false),
+            (2, 1) => (Access::Load32, false),
+            (3, 1) => (Access::Load64, true),
+            (0, 2) => (Access::Load8S64, true),
+            (1, 2) => (Access::Load16S64, true),
+            (2, 2) => (Access::Load32S64, true),
+            (0, 3) => (Access::Load8S32, false),
+            (1, 3) => (Access::Load16S32, false),
+            _ => unreachable!("load size/opc {size}/{opc}"),
+        };
+        self.load_access(addr, acc);
+        self.set(rt, wide);
+    }
+
+    fn emit_store(&mut self, addr: u32, size: u32, rt: u32) {
+        let acc = match size {
+            0 => Access::Store8,
+            1 => Access::Store16,
+            2 => Access::Store32,
+            _ => Access::Store64,
+        };
+        // A 32-bit form writes the low half of the register it is given.
+        self.store_access(addr, acc, StoreValue::Gpr(rt, size == 3));
     }
 
     /// An instruction the translator cannot emit. With `allow_undefined` it becomes a trap at the
@@ -5196,52 +5567,27 @@ impl<'a> RegionEmitter<'a> {
                         self.f.ls(L_T1);
                     }
                     let r = (rt + i) % 32;
-                    self.check_access(L_T1, ebytes as u64, !is_load);
                     if is_load {
+                        // The register goes on the stack first, and the lane the scalar lands in is
+                        // the one thing this form adds.
+                        let (acc, replace) = match size {
+                            0 => (Access::Load8U, simd::I8X16_REPLACE_LANE),
+                            1 => (Access::Load16U, simd::I16X8_REPLACE_LANE),
+                            2 => (Access::Load32, simd::I32X4_REPLACE_LANE),
+                            _ => (Access::Load64, simd::I64X2_REPLACE_LANE),
+                        };
                         self.getv(r);
-                        self.f.lg(L_T1);
-                        self.f.wrap_i64();
-                        match size {
-                            0 => {
-                                self.f.mem(I32_LOAD8_U, 0, 0);
-                                self.f.simd_lane(simd::I8X16_REPLACE_LANE, index);
-                            }
-                            1 => {
-                                self.f.mem(I32_LOAD16_U, 1, 0);
-                                self.f.simd_lane(simd::I16X8_REPLACE_LANE, index);
-                            }
-                            2 => {
-                                self.f.mem(I32_LOAD, 2, 0);
-                                self.f.simd_lane(simd::I32X4_REPLACE_LANE, index);
-                            }
-                            _ => {
-                                self.f.mem(I64_LOAD, 3, 0);
-                                self.f.simd_lane(simd::I64X2_REPLACE_LANE, index);
-                            }
-                        }
+                        self.load_access(L_T1, acc);
+                        self.f.simd_lane(replace, index);
                         self.setv(r);
                     } else {
-                        self.f.lg(L_T1);
-                        self.f.wrap_i64();
-                        self.getv(r);
-                        match size {
-                            0 => {
-                                self.f.simd_lane(simd::I8X16_EXTRACT_LANE_U, index);
-                                self.f.mem(I32_STORE8, 0, 0);
-                            }
-                            1 => {
-                                self.f.simd_lane(simd::I16X8_EXTRACT_LANE_U, index);
-                                self.f.mem(I32_STORE16, 1, 0);
-                            }
-                            2 => {
-                                self.f.simd_lane(simd::I32X4_EXTRACT_LANE, index);
-                                self.f.mem(I32_STORE, 2, 0);
-                            }
-                            _ => {
-                                self.f.simd_lane(simd::I64X2_EXTRACT_LANE, index);
-                                self.f.mem(I64_STORE, 3, 0);
-                            }
-                        }
+                        let (extract, acc) = match size {
+                            0 => (simd::I8X16_EXTRACT_LANE_U, Access::Store8),
+                            1 => (simd::I16X8_EXTRACT_LANE_U, Access::Store16),
+                            2 => (simd::I32X4_EXTRACT_LANE, Access::Store32),
+                            _ => (simd::I64X2_EXTRACT_LANE, Access::Store64),
+                        };
+                        self.store_access(L_T1, acc, StoreValue::Lane(NVEC0 + r, extract, index));
                     }
                 }
                 if let Some(index) = post {
@@ -5261,16 +5607,13 @@ impl<'a> RegionEmitter<'a> {
                 self.addr_base_off(rn, 0);
                 self.f.lg(L_T1);
                 self.f.ls(L_T2);
-                self.check_access(L_T1, (bits / 8) as u64, false);
-                self.f.lg(L_T1);
-                self.f.wrap_i64();
-                let op = match bits {
-                    8 => simd::V128_LOAD8_SPLAT,
-                    16 => simd::V128_LOAD16_SPLAT,
-                    32 => simd::V128_LOAD32_SPLAT,
-                    _ => simd::V128_LOAD64_SPLAT,
+                let acc = match bits {
+                    8 => Access::VLoad8Splat,
+                    16 => Access::VLoad16Splat,
+                    32 => Access::VLoad32Splat,
+                    _ => Access::VLoad64Splat,
                 };
-                self.f.simd_mem(op, size, 0);
+                self.load_access(L_T1, acc);
                 if !q {
                     self.f.v128c(low_half_mask());
                     self.f.simd(simd::V128_AND);
@@ -6984,10 +7327,7 @@ impl<'a> RegionEmitter<'a> {
     fn emit_load_or_store_pair(&mut self, is_load: bool, width: u32, signed_word: bool, addr: u32, r: u32) {
         if is_load {
             if signed_word {
-                self.check_access(addr, 4, false);
-                self.f.lg(addr);
-                self.f.wrap_i64();
-                self.f.mem(I64_LOAD32_S, 2, 0);
+                self.load_access(addr, Access::Load32S64);
                 self.set(r, true);
             } else if width == 64 {
                 self.emit_load(addr, 3, 1, r);
@@ -7076,16 +7416,21 @@ pub fn translate_page(
     }
 
     let mut m = Module::new();
-    m.mem_import = Some(("env".into(), "mem".into()));
-    let Prelude { ids, ty_region } = prelude(&mut m, cfg);
+    let plan = plan(cfg)?;
+    m.mem_imports = (0..plan.chunks)
+        .map(|k| ("env".to_string(), if k == 0 { "mem".to_string() } else { format!("g{k}") }))
+        .collect();
+    let Prelude { ids, ty_region } = prelude(&mut m, cfg, &plan);
     let layout = Layout {
         table_mask: 0,
-        stack_floor: 0,
+        stack_floor: plan.stack_floor,
         bounds_check: cfg.bounds_check,
         trace: cfg.trace,
         trace_loops: cfg.trace_loops,
         allow_undefined: cfg.allow_undefined,
-        mem_size: cfg.mem_pages as u64 * 65536,
+        mem_size: plan.mem_size,
+        chunks: plan.chunks,
+        pte_base: plan.pte_base,
     };
     let mut unsupported: Vec<(u64, String)> = Vec::new();
     let (bodies, failed) = emit_regions(&regions, &layout, &ids, ty_region, &mut unsupported);

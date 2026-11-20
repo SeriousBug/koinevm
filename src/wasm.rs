@@ -529,11 +529,26 @@ impl Func {
         self.body.push(op::RETURN);
         self
     }
+    /// A load or store in the module's first memory, which is the one the engine keeps its own
+    /// state in.
     pub fn mem(&mut self, o: u8, align_log2: u32, offset: u64) -> &mut Self {
+        self.mem_at(0, o, align_log2, offset)
+    }
+    /// The same in memory `memory`: the multi-memory form marks the alignment's top bit and puts
+    /// the memory's index between the alignment and the offset.
+    pub fn mem_at(&mut self, memory: u32, o: u8, align_log2: u32, offset: u64) -> &mut Self {
         self.body.push(o);
-        uleb(&mut self.body, align_log2 as u64);
-        uleb(&mut self.body, offset);
+        self.memarg(memory, align_log2, offset);
         self
+    }
+    fn memarg(&mut self, memory: u32, align_log2: u32, offset: u64) {
+        if memory == 0 {
+            uleb(&mut self.body, align_log2 as u64);
+        } else {
+            uleb(&mut self.body, (align_log2 | 0x40) as u64);
+            uleb(&mut self.body, memory as u64);
+        }
+        uleb(&mut self.body, offset);
     }
     /// A `0xfd`-prefixed SIMD instruction.
     pub fn simd(&mut self, op: u32) -> &mut Self {
@@ -542,15 +557,26 @@ impl Func {
         self
     }
     pub fn simd_mem(&mut self, op: u32, align_log2: u32, offset: u64) -> &mut Self {
+        self.simd_mem_at(0, op, align_log2, offset)
+    }
+    pub fn simd_mem_at(&mut self, memory: u32, op: u32, align_log2: u32, offset: u64) -> &mut Self {
         self.simd(op);
-        uleb(&mut self.body, align_log2 as u64);
-        uleb(&mut self.body, offset);
+        self.memarg(memory, align_log2, offset);
         self
     }
     pub fn simd_mem_lane(&mut self, op: u32, align_log2: u32, offset: u64, lane: u8) -> &mut Self {
+        self.simd_mem_lane_at(0, op, align_log2, offset, lane)
+    }
+    pub fn simd_mem_lane_at(
+        &mut self,
+        memory: u32,
+        op: u32,
+        align_log2: u32,
+        offset: u64,
+        lane: u8,
+    ) -> &mut Self {
         self.simd(op);
-        uleb(&mut self.body, align_log2 as u64);
-        uleb(&mut self.body, offset);
+        self.memarg(memory, align_log2, offset);
         self.body.push(lane);
         self
     }
@@ -593,10 +619,13 @@ pub struct Module {
     pub elems: Vec<(u32, Vec<u32>)>,
     /// (name, kind, index): kind 0 = func, 1 = table, 2 = memory
     pub exports: Vec<(String, u8, u32)>,
-    pub mem_pages: u32,
-    /// A module that translates more code for an existing run takes the host's memory instead of
-    /// defining one, so both see the same bytes.
-    pub mem_import: Option<(String, String)>,
+    /// One entry per defined memory, its initial size in 64 KiB pages. A module that joins a
+    /// running image imports the host's memories instead and defines none.
+    pub mem_defs: Vec<u32>,
+    /// The host's memories, in the order the guest's address space is carved into them: a module
+    /// that translates more code for an existing run takes the ones the run has, so both see the
+    /// same bytes. Memory index 0 is the first, which is where the engine's own state lives.
+    pub mem_imports: Vec<(String, String)>,
     /// `(type, mutable, initial value)`, indexed from zero because a module here imports no global.
     /// A global is the one thing a translated region can keep between instructions without a
     /// memory round trip, which is what the preemption counter needs.
@@ -614,8 +643,8 @@ impl Module {
             table_max: None,
             elems: Vec::new(),
             exports: Vec::new(),
-            mem_pages: 0,
-            mem_import: None,
+            mem_defs: Vec::new(),
+            mem_imports: Vec::new(),
             globals: Vec::new(),
             data: Vec::new(),
         }
@@ -669,7 +698,7 @@ impl Module {
         }
         Self::section(&mut out, 1, &s);
 
-        let n_imports = self.imports.len() + self.mem_import.iter().count();
+        let n_imports = self.imports.len() + self.mem_imports.len();
         if n_imports > 0 {
             let mut s = Vec::new();
             uleb(&mut s, n_imports as u64);
@@ -681,7 +710,9 @@ impl Module {
                 s.push(0x00);
                 uleb(&mut s, im.ty as u64);
             }
-            if let Some((module, name)) = &self.mem_import {
+            // A memory an import declares with a minimum of one page and no maximum accepts any
+            // size the host hands it, which is what a guest chunk of four gigabytes is.
+            for (module, name) in &self.mem_imports {
                 uleb(&mut s, module.len() as u64);
                 s.extend_from_slice(module.as_bytes());
                 uleb(&mut s, name.len() as u64);
@@ -718,11 +749,13 @@ impl Module {
             Self::section(&mut out, 4, &s);
         }
 
-        if self.mem_pages > 0 {
+        if !self.mem_defs.is_empty() {
             let mut s = Vec::new();
-            uleb(&mut s, 1);
-            s.push(0x00);
-            uleb(&mut s, self.mem_pages as u64);
+            uleb(&mut s, self.mem_defs.len() as u64);
+            for pages in &self.mem_defs {
+                s.push(0x00);
+                uleb(&mut s, *pages as u64);
+            }
             Self::section(&mut out, 5, &s);
         }
 
