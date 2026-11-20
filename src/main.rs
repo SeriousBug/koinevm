@@ -196,7 +196,8 @@ fn place(
             "{{\"entry\":{},\"sp\":{},\"mem_pages\":{},\"chunks\":{},\"code_lo\":{},\"code_hi\":{},",
             "\"pte_base\":{},\"table_base\":{},\"table_mask\":{},\"block_bits\":{},",
             "\"heap_base\":{},\"heap_limit\":{},\"mmap_base\":{},",
-            "\"stack_floor\":{},\"bounds\":{},\"trace\":{},\"trace_loops\":{},\"images\":[{}]}}\n"
+            "\"stack_floor\":{},\"bounds\":{},\"trace\":{},\"trace_loops\":{},",
+            "\"pages\":[{}],\"images\":[{}]}}\n"
         ),
         res.entry,
         res.sp,
@@ -215,6 +216,11 @@ fn place(
         if cfg.bounds_check { 1 } else { 0 },
         if cfg.trace { 1 } else { 0 },
         if cfg.trace_loops { 1 } else { 0 },
+        res.pages
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         images.join(",")
     );
     Ok(Placed { interp_entry: interp.as_ref().map(|i| i.entry), output: res, meta })

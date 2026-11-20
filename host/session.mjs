@@ -335,7 +335,7 @@ export class Session {
         if (pc === SIGTRAMP) return this.sigreturnAt(proc, thread);
         // A jump into a page the guest did not map executable is a fault rather than a request to
         // translate: running data is how a program finds out it has a wild function pointer.
-        if ((proc.kernel.space.ptes[pc >>> 12] & (PTE.MAPPED | PTE.EXECUTABLE)) !== (PTE.MAPPED | PTE.EXECUTABLE)) {
+        if ((proc.kernel.space.ptes[Math.floor(pc / 0x1000)] & (PTE.MAPPED | PTE.EXECUTABLE)) !== (PTE.MAPPED | PTE.EXECUTABLE)) {
           return this.faulted(proc, thread, {
             kind: 6,
             signal: 11,

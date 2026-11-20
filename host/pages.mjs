@@ -10,6 +10,8 @@ import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { PTE } from "./addressspace.mjs";
+
 /// Distinguishes the module files of one host from another's, since they share a temporary folder.
 let imageSerial = 0;
 
@@ -129,8 +131,13 @@ export class Mach {
     this.lineage = new Lineage(this.table.length);
     this.pageInstances = new Map();
     /// Pages the guest has written to since they were translated: the file no longer says what
-    /// they hold, so the next translation of one is taken from memory instead.
-    this.patched = new Set();
+    /// they hold, so the next translation of one is taken from memory instead. Held as merged
+    /// ranges, because the ranges a program names are its whole arenas: a munmap of a 4 GiB heap
+    /// would otherwise put a million pages in a set.
+    this.patched = [];
+    /// The image pages that hold a block, from the translation: the dispatch words of those pages
+    /// are the translator's, so forgetting one means clearing the slots it wrote.
+    this.imagePages = meta.pages ?? [];
     this.view = new DataView(memory.buffer);
   }
 
@@ -209,16 +216,72 @@ export class Mach {
     this.view.setUint32(addr + 4, 0, true);
   }
 
+  /// Whether the guest has written to the page at `at` since it was translated.
+  isPatched(at) {
+    let lo = 0;
+    let hi = this.patched.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const span = this.patched[mid];
+      if (at < span.lo) hi = mid - 1;
+      else if (at >= span.hi) lo = mid + 1;
+      else return true;
+    }
+    return false;
+  }
+
+  /// Mark every page in `[lo, hi)` as holding what the guest put there rather than what the file
+  /// did, as one merged range: the ranges a program names are its arenas.
+  markPatched(lo, hi) {
+    const spans = this.patched;
+    let at = 0;
+    while (at < spans.length && spans[at].lo < lo) at++;
+    const merged = [];
+    let start = lo;
+    let end = hi;
+    let i = 0;
+    for (; i < at; i++) merged.push(spans[i]);
+    for (let j = at; j < spans.length; j++) {
+      const span = spans[j];
+      if (span.lo > end) break;
+      start = Math.min(start, span.lo);
+      end = Math.max(end, span.hi);
+    }
+    merged.push({ lo: start, hi: end });
+    for (let j = i; j < spans.length; j++) {
+      if (spans[j].lo > end) merged.push(spans[j]);
+    }
+    this.patched = merged;
+  }
+
+  /// Without a dispatch word of its own, the first four-byte pc at or after `at`.
+  firstImagePage(at) {
+    let lo = 0;
+    let hi = this.imagePages.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (this.imagePages[mid] < at) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
   /// Forget every page whose code lies in `[lo, hi)`: the guest changed what is there, so the
   /// module that was translated from it is a translation of bytes that no longer exist. The slots
   /// stay in use - a fork's parent may still be running them - and the next translation of the page
   /// takes a range of its own.
   forgetRange(lo, hi) {
-    // Every entry the page could have claimed, since the table is keyed by pc and a block can start
-    // anywhere in it: the probe is what says whether that pc was a block start at all.
-    for (let page = lo & ~0xfff; page < hi; page += 0x1000) {
-      this.patched.add(page);
-      this.kernel.space.unmarkTranslated(page);
+    // A range can be a program's whole arena, four gigabytes of it, so the pages are marked as one
+    // span and the words cleared are the ones a page is known to own: the image's, which the
+    // translator listed, and the ones this host dispatched. Walking every four-byte slot the range
+    // covers would be a billion probes to find the handful of blocks that were in it.
+    this.markPatched(lo, hi);
+    const space = this.kernel.space;
+    for (let p = Math.floor(lo / 0x1000); p < Math.ceil(hi / 0x1000); p++) {
+      space.ptes[p] &= ~PTE.TRANSLATED;
+    }
+    for (let i = this.firstImagePage(lo); i < this.imagePages.length && this.imagePages[i] < hi; i++) {
+      const page = this.imagePages[i];
       for (let pc = page; pc < page + 0x1000; pc += 4) this.clearDispatch(pc);
     }
     for (const key of [...this.lineage.slotOf.keys()]) {
@@ -260,8 +323,8 @@ export class Mach {
     // A page the guest wrote to is translated from what it holds now: the file says what the loader
     // put there, and a guest that patches its own code has moved past that. A page with no file
     // behind it is code the guest generated, so every translation of it comes from memory.
-    const from = pc & ~0xfff;
-    const patched = !image || this.patched.has(from);
+    const from = Math.floor(pc / 0x1000) * 0x1000;
+    const patched = !image || this.isPatched(from);
     let page = patched ? null : pageModules.get(key);
     if (!page) {
       const bytes = patched
