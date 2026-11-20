@@ -4,7 +4,8 @@
 #
 #   tools/run-rootfs.sh /bin/ls -l /etc
 #
-# Translation is cached in target/tmp by the argument list, so a repeat run is only the run itself.
+# Translation is cached in target/tmp by the argument list and the build of the translator that
+# produced it, so a repeat run is only the run itself and a rebuild costs a translation.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -37,6 +38,17 @@ pages=${ARMJIT_MEM_PAGES:-}
 key=$(printf '%s_' "$prog" "$@" "$env" "$pages" | tr -c 'A-Za-z0-9_.-' '_')${ARMJIT_TRACE:+_trace}${ARMJIT_TRACE_LOOPS:+_loops}
 wasm="target/tmp/rootfs_$key.wasm"
 mkdir -p target/tmp
+
+# A cached module is the output of one build of the translator, so a rebuild makes every cached one
+# stale: the layout, the metadata and the conventions the host shares with the translator all move.
+# The build is named by what it produced, and a different name is a different cache.
+build=$(shasum -a 256 target/release/armjit 2> /dev/null | cut -d' ' -f1)
+if [[ -z $build ]]; then build=$(sha256sum target/release/armjit 2> /dev/null | cut -d' ' -f1); fi
+if [[ -z $build ]]; then build="$(wc -c < target/release/armjit)-$(date -r target/release/armjit +%s)"; fi
+if [[ $(cat target/tmp/rootfs.build 2> /dev/null) != "$build" ]]; then
+    rm -f target/tmp/rootfs_*.wasm target/tmp/rootfs_*.wasm.json target/tmp/rootfs_*.log
+    printf '%s\n' "$build" > target/tmp/rootfs.build
+fi
 
 if [[ ! -f $wasm || -n ${ARMJIT_RETRANSLATE:-} ]]; then
     if ! ./target/release/armjit translate "$rootfs$prog" -o "$wasm" --rootfs="$rootfs" \

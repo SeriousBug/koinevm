@@ -110,6 +110,15 @@ export class Translator {
 /// One guest run: the module, the table its code lives in, and the dispatch table behind it.
 export class Mach {
   constructor({ instance, memory, meta, kernel, translator, imports }) {
+    // A dispatch word is packed by a convention the translator and this host both hold, and a module
+    // from a build that held a different one misreads every entry it holds: a cached module from an
+    // older build is stale, and saying so is better than running it.
+    if (meta.block_bits !== BLOCK_BITS) {
+      throw new Error(
+        `the module was translated with ${meta.block_bits} block bits in a dispatch word, this host ` +
+          `reads ${BLOCK_BITS}: it is from another build, and has to be translated again`,
+      );
+    }
     this.instance = instance;
     this.memory = memory;
     this.meta = meta;

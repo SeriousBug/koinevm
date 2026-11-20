@@ -194,7 +194,7 @@ fn place(
     let meta = format!(
         concat!(
             "{{\"entry\":{},\"sp\":{},\"mem_pages\":{},\"chunks\":{},\"code_lo\":{},\"code_hi\":{},",
-            "\"pte_base\":{},\"table_base\":{},\"table_mask\":{},",
+            "\"pte_base\":{},\"table_base\":{},\"table_mask\":{},\"block_bits\":{},",
             "\"heap_base\":{},\"heap_limit\":{},\"mmap_base\":{},",
             "\"stack_floor\":{},\"bounds\":{},\"trace\":{},\"trace_loops\":{},\"images\":[{}]}}\n"
         ),
@@ -207,6 +207,7 @@ fn place(
         res.map.pte_base,
         res.map.table_base,
         res.map.table_mask,
+        emit::BLOCK_BITS,
         res.map.heap_base,
         res.map.heap_limit,
         res.map.mmap_base,
