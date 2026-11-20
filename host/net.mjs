@@ -795,6 +795,10 @@ class PairEnd {
     /// A pair is connected from the moment it exists, to a name that is only its own end.
     this.peer = { family: AF_UNIX, path: "" };
     this.peerClosed = false;
+    /// The directions `shutdown` has closed, which is what a program that has finished writing
+    /// says before it waits for the answer.
+    this.writeClosed = false;
+    this.readClosed = false;
     this.refs = 1;
     this.nonblock = false;
     this.timeout = 0;
@@ -812,7 +816,21 @@ class PairEnd {
     return Promise.resolve(-EOPNOTSUPP);
   }
 
+  /// `shutdown`: one direction of a pair, which is what a program does when it has written all it
+  /// is going to and waits for the answer. The far end reads to the end of the queue and then finds
+  /// the file at its end, which is what a half-closed connection looks like.
+  shutdown(how) {
+    if (how === 0 || how === 1 || how === 2) this.writeClosed = true;
+    if (how === 0 || how === 2) this.readClosed = true;
+    if ((how === 1 || how === 2) && this.other) {
+      this.other.peerClosed = true;
+      this.net.notify();
+    }
+    return 0;
+  }
+
   send(bytes) {
+    if (this.writeClosed) return -EPIPE;
     if (!this.other || this.otherClosed) return -EPIPE;
     this.other.queue.push(Buffer.from(bytes));
     this.net.notify();
@@ -831,7 +849,7 @@ class PairEnd {
   }
 
   status() {
-    return { read: this.queue.length > 0 || this.peerClosed, write: !this.peerClosed, err: false, hup: this.peerClosed };
+    return { read: this.queue.length > 0 || this.peerClosed || this.readClosed, write: !this.peerClosed && !this.writeClosed, err: false, hup: this.peerClosed };
   }
 
   pending() {
