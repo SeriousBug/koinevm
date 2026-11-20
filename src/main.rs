@@ -99,10 +99,7 @@ fn load_image(path: &str, base: Option<u64>) -> Result<elf::Elf, String> {
 /// offset is the segment's, and the page is the one `at` falls on.
 fn patch_page(image: &mut elf::Elf, at: u64, hex: &str) -> Result<(), String> {
     let page = at & !0xfff;
-    let bytes: Vec<u8> = (0..hex.len() / 2)
-        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
-        .collect::<Result<_, _>>()
-        .map_err(|_| "bad page bytes".to_string())?;
+    let bytes = unhex(hex)?;
     for s in &image.segments {
         if page < s.vaddr || page >= s.end() {
             continue;
@@ -391,6 +388,45 @@ fn run(args: &[String]) -> Result<(), String> {
                             // holds now: the file says what the loader put there, and the guest has
                             // moved past that. Those bytes are not cached, because the next write
                             // to the page makes them wrong again.
+                            if path == "-" {
+                                // A page the guest wrote where no file is mapped, which is what a
+                                // program's own JIT does: the address space owes it code translated
+                                // from the bytes it left there, and there is nothing else to go on.
+                                let bytes = unhex(req.get(4).ok_or("a page with no image needs bytes")?)?;
+                                let site = emit::sites_of_code(at, &bytes);
+                                let res = emit::translate_page(&site, at, &cfg)?;
+                                let regions: Vec<String> = res
+                                    .regions
+                                    .iter()
+                                    .map(|r| {
+                                        let blocks: Vec<String> =
+                                            r.blocks.iter().map(|b| b.to_string()).collect();
+                                        format!(
+                                            "{{\"entry\":{},\"blocks\":[{}]}}",
+                                            r.entry,
+                                            blocks.join(",")
+                                        )
+                                    })
+                                    .collect();
+                                let gaps: Vec<String> = res
+                                    .unsupported
+                                    .iter()
+                                    .map(|(a, why)| {
+                                        let off = (a & 0xfff) as usize;
+                                        let word = match bytes.get(off..off + 4) {
+                                            Some(b) => u32::from_le_bytes(b.try_into().unwrap()),
+                                            None => 0,
+                                        };
+                                        format!("[{a},\"{word:08x}\",{}]", json_str(why))
+                                    })
+                                    .collect();
+                                return Ok(format!(
+                                    "{{\"ok\":true,\"wasm\":\"{}\",\"regions\":[{}],\"unsupported\":[{}]}}",
+                                    hex(&res.wasm),
+                                    regions.join(","),
+                                    gaps.join(",")
+                                ));
+                            }
                             let mut fresh: Option<elf::Elf> = None;
                             if let Some(hex) = req.get(4) {
                                 let mut image = load_image(&path, Some(base))?;
@@ -400,7 +436,7 @@ fn run(args: &[String]) -> Result<(), String> {
                             let (res, image) = match &fresh {
                                 Some(image) => {
                                     let site = emit::sites(&[image]);
-                                    (emit::translate_page(image, &site, at, &cfg)?, image)
+                                    (emit::translate_page(&site, at, &cfg)?, image)
                                 }
                                 None => {
                                     if !cache.contains_key(&(path.clone(), base)) {
@@ -409,7 +445,7 @@ fn run(args: &[String]) -> Result<(), String> {
                                         cache.insert((path.clone(), base), (image, site));
                                     }
                                     let (image, site) = &cache[&(path.clone(), base)];
-                                    (emit::translate_page(image, site, at, &cfg)?, image)
+                                    (emit::translate_page(site, at, &cfg)?, image)
                                 }
                             };
                             let bias = image.bias;

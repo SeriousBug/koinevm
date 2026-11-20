@@ -522,29 +522,7 @@ pub fn sites<'a>(images: &[&'a Elf]) -> Site {
     // Addresses that only a value reaches: built by `adrp` + `add`, or stored in the image's data.
     // Either can land on a number that is not code, so a region that fails to translate there
     // becomes a trap rather than failing the image.
-    let mut pointer_entries: BTreeSet<u64> = BTreeSet::new();
-    for (&addr, insn) in &insns {
-        let Insn::AddSubImm { sf: _, sub: false, setflags: false, shift, imm: add, rn, rd } = *insn
-        else {
-            continue;
-        };
-        if rn != rd {
-            continue;
-        }
-        // The `adrp` that a following `add` completes need not be its immediate predecessor: the
-        // compiler interleaves several pairs.
-        let page = (1..=8u64).find_map(|k| match insns.get(&addr.checked_sub(4 * k)?) {
-            Some(Insn::Adrp { rd: base, imm }) if *base == rn => Some((addr - 4 * k, *imm)),
-            _ => None,
-        });
-        let Some((page_addr, page_imm)) = page else { continue };
-        let target = ((page_addr & !0xfff) as i64
-            + (page_imm << 12)
-            + ((add as i64) << (12 * shift))) as u64;
-        if insns.contains_key(&target) {
-            pointer_entries.insert(target);
-        }
-    }
+    let mut pointer_entries = pointer_entries(&insns);
 
     // A function reached only through a pointer has no branch to discover it: the pointer is what
     // makes it an entry, so every code address an image stores in its writable data becomes one.
@@ -574,6 +552,61 @@ pub fn sites<'a>(images: &[&'a Elf]) -> Site {
         }
     }
     Site { insns, entries, pointer_entries }
+}
+
+/// Instruction words and the addresses a region may start at, for a page of code that has no file
+/// behind it: a guest's own JIT wrote the bytes, so the bytes are the whole of what is known. A
+/// branch out of the page reaches the dispatcher, which translates the page it lands in when the
+/// run gets there.
+pub fn sites_of_code(at: u64, bytes: &[u8]) -> Site {
+    let page = at & !0xfff;
+    let mut insns: BTreeMap<u64, Insn> = BTreeMap::new();
+    let mut a = page;
+    for w in bytes.chunks_exact(4) {
+        insns.insert(a, decode(u32::from_le_bytes(w.try_into().unwrap())));
+        a += 4;
+    }
+    // The only function starts a page of generated code has are the ones it calls: there are no
+    // symbols, no unwind tables and no loader to say where a function begins.
+    let mut entries: BTreeSet<u64> = BTreeSet::new();
+    for (&addr, i) in &insns {
+        if let Insn::Bl { offset } = i {
+            let t = (addr as i64 + *offset) as u64;
+            if insns.contains_key(&t) {
+                entries.insert(t);
+            }
+        }
+    }
+    let pointer_entries = pointer_entries(&insns);
+    Site { insns, entries, pointer_entries }
+}
+
+/// Addresses that only a value reaches: built by `adrp` + `add`, inside the same instruction words.
+fn pointer_entries(insns: &BTreeMap<u64, Insn>) -> BTreeSet<u64> {
+    let mut out: BTreeSet<u64> = BTreeSet::new();
+    for (&addr, insn) in insns {
+        let Insn::AddSubImm { sf: _, sub: false, setflags: false, shift, imm: add, rn, rd } = *insn
+        else {
+            continue;
+        };
+        if rn != rd {
+            continue;
+        }
+        // The `adrp` that a following `add` completes need not be its immediate predecessor: the
+        // compiler interleaves several pairs.
+        let page = (1..=8u64).find_map(|k| match insns.get(&addr.checked_sub(4 * k)?) {
+            Some(Insn::Adrp { rd: base, imm }) if *base == rn => Some((addr - 4 * k, *imm)),
+            _ => None,
+        });
+        let Some((page_addr, page_imm)) = page else { continue };
+        let target = ((page_addr & !0xfff) as i64
+            + (page_imm << 12)
+            + ((add as i64) << (12 * shift))) as u64;
+        if insns.contains_key(&target) {
+            out.insert(target);
+        }
+    }
+    out
 }
 
 /// Everything a module needs before its region bodies: the types, the two host imports and the
@@ -7534,7 +7567,6 @@ pub struct PageOutput {
 /// The module has no memory and no dispatch table of its own: it imports the host's memory and
 /// exports its regions, which the host puts in the running image's table and then dispatches to.
 pub fn translate_page(
-    elf: &Elf,
     site: &Site,
     at: u64,
     cfg: &Config,

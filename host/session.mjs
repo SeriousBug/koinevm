@@ -341,10 +341,6 @@ export class Session {
             what: "execution of a page that is not executable",
           });
         }
-        if (!proc.kernel.space.imageOf(pc)) {
-          console.error(`armjit: pid ${proc.pid} jumped to untranslated address 0x${pc.toString(16)}`);
-          return 1;
-        }
         status = await proc.mach.translateAndResume(pc);
       }
     } catch (e) {

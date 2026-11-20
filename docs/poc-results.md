@@ -54,7 +54,9 @@ so a library the loader maps while it runs executes without being known in advan
   each. The host puts those functions in the running image's table, patches the dispatch table with
   the same open-addressing probe the translator uses, and resumes: `run(entry, sp, resume)` reloads
   the guest state the previous run stored in the shadow. Which pages run is only known while the guest
-  runs, so this is the only way a `libc.so.6` mapped by `ld.so` can be executed.
+  runs, so this is the only way a `libc.so.6` mapped by `ld.so` can be executed. A page the guest
+  wrote where no file is mapped asks with `-` in place of the image and carries the page's bytes:
+  that is code a program generated, and the bytes are all there is to translate from.
 - Syscall boundary shaped like a Linux ABI layer: number in x8, args in x0-x5, result or `-errno` in
   x0, unknown numbers answer `-ENOSYS` and say so once on stderr with `ARMJIT_SYSCALLS=1`. Memory:
   `brk`, `mmap` (anonymous and file-backed, `MAP_FIXED`), `munmap`, `mprotect`, `madvise` (the
@@ -275,11 +277,16 @@ Two things follow.
   a load from an unmapped one and a call into a page without execute all end the process with
   `SIGSEGV`, which `tests/faults.sh` compares against a real kernel. What is still missing is the
   handler: a synchronous fault cannot be caught yet, so a program with a `SIGSEGV` handler dies.
-- **Self-modifying code.** A `mprotect` that makes a page holding translated code writable drops that
-  page's translations, and the next run of it is translated from the bytes the guest holds rather
-  than from the file, which `tests/smc.sh` checks by patching a function and calling it. A guest JIT
-  is still out of reach: code on a page that is in no image has nothing to translate *from*, so
-  `mmap` + write + execute is refused rather than run.
+- **Self-modifying code, and code the guest generates.** A `mprotect` that makes a page holding
+  translated code writable drops that page's translations, and the next run of it is translated from
+  the bytes the guest holds rather than from the file, which `tests/smc.sh` checks by patching a
+  function and calling it. A page in no image is code the guest wrote itself: the host asks the
+  translator for it with the bytes the page holds, and the translator decodes them with no file,
+  symbols or unwind tables behind them, so the only function starts are the ones the page calls. A
+  branch or a call that leaves the page reaches the dispatcher, which translates the page it lands
+  in when the run gets there. `tests/jit.sh` covers a written page made executable, a second write
+  to a page that had already run, an RWX page, a branch across a page boundary, a call from
+  generated code into the translated image, and a syscall made from generated code.
 - **Signals.** A handler of the guest's own runs, with the frame, the mask and the restorer a kernel
   gives it, when a syscall is where the signal can be taken; a signal that arrives while the guest is
   in the middle of a computation waits for the next syscall. A fault is still fatal, so a `SIGSEGV`

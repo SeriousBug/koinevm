@@ -194,6 +194,17 @@ export class AddressSpace {
     this.images = this.images.filter((m) => m.hi <= lo || m.lo >= hi);
   }
 
+  /// Remember that a page holds translated code. A `mprotect` that makes such a page writable is a
+  /// guest about to put new code there, and the translation of the old code has to go first.
+  markTranslated(at) {
+    this.ptes[pageOf(at)] |= PTE.TRANSLATED;
+  }
+
+  /// Forget that a page holds translated code, for when it no longer does.
+  unmarkTranslated(at) {
+    this.ptes[pageOf(at)] &= ~PTE.TRANSLATED;
+  }
+
   /// Drop `[lo, hi)` from the free spans, keeping whatever lies outside it.
   subtract(lo, hi) {
     const out = [];

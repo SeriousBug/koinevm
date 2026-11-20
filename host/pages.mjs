@@ -75,7 +75,10 @@ export class Translator {
 
   page(image, base, at, bytes = null) {
     const tail = bytes ? ` ${bytes}` : "";
-    return this.ask(`page ${image} ${base.toString(16)} ${at.toString(16)}${tail}`);
+    // No image is a page the guest generated: the bytes it holds are the whole of what there is.
+    const from = image || "-";
+    const where = image ? base.toString(16) : "0";
+    return this.ask(`page ${from} ${where} ${at.toString(16)}${tail}`);
   }
 
   /// A whole image, which is what `execve` needs: the program, its loader, and the stack built for
@@ -202,6 +205,7 @@ export class Mach {
     // anywhere in it: the probe is what says whether that pc was a block start at all.
     for (let page = lo & ~0xfff; page < hi; page += 0x1000) {
       this.patched.add(page);
+      this.kernel.space.unmarkTranslated(page);
       for (let pc = page; pc < page + 0x1000; pc += 4) this.clearDispatch(pc);
     }
     for (const key of [...this.lineage.slotOf.keys()]) {
@@ -233,27 +237,30 @@ export class Mach {
   async translateAndResume(pc) {
     const T = [performance.now()];
     const image = this.kernel.space.imageOf(pc);
-    if (!image) throw new Error(`nothing to translate 0x${pc.toString(16)} from`);
+    const imageBase = image ? image.base : 0;
+    const host = image ? image.host : "-";
+    const where = (at) =>
+      `${image ? host.split("/").pop() : "generated code"}+0x${(at - imageBase).toString(16)}`;
 
-    const key = `${image.host}:${image.base}:${pc}`;
+    const key = `${host}:${imageBase}:${pc}`;
     T.push(performance.now());
     // A page the guest wrote to is translated from what it holds now: the file says what the loader
-    // put there, and a guest that patches its own code has moved past that.
+    // put there, and a guest that patches its own code has moved past that. A page with no file
+    // behind it is code the guest generated, so every translation of it comes from memory.
     const from = pc & ~0xfff;
-    const patched = this.patched.has(from);
+    const patched = !image || this.patched.has(from);
     let page = patched ? null : pageModules.get(key);
     if (!page) {
       const bytes = patched
-        ? Buffer.from(new Uint8Array(this.memory.buffer, from, 0x1000)).toString("hex")
+        ? Buffer.from(this.kernel.space.bytes(from, 0x1000)).toString("hex")
         : null;
-      const answer = await this.translator.page(image.host, image.base, pc, bytes);
+      const answer = await this.translator.page(image ? image.host : null, imageBase, pc, bytes);
       if (!answer.ok) throw new Error(`translating 0x${pc.toString(16)}: ${answer.error}`);
       let module;
       try {
         module = new WebAssembly.Module(Buffer.from(answer.wasm, "hex"));
       } catch (e) {
-        const where = `${image.host.split("/").pop()}+0x${(pc - image.base).toString(16)}`;
-        throw new Error(`the page at ${where} does not validate: ${e.message}`);
+        throw new Error(`the page at ${where(pc)} does not validate: ${e.message}`);
       }
       page = { module, regions: answer.regions, unsupported: answer.unsupported };
       if (!patched) pageModules.set(key, page);
@@ -262,19 +269,16 @@ export class Mach {
       // out and prints the refusals alone.
       if (page.unsupported.length && process.env.ARMJIT_LOG_GAPS && !process.env.ARMJIT_TRACE_PAGES) {
         for (const [at, word, why] of page.unsupported) {
-          const file = image.host.split("/").pop();
-          console.error(`gap at ${file}+0x${at.toString(16)} (${word}): ${why}`);
+          console.error(`gap at ${where(at)} (${word}): ${why}`);
         }
       }
       if (process.env.ARMJIT_TRACE_PAGES) {
-        const where = `${image.host.split("/").pop()}+0x${(pc - image.base).toString(16)}`;
         console.error(
-          `page ${where}: ${page.regions.length} regions, ${answer.wasm.length / 2} bytes wasm` +
+          `page ${where(pc)}: ${page.regions.length} regions, ${answer.wasm.length / 2} bytes wasm` +
             (page.unsupported.length ? `, ${page.unsupported.length} gaps` : ""),
         );
         for (const [at, word, why] of page.unsupported) {
-          const file = image.host.split("/").pop();
-          console.error(`  gap at ${file}+0x${at.toString(16)} (${word}): ${why}`);
+          console.error(`  gap at ${where(at)} (${word}): ${why}`);
         }
         if (process.env.ARMJIT_TRACE_REGIONS) {
           for (const region of page.regions) {
@@ -305,6 +309,9 @@ export class Mach {
       this.growTo(this.lineage.slots);
       this.instantiate(key, page, base);
     }
+    // The page holds translated code now, so a `mprotect` that makes it writable is a guest about
+    // to write new code there and the translation of what it held before has to go.
+    this.kernel.space.markTranslated(from);
 
     for (let i = 0; i < page.regions.length; i++) {
       const region = page.regions[i];
