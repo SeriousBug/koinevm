@@ -99,7 +99,29 @@ host. A program that sizes a buffer from the free memory has to hear a number a 
 asked for a quarter of a machine's memory, spilled every few lines into temporary files, and its
 names for them collided.
 
+## What a process has used
+
+`getrusage` for the process, a thread and the children, `times`, and the `rusage` a `wait4` caller
+asks for all answer from counters the session keeps per process: the time inside the guest's own
+translated code is `utime`, the time inside a syscall's own work is `stime`, and a thread's is the
+part charged while its registers were live. Time that belongs to neither - a page being translated,
+an image being compiled, a module being instantiated - is charged to no one, because a program that
+ran natively never paid for it; the guest sees the clock jump, the way it would on a machine that
+was suspended.
+
+That is what makes `time` answer: bash reads `RUSAGE_SELF` around its own work and subtracts a pair
+of `RUSAGE_CHILDREN` readings around a command, so a child's time is added to its parent when it is
+reaped, at that moment and not when the child exits, and a `fork` starts a child at zero. `times`
+reports the same nanoseconds in the `clock_t` ticks the ABI has fixed at 100 per second since
+`USER_HZ` stopped changing, so it moves in steps of 10 ms exactly as a real kernel's does, and a
+program that measures something shorter than that is told zero.
+
+The counters are read from the same clock `clock_gettime` answers with, so `user + sys` stays inside
+the `real` the guest measures for itself. A syscall that answers with a counter closes out the run it
+is in first: a program that measures itself inside its own loop would otherwise see nothing until it
+stopped measuring.
+
 ## What is not modelled
 
 Process groups and sessions (a `kill` with a negative pid reaches every process but the caller), job
-control, `ptrace`, and the rusage a `wait4` caller can ask for, which is zeroed.
+control, and `ptrace`.

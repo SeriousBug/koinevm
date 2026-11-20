@@ -46,10 +46,10 @@ so a library the loader maps while it runs executes without being known in advan
   allocator and the page table maintained in guest memory. Files: `openat`, `close`, `read`,
   `pread64`, `readv`, `preadv`, `write`, `writev`, `lseek`, `fstat`, `newfstatat`, `readlinkat`,
   `faccessat`, `getcwd`, `ioctl`, resolved inside a root filesystem directory. Waiting and counting:
-  `pipe2`, `eventfd`/`eventfd2`, `signalfd4`, `ppoll`, `epoll_*`, `futex`. Start-up:
-  `set_tid_address`, `set_robust_list`, `uname`, `clock_gettime`, `clock_getres`, `getrandom`,
-  `prlimit64`, `sched_getaffinity`, `getuid` family, `rt_sigaction`,
-  `rt_sigprocmask`, `madvise`, `membarrier`, `sched_yield`.
+  `pipe2`, `eventfd`/`eventfd2`, `signalfd4`, `ppoll`, `epoll_*`, `futex`, `getrusage`, `times`.
+  Start-up: `set_tid_address`, `set_robust_list`, `uname`, `clock_gettime`, `clock_getres`,
+  `getrandom`, `prlimit64`, `sched_getaffinity`, `getuid` family, `rt_sigaction`, `rt_sigprocmask`,
+  `madvise`, `membarrier`, `sched_yield`.
 
 ## Correctness
 
@@ -67,7 +67,7 @@ native macOS arm64 program (the oracle). Output and exit status compared byte fo
 | `bench` | 500M xorshift iterations plus an array sweep | exact checksum |
 
 80 oracle cases pass: eight guests at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, each with explicit address
-checks on and off. Thirty-three more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
+checks on and off. Thirty-five more assert the ABI itself: the loader handoff (`tests/dyn.sh`), the
 memory syscalls (`tests/mem.sh`), the file syscalls (`tests/files.sh`, which makes two names that
 differ only in case and checks they stay two files), the pages a guest may not touch
 (`tests/faults.sh`), the handler a caught signal runs (`tests/sighandler.sh`), a signal and another
@@ -75,9 +75,10 @@ process reaching a spinning guest (`tests/poll.sh`), a guest patching its own co
 the console an interactive shell reads (`tests/console.sh`), a pseudo-terminal a program makes for a
 child of its own (`tests/pty.sh`), a counted wakeup one process writes and another reads
 (`tests/eventfd.sh`), the bytes `/dev/random`, `/dev/urandom` and `getrandom` hand out
-(`tests/random.sh`), an editor on top of the whole stack (`tests/nvim.sh`), and the socket,
+(`tests/random.sh`), the CPU a process, a thread and its children have used (`tests/rusage.sh`), an
+editor on top of the whole stack (`tests/nvim.sh`), and the socket,
 epoll, signal and resolver paths, each in both address-check modes. `bash tests/run.sh` runs all
-113; `tests/nvim.sh` skips when the image has no `neovim` in it.
+115; `tests/nvim.sh` skips when the image has no `neovim` in it.
 
 The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
