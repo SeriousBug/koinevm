@@ -93,9 +93,7 @@ export class Usage {
   /// that starts and ends inside it charges nothing at all.
   suspend(body) {
     const at = this.now();
-    this.suspending++;
     const done = () => {
-      this.suspending--;
       this.suspended += this.now() - at;
     };
     let answer;
