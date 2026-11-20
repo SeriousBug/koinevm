@@ -448,7 +448,6 @@ fn run(args: &[String]) -> Result<(), String> {
                                     (emit::translate_page(site, at, &cfg)?, image)
                                 }
                             };
-                            let bias = image.bias;
                             let regions: Vec<String> = res
                                 .regions
                                 .iter()
@@ -458,8 +457,8 @@ fn run(args: &[String]) -> Result<(), String> {
                                     format!("{{\"entry\":{},\"blocks\":[{}]}}", r.entry, blocks.join(","))
                                 })
                                 .collect();
-                            // The host logs a gap against the file it is in, so the address is the
-                            // image's own: the load base means nothing outside this process.
+                            // A gap is an address in the address space, which is what the host has
+                            // in hand: naming the file and the offset into it is its job.
                             let gaps: Vec<String> = res
                                 .unsupported
                                 .iter()
@@ -468,7 +467,7 @@ fn run(args: &[String]) -> Result<(), String> {
                                         Some(b) => u32::from_le_bytes(b.try_into().unwrap()),
                                         None => 0,
                                     };
-                                    format!("[{},\"{word:08x}\",{}]", a - bias, json_str(why))
+                                    format!("[{a},\"{word:08x}\",{}]", json_str(why))
                                 })
                                 .collect();
                             Ok(format!(

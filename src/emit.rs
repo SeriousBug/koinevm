@@ -111,9 +111,13 @@ pub const PTE_PAGES: u64 = 1 << 20;
 /// table is twice the size of the largest image, and where the images go is the toolchain's to
 /// choose, so the two cannot share a corner of the map.
 pub const TABLE_BASE: u64 = 0x2000_0000;
-/// A dispatch slot is `[u32 payload][u32 tag]`: payload 0 is empty, else `block << 16 | region + 1`,
-/// tag is `pc >> 2` plus one so it is never zero.
+/// A dispatch slot is `[u32 payload][u32 tag]`: payload 0 is empty, else `region + 1` in the twenty
+/// bits above the block index, tag is `pc >> 2` plus one so it is never zero.
 pub const TABLE_SLOT: u64 = 8;
+/// Bits of the payload the block index takes, below the region. A region is emitted in pieces of at
+/// most 512 blocks, so twelve is eight times what one region can hold.
+pub const BLOCK_BITS: u32 = 12;
+pub const BLOCK_MASK: u32 = (1 << BLOCK_BITS) - 1;
 /// The smallest arena any image is given. The table is open-addressed, so it is two slots for every
 /// block the image holds and a power of two for the mask, and the host adds blocks later when it
 /// translates a page of a library the guest jumps into: the floor is what leaves room for those.
@@ -121,8 +125,9 @@ pub const TABLE_MIN_SLOTS: u64 = 1 << 21;
 /// The most the arena may grow to. `cc1` is 1373914 blocks, which is more than the floor holds; at
 /// four slots a block a gigabyte of code would still fit, and no image this machine runs is that.
 pub const TABLE_MAX_SLOTS: u64 = 1 << 23;
-/// Region slots in the wasm table: a dispatch word holds `slot + 1` in 16 bits.
-pub const TABLE_SLOTS_MAX: u32 = 0xffff;
+/// Regions in the wasm table: a dispatch word holds `slot + 1` in the twenty bits above the block.
+/// One million regions is twelve times what the largest library in the tree needs.
+pub const TABLE_SLOTS_MAX: u32 = (1 << (32 - BLOCK_BITS)) - 1;
 /// PoC simplification against a real kernel's randomized layout: images start at fixed addresses.
 /// The program at 4 MiB, its dynamic loader well above the heap, `mmap` in between.
 pub const IMAGE_BASE: u64 = 0x400000;
@@ -377,14 +382,24 @@ fn build_dispatch_table(regions: &[Region], failed: &[bool]) -> Result<(Vec<u8>,
     let mask = (slots - 1) as u32;
     let mut table = vec![0u8; (slots * TABLE_SLOT) as usize];
     for (region_idx, region) in regions.iter().enumerate() {
+        if region_idx + 1 > TABLE_SLOTS_MAX as usize {
+            return Err(format!(
+                "{} regions exceeds the {} a dispatch word holds",
+                regions.len(),
+                TABLE_SLOTS_MAX
+            ));
+        }
         let keep = if failed[region_idx] { 1 } else { region.blocks.len() };
+        if keep > BLOCK_MASK as usize {
+            return Err(format!("{keep} blocks in one region exceeds the {BLOCK_MASK} a dispatch word holds"));
+        }
         for (block_idx, block) in region.blocks.iter().enumerate().take(keep) {
             let key = (block.addr >> 2) as u32;
             let mut slot = (key & mask) as usize;
             loop {
                 let at = slot * TABLE_SLOT as usize;
                 if table[at] == 0 && table[at + 1] == 0 && table[at + 2] == 0 && table[at + 3] == 0 {
-                    let payload = ((region_idx as u32) + 1) | ((block_idx as u32) << 16);
+                    let payload = (((region_idx as u32) + 1) << BLOCK_BITS) | block_idx as u32;
                     table[at..at + 4].copy_from_slice(&payload.to_le_bytes());
                     table[at + 4..at + 8].copy_from_slice(&(key + 1).to_le_bytes());
                     break;
@@ -991,7 +1006,7 @@ pub fn translate(
         return Err(format!("entry point 0x{entry:x} did not decode"));
     }
 
-    if regions.len() > 0xfffe {
+    if regions.len() > TABLE_SLOTS_MAX as usize {
         return Err(format!("{} regions exceeds the dispatch table encoding", regions.len()));
     }
 
@@ -1866,8 +1881,8 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
         f.mem(I32_STORE, 2, 0);
     }
     // Dispatch: open addressing on `(pc >> 2) & mask`. A slot holds `[payload][tag]`, the payload
-    // being region + 1 in the low half and block index in the high half, and an empty slot reads
-    // zero. A pc that no block starts at leaves the slot zero, which reports an untranslated jump.
+    // being region + 1 above the block index, and an empty slot reads zero. A pc that no block
+    // starts at leaves the slot zero, which reports an untranslated jump.
     f.lg(PC);
     f.i32c(2);
     f.op(I32_SHR_U);
@@ -1939,14 +1954,14 @@ fn emit_run(ids: &Ids, layout: &Layout, ty: u32) -> Func {
     f.br(2);
     f.end();
 
-    // block index = word >> 16, region slot = (word & 0xffff) - 1
+    // block index = word & 0xfff, region slot = (word >> 12) - 1
     f.lg(IDX);
-    f.i32c(16);
-    f.op(I32_SHR_U);
+    f.i32c(BLOCK_MASK as i32);
+    f.op(I32_AND);
     f.ls(ENTRY); // entry block
     f.lg(IDX);
-    f.i32c(0xffff);
-    f.op(I32_AND);
+    f.i32c(BLOCK_BITS as i32);
+    f.op(I32_SHR_U);
     f.i32c(1);
     f.op(I32_SUB);
     f.ls(IDX); // table slot

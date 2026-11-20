@@ -18,6 +18,10 @@ const SHADOW_PC = 0x108;
 /// src/emit.rs.
 const ACCESS_HELPERS = 23;
 const TABLE_SLOT = 8;
+/// Bits of a dispatch word's payload the block index takes, and therefore the bits a region slot has
+/// above it: `BLOCK_BITS` in src/emit.rs.
+const BLOCK_BITS = 12;
+const SLOT_MAX = (1 << (32 - BLOCK_BITS)) - 1;
 
 /// The pages translated for one image generation, as modules: the same image at the same base
 /// always translates to the same bytes, and a fork or a second run must not pay for it again.
@@ -181,7 +185,7 @@ export class Mach {
   dispatch(pc, slot, block) {
     const { addr, tag, want } = this.probe(pc);
     if (tag === want) return; // another page already claimed this address
-    this.view.setUint32(addr, ((slot + 1) | (block << 16)) >>> 0, true);
+    this.view.setUint32(addr, (((slot + 1) << BLOCK_BITS) | block) >>> 0, true);
     this.view.setUint32(addr + 4, want, true);
     if (process.env.ARMJIT_DISPATCH_PC && pc === Number(process.env.ARMJIT_DISPATCH_PC)) {
       console.error(`dispatch 0x${pc.toString(16)} -> slot 0x${slot.toString(16)} block ${block}`);
@@ -295,9 +299,9 @@ export class Mach {
     let base = this.lineage.slotOf.get(key);
     if (base === undefined) {
       base = this.lineage.slots;
-      // The dispatch entry packs the region slot and the block index into 16 bits each, so a run
-      // that translates enough pages to need more than 65535 slots corrupts every later entry.
-      if (base + page.regions.length > 0xffff) {
+      // A dispatch word holds the region slot above the block index, so a run that needs more slots
+      // than those bits hold would corrupt every entry it writes.
+      if (base + page.regions.length > SLOT_MAX) {
         throw new Error(
           `region slots exhausted: ${base} in use, ${page.regions.length} more for 0x${pc.toString(16)}`,
         );
