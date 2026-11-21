@@ -53,14 +53,14 @@ rest of that family, so a filesystem that folds case would let one of each pair 
 
 What the walk does instead is keep the two apart by name. A name is looked up as the directory holds
 it spelled, which only a listing can say, and a name that another entry would answer to as well is
-stored under `.armjit.case.` and the hex of its bytes: `xt_connmark.h` becomes
-`.armjit.case.78745f636f6e6e6d61726b2e68`. The escape stays with the name, so once a file is created
+stored under `.koinevm.case.` and the hex of its bytes: `xt_connmark.h` becomes
+`.koinevm.case.78745f636f6e6e6d61726b2e68`. The escape stays with the name, so once a file is created
 that way it is found there by every later lookup, even after the entry that forced the escape is
 gone - `dpkg` writes its temporary under the target's own name and renames it after, by which time
 the sibling is usually not there any more. `readdir` decodes the escapes back, so the guest sees the
 names it created and never the hex.
 
 The host tree shows the escaped spelling for the second of a pair, and a guest name that begins with
-`.armjit.case.` followed by hex is read back as the hex means, so an escaped tree is not a tree to
+`.koinevm.case.` followed by hex is read back as the hex means, so an escaped tree is not a tree to
 edit from the host side and hand back. `apt-get install linux-libc-dev` unpacks its whole header set
 now, which is what `libc6-dev`, `g++` and every `-dev` package depend on.

@@ -5,7 +5,7 @@ Reads addresses on stdin, one per line (hex with or without 0x), and prints the 
 A guest address maps to a linked address by subtracting the base the translator placed the image at,
 so this needs the image and that base:
 
-    armjit gaps dash --rootfs=rootfs/debian | awk '{print $NF}' | cut -d= -f2 \\
+    koinevm gaps dash --rootfs=rootfs/debian | awk '{print $NF}' | cut -d= -f2 \\
         | python3 tools/whatis.py rootfs/debian/bin/dash:0x400000 \\
                                  rootfs/debian/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1:0x10000000
 """

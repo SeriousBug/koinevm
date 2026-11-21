@@ -37,7 +37,7 @@ export const AT_FDCWD = -100;
 /// in case: Debian's kernel headers hold both `xt_connmark.h` and `xt_CONNMARK.h`, and a volume that
 /// does not tell them apart would let one overwrite the other. The guest name is the hex of its
 /// bytes, which no name it can ask for collides with, and the walk decodes it back.
-const CASE_ESCAPE = ".armjit.case.";
+const CASE_ESCAPE = ".koinevm.case.";
 
 const DT = { file: 8, dir: 4, link: 10, fifo: 1, sock: 12, chr: 2, blk: 6 };
 
@@ -101,7 +101,7 @@ const O_CLOEXEC = 0x80000;
 /// guest's name for a file is not the host's, and a package manager that fails one file at a time
 /// says which of the two it meant.
 function tracePath(op, text, result) {
-  const want = process.env.ARMJIT_TRACE_PATHS;
+  const want = process.env.KOINEVM_TRACE_PATHS;
   if (!want || !text.includes(want)) return;
   console.error(`${op} ${text} -> ${result}`);
 }
@@ -522,7 +522,7 @@ export class Files {
 
   /// What the descriptor table did, for a run that has to explain a pipe that never closes.
   note(text, desc) {
-    if (!process.env.ARMJIT_TRACE_FDS) return;
+    if (!process.env.KOINEVM_TRACE_FDS) return;
     const ends = desc && desc.readers !== undefined ? ` r=${desc.readers} w=${desc.writers}` : "";
     console.error(`fds: ${this.pid}: ${text}${ends}`);
   }
@@ -1070,7 +1070,7 @@ export class Files {
       if (desc.readers === 0) return -EPIPE;
       desc.data = desc.data.length ? Buffer.concat([desc.data, data]) : Buffer.from(data);
       this.note(`write ${data.length} into pipe ${desc.id} (r=${desc.readers} w=${desc.writers})`, desc);
-      if (process.env.ARMJIT_TRACE_PIPES) {
+      if (process.env.KOINEVM_TRACE_PIPES) {
         const head = Buffer.from(data.subarray(0, 16)).toString("latin1");
         console.error(`  pipe ${desc.id}: +${data.length} bytes ${JSON.stringify(head)}`);
       }

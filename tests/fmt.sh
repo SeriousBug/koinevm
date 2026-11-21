@@ -24,12 +24,12 @@ done
 for g in $GUESTS; do
     for mode in $MODES; do
         wasm="$work/$g.$mode.wasm"
-        if ! ./target/release/armjit translate "tests/guest/${g}_dyn.elf" -o "$wasm" \
+        if ! ./target/release/koinevm translate "tests/guest/${g}_dyn.elf" -o "$wasm" \
                 --rootfs=$rootfs --bounds="$mode" --trace \
                 --argv=./tests/guest/${g}_dyn.elf > "$work/translate.log" 2>&1; then
             echo "FAIL $g bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
         fi
-        ARMJIT_ROOTFS=$rootfs timeout "${GUEST_TIMEOUT:-300}" node run.mjs "$wasm" > "$work/out" 2> "$work/err"
+        KOINEVM_ROOTFS=$rootfs timeout "${GUEST_TIMEOUT:-300}" node run.mjs "$wasm" > "$work/out" 2> "$work/err"
         code=$?
         if ! diff -q "tests/guest/$g.expected" "$work/out" > /dev/null; then
             echo "FAIL $g bounds=$mode, output:"

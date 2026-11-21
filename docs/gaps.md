@@ -11,9 +11,9 @@ register dump and the memory around it, rather than computing a wrong answer.
     bash tools/sweep-run.sh /bin/bash /tmp/load.sh   # what a run reaches
 
 `tools/sweep.sh` translates each of the tree's 913 ELFs as a whole and adds the refusals up by
-encoding and by reason. `ARMJIT_LOG_GAPS=1` makes a run log the refusals of the pages it translates,
-which is what `tools/sweep-run.sh` ranks. `armjit gaps <elf> [--tsv]` is one file, `armjit decode
-<word>` names a word, `armjit dump <elf>` lists an image's instructions as decoded.
+encoding and by reason. `KOINEVM_LOG_GAPS=1` makes a run log the refusals of the pages it translates,
+which is what `tools/sweep-run.sh` ranks. `koinevm gaps <elf> [--tsv]` is one file, `koinevm decode
+<word>` names a word, `koinevm dump <elf>` lists an image's instructions as decoded.
 
 A refusal is recorded at the word that raised it and its message does not repeat the address, so
 every row is a word, an address and a reason. Three faults in that reporting came out of the sweep

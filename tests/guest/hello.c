@@ -1,4 +1,4 @@
-/* Freestanding guest for the armjit PoC.
+/* Freestanding guest for the koinevm PoC.
  *
  * Built twice: as a static aarch64 Linux executable (the guest, translated to wasm) and as a
  * native macOS arm64 program (the oracle, run directly). Only the write/exit shim differs, so

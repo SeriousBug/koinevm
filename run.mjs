@@ -1,5 +1,5 @@
-// Host side of the armjit PoC: loads a translated module, provides the kernel the guest talks to,
-// runs it. ARMJIT_ROOTFS names the directory the guest sees as /.
+// Host side of the koinevm PoC: loads a translated module, provides the kernel the guest talks to,
+// runs it. KOINEVM_ROOTFS names the directory the guest sees as /.
 //
 // The Linux ABI contract lives in host/syscall.mjs. Everything here is the process boundary: read
 // the metadata the translator wrote next to the module, instantiate, run from the entry with the
@@ -109,16 +109,16 @@ function recentTail(n) {
   for (let k = 0; k < count; k++) out[k] = recent[(recentLen - count + k) & recentMask];
   return out;
 }
-// ARMJIT_TRACE_PRINT prints the state *before* each instruction, which is what the translator wrote
-// to the shadow: pc, packed NZCV and the registers named in ARMJIT_TRACE_REGS.
-const traceRegs = (process.env.ARMJIT_TRACE_REGS || "8").split(",").map(Number);
-// ARMJIT_WATCH_PC=0xADDR[:SKIP[:MAX]],... ARMJIT_WATCH_DUMP=0xADDR:LEN,... or xN+0xNN:LEN reads guest memory
+// KOINEVM_TRACE_PRINT prints the state *before* each instruction, which is what the translator wrote
+// to the shadow: pc, packed NZCV and the registers named in KOINEVM_TRACE_REGS.
+const traceRegs = (process.env.KOINEVM_TRACE_REGS || "8").split(",").map(Number);
+// KOINEVM_WATCH_PC=0xADDR[:SKIP[:MAX]],... KOINEVM_WATCH_DUMP=0xADDR:LEN,... or xN+0xNN:LEN reads guest memory
 // the time that instruction runs, once the first SKIP hits have gone by, MAX of them at most. Each hit
 // also reports the call chain the frame pointers describe, because the caller is what says which call
 // this is. An address is absolute, or `image+0xNN` for an offset inside the image whose path holds
 // `image`, which is how a shared object's own code gets named before the load address of the run is
 // known.
-const watches = (process.env.ARMJIT_WATCH_PC || "")
+const watches = (process.env.KOINEVM_WATCH_PC || "")
   .split(",")
   .filter(Boolean)
   .map((s) => {
@@ -138,10 +138,10 @@ function watchAddress(w) {
   for (const m of ranges) if (m.host.includes(w.image)) return (w.pc = m.base + w.at);
   return NaN;
 }
-const watchVecRegs = (process.env.ARMJIT_WATCH_VREGS || "0,1").split(",").filter(Boolean).map(Number);
+const watchVecRegs = (process.env.KOINEVM_WATCH_VREGS || "0,1").split(",").filter(Boolean).map(Number);
 // A dump address is absolute, `sp+0xNN`, or a register plus an offset, because the frame a value
 // lives in is only known once the run is there.
-const watchRanges = (process.env.ARMJIT_WATCH_DUMP || "")
+const watchRanges = (process.env.KOINEVM_WATCH_DUMP || "")
   .split(",")
   .filter(Boolean)
   .map((s) => {
@@ -158,9 +158,9 @@ function dumpAddress({ reg, at, off }) {
   if (reg === null) return at + off;
   return Number(view.getBigUint64((reg < 0 ? 0xf8 : reg * 8), true)) + off;
 }
-// ARMJIT_WATCH_MEM=0xADDR reports the instruction after which those eight bytes change, which is
+// KOINEVM_WATCH_MEM=0xADDR reports the instruction after which those eight bytes change, which is
 // the only way to find what wrote to a guest address.
-const watchMem = process.env.ARMJIT_WATCH_MEM ? parseInt(process.env.ARMJIT_WATCH_MEM, 16) : null;
+const watchMem = process.env.KOINEVM_WATCH_MEM ? parseInt(process.env.KOINEVM_WATCH_MEM, 16) : null;
 let watchedValue = null;
 function watchWrite(pc) {
   const bytes = kernel.read(watchMem, 8);
@@ -236,7 +236,7 @@ function cstr(at) {
   return printable ? JSON.stringify(text.toString("latin1")) : null;
 }
 
-const ARM_RING = Number(process.env.ARMJIT_LAST || 24);
+const ARM_RING = Number(process.env.KOINEVM_LAST || 24);
 // Where the time went in the last `n` instructions, which is how a loop this large shows itself.
 function hot(n) {
   const counts = new Map();
@@ -248,7 +248,7 @@ function hot(n) {
     .join(", ");
 }
 
-// The memory named by ARMJIT_WATCH_DUMP, for a report of any kind.
+// The memory named by KOINEVM_WATCH_DUMP, for a report of any kind.
 function memory_dump() {
   let out = "";
   for (const range of watchRanges) {
@@ -291,11 +291,11 @@ function report(pc) {
   console.error(`  ring ${ring(40).map(where).join(" -> ")}`);
   console.error(`  last ${recentTail(ARM_RING).map(where).join(" -> ")}`);
 }
-// ARMJIT_HEARTBEAT=SECONDS reports where the guest is every so often, and ARMJIT_SPIN=N where one
+// KOINEVM_HEARTBEAT=SECONDS reports where the guest is every so often, and KOINEVM_SPIN=N where one
 // instruction has run N times in the last few thousand. Both exist because the wasm call does not
 // return while a guest spins, so this hook is the only place the host sees it at all.
-const spin = process.env.ARMJIT_SPIN ? Number(process.env.ARMJIT_SPIN) : 0;
-const heartbeat = process.env.ARMJIT_HEARTBEAT ? Number(process.env.ARMJIT_HEARTBEAT) * 1000 : 0;
+const spin = process.env.KOINEVM_SPIN ? Number(process.env.KOINEVM_SPIN) : 0;
+const heartbeat = process.env.KOINEVM_HEARTBEAT ? Number(process.env.KOINEVM_HEARTBEAT) * 1000 : 0;
 const startedAt = Date.now();
 let beat = startedAt;
 let ticks = 0;
@@ -332,7 +332,7 @@ function trace2(pc, sp) {
     );
   }
   watch(at);
-  if (!process.env.ARMJIT_TRACE_PRINT) return;
+  if (!process.env.KOINEVM_TRACE_PRINT) return;
   const view = new DataView(memory.buffer);
   const regs = traceRegs.map((r) => `x${r}=0x${view.getBigUint64(r * 8, true).toString(16)}`);
   const nzcv = view.getBigUint64(0x100, true);
@@ -345,13 +345,13 @@ function makeImports(proc) {
   return {
     syscall: (nr, a0, a1, a2, a3, a4, a5) => {
       enter(proc);
-      if (process.env.ARMJIT_TRACE_WRITES && Number(nr) === 64) {
+      if (process.env.KOINEVM_TRACE_WRITES && Number(nr) === 64) {
         const bytes = kernel.read(a1, Number(a2));
         const hex = bytes ? Buffer.from(bytes).toString("hex") : "?";
         const text = bytes ? JSON.stringify(Buffer.from(bytes).toString("latin1")) : "";
         console.error(`write fd=${a0} n=${a2} ${hex} ${text}`);
       }
-      if (process.env.ARMJIT_TRACE_SYSCALLS) {
+      if (process.env.KOINEVM_TRACE_SYSCALLS) {
         const view = new DataView(memory.buffer);
         const pc = Number(view.getBigUint64(0xf8 + 16, true));
         const args = [a0, a1, a2, a3, a4, a5].map((v) => `0x${BigInt(v).toString(16)}`).join(" ");
@@ -392,8 +392,8 @@ function makeImports(proc) {
 
 const module = new WebAssembly.Module(bytes);
 
-const rootfs = process.env.ARMJIT_ROOTFS;
-const translator = new Translator(process.env.ARMJIT_TRANSLATOR || "./target/release/armjit");
+const rootfs = process.env.KOINEVM_ROOTFS;
+const translator = new Translator(process.env.KOINEVM_TRANSLATOR || "./target/release/koinevm");
 const configured = await translator.configure({
   bounds: meta.bounds === 1,
   trace: meta.trace === 1,
@@ -402,14 +402,14 @@ const configured = await translator.configure({
   rootfs,
 });
 if (!configured.ok) {
-  console.error(`armjit: translator did not start: ${configured.error}`);
+  console.error(`koinevm: translator did not start: ${configured.error}`);
   process.exit(1);
 }
 
 const session = new Session({ translator, rootfs, makeImports });
 const root = session.spawn({ module, meta });
 enter(root);
-if (process.env.ARMJIT_DUMP_STACK) {
+if (process.env.KOINEVM_DUMP_STACK) {
   const at = Number(BigInt(meta.sp));
   for (let i = 0; i < 16; i++) {
     const bytes = kernel.read(at + i * 8, 8);
@@ -421,7 +421,7 @@ if (process.env.ARMJIT_DUMP_STACK) {
 // The console: a guest that reads fd 0 waits on the host's own input, which node delivers while
 // the scheduler waits for something. Off by default, because a test that runs a program which reads
 // its input would otherwise wait for a line nobody is going to type.
-if (process.env.ARMJIT_CONSOLE) {
+if (process.env.KOINEVM_CONSOLE) {
   terminal.live = true;
   // The host's terminal is in raw mode for the whole session: this process is the one holding it, so
   // a cooked terminal would do the line discipline for a guest that asked to do it itself, and its
@@ -449,12 +449,12 @@ const code = await session.run();
 const elapsed = process.hrtime.bigint();
 translator.stop();
 if (code === 4) {
-  console.error(`watchdog: still running after ${process.env.ARMJIT_WATCHDOG}s`);
+  console.error(`watchdog: still running after ${process.env.KOINEVM_WATCHDOG}s`);
   console.error(`  last pcs: ${ring(32).map(where).join(" -> ")}`);
   console.error(state());
   process.exit(4);
 }
-if (process.env.ARMJIT_TIME) {
+if (process.env.KOINEVM_TIME) {
   console.error(`guest run ${Number(elapsed - started) / 1e6} ms`);
 }
 

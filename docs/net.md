@@ -105,7 +105,7 @@ same way here, because the question asked is the one the machine would ask, whic
 
 The policy is per nameserver, not per query. Any other address in the file is a real UDP flow, so a
 guest that points at its own server - a corporate resolver, a Pi-hole, `dig @8.8.8.8` - gets that
-server, and a rootfs that already names one keeps it. `ARMJIT_DNS=raw` leaves the file and the
+server, and a rootfs that already names one keeps it. `KOINEVM_DNS=raw` leaves the file and the
 servers alone entirely.
 
 `A` and `AAAA` answers are built from what the host's resolver says. Everything else - `PTR`, `TXT`,

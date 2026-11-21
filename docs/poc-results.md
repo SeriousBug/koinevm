@@ -51,7 +51,7 @@ so a library the loader maps while it runs executes without being known in advan
   crosses has that part of it free, and the only thing that a boundary breaks is an access that
   straddles it, which copies its bytes through the engine's scratch a byte at a time. The
   default is four chunks.
-- Translation on demand: `armjit page` reads `page <elf> <base> <address>` requests and answers with a
+- Translation on demand: `koinevm page` reads `page <elf> <base> <address>` requests and answers with a
   module that imports the host's memory and exports the regions it found, plus the block starts of
   each. The host puts those functions in the running image's table, patches the dispatch table with
   the same open-addressing probe the translator uses, and resumes: `run(entry, sp, resume)` reloads
@@ -60,7 +60,7 @@ so a library the loader maps while it runs executes without being known in advan
   wrote where no file is mapped asks with `-` in place of the image and carries the page's bytes:
   that is code a program generated, and the bytes are all there is to translate from.
 - Syscall boundary shaped like a Linux ABI layer: number in x8, args in x0-x5, result or `-errno` in
-  x0, unknown numbers answer `-ENOSYS` and say so once on stderr with `ARMJIT_SYSCALLS=1`. Memory:
+  x0, unknown numbers answer `-ENOSYS` and say so once on stderr with `KOINEVM_SYSCALLS=1`. Memory:
   `brk`, `mmap` (anonymous and file-backed, `MAP_FIXED`), `munmap`, `mprotect`, `madvise` (the
   advices that take a page back zero it, or read it from the file again), with a free-span allocator
   and the page table maintained in guest memory, and `sysinfo` answering the ranges a run can still
@@ -115,7 +115,7 @@ SHA-3 instructions of Keccak's round (`tests/sha3.sh`, which has no oracle becau
 modes. `bash tests/run.sh` runs all 116; `tests/nvim.sh` skips when the image has no `neovim` in
 it.
 
-The console is what makes the whole thing usable by hand: `ARMJIT_CONSOLE=1 tools/run-rootfs.sh
+The console is what makes the whole thing usable by hand: `KOINEVM_CONSOLE=1 tools/run-rootfs.sh
 /bin/bash -i` gives a prompt at the terminal it was started from. File descriptor 0 is the host's own
 input, so a read parks the thread and the bytes node delivers answer it; `isatty` is true and
 `tcgetattr`/`tcsetattr` carry the flags a Linux tty starts with. The host's terminal is in raw mode

@@ -58,7 +58,7 @@ for guest in net tcp; do
     if [ "$guest" = net ]; then port=$udp_port; else port=$tcp_port; fi
     for mode in $MODES; do
         wasm="$work/$guest.$mode.wasm"
-        if ! ./target/release/armjit translate "tests/guest/$guest.elf" -o "$wasm" --bounds="$mode" \
+        if ! ./target/release/koinevm translate "tests/guest/$guest.elf" -o "$wasm" --bounds="$mode" \
                 --argv="$guest","$port" > "$work/translate.log" 2>&1; then
             echo "FAIL $guest bounds=$mode, translate:"
             cat "$work/translate.log"

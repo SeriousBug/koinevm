@@ -11,7 +11,7 @@ trap 'rm -rf "$work"' EXIT
 fail=0
 for mode in $MODES; do
     wasm="$work/epoll.$mode.wasm"
-    if ! ./target/release/armjit translate tests/guest/epoll.elf -o "$wasm" --bounds="$mode" \
+    if ! ./target/release/koinevm translate tests/guest/epoll.elf -o "$wasm" --bounds="$mode" \
             > "$work/translate.log" 2>&1; then
         echo "FAIL epoll bounds=$mode, translate:"
         cat "$work/translate.log"

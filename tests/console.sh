@@ -1,7 +1,7 @@
 #!/bin/bash
 # The console: an interactive shell reading the host's own input.
 #
-# `ARMJIT_CONSOLE=1` is what makes fd 0 the host's input and `isatty(0)` true, so bash starts as an
+# `KOINEVM_CONSOLE=1` is what makes fd 0 the host's input and `isatty(0)` true, so bash starts as an
 # interactive shell: it prints its prompt, readline echoes what it reads and edits the line, and a
 # `read` builtin takes the next line the way it does at a terminal. `console.expected` is what this
 # guest session prints and not a native run, because what a native run prints depends on the
@@ -24,7 +24,7 @@ feed() {
 
 fail=0
 for mode in $MODES; do
-    if ! ./target/release/armjit translate rootfs/debian/bin/bash -o "$work/bash.$mode.wasm" \
+    if ! ./target/release/koinevm translate rootfs/debian/bin/bash -o "$work/bash.$mode.wasm" \
             --rootfs=rootfs/debian --argv="/bin/bash,-i" \
             --env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,HOME=/root" \
             --bounds="$mode" > "$work/translate.log" 2>&1; then
@@ -61,7 +61,7 @@ for mode in $MODES; do
         sleep 1
         feed 'echo "status:$?"'
         feed 'exit'
-    } | ARMJIT_ROOTFS=rootfs/debian ARMJIT_CONSOLE=1 timeout 120 node run.mjs "$work/bash.$mode.wasm" \
+    } | KOINEVM_ROOTFS=rootfs/debian KOINEVM_CONSOLE=1 timeout 120 node run.mjs "$work/bash.$mode.wasm" \
         > "$work/out" 2>&1
     code=$?
     if ! diff -q tests/guest/console.expected "$work/out" > /dev/null; then
@@ -84,12 +84,12 @@ done
 # nowhere to go if the console has no sink. `script(1)` is what gives the host a terminal of its own.
 if script -q /dev/null true > /dev/null 2>&1; then
     tty="$work/tty.wasm"
-    if ./target/release/armjit translate rootfs/debian/bin/bash -o "$tty" \
+    if ./target/release/koinevm translate rootfs/debian/bin/bash -o "$tty" \
             --rootfs=rootfs/debian --argv="/bin/bash,-i" \
             --env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,HOME=/root" \
             --bounds=check > "$work/tty-translate.log" 2>&1; then
         printf 'echo hi\nexit\n' |
-            script -q /dev/null env ARMJIT_ROOTFS=rootfs/debian ARMJIT_CONSOLE=1 \
+            script -q /dev/null env KOINEVM_ROOTFS=rootfs/debian KOINEVM_CONSOLE=1 \
                 timeout 120 node run.mjs "$tty" > "$work/tty.out" 2>&1
         ttycode=$?
         if ! grep -q '^hi' "$work/tty.out"; then

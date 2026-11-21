@@ -11,19 +11,19 @@ fn main() -> ExitCode {
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("armjit: {e}");
+            eprintln!("koinevm: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
 fn usage() -> String {
-    "usage: armjit translate <elf> -o <out.wasm> [--bounds=check|trust] [--mem-pages=N] [--trace]\n       \
+    "usage: koinevm translate <elf> -o <out.wasm> [--bounds=check|trust] [--mem-pages=N] [--trace]\n       \
      [--argv=a,b] [--env=k=v,...] [--rootfs=<dir>] [--interp=<elf>] [--interp-base=0xADDR]\n       \
-     armjit page      (a request per line on stdin, a module back on stdout)\n       \
-     armjit gaps <elf> [--rootfs=<dir>] [--tsv]\n       \
-     armjit decode <hex word>...\n       \
-     armjit dump <elf>".into()
+     koinevm page      (a request per line on stdin, a module back on stdout)\n       \
+     koinevm gaps <elf> [--rootfs=<dir>] [--tsv]\n       \
+     koinevm decode <hex word>...\n       \
+     koinevm dump <elf>".into()
 }
 
 /// The host path a guest's absolute path names, following the tree's own symbolic links the way its
@@ -647,7 +647,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "decode" => {
-            // What a word is, for the words a gap log names: `armjit decode 5e104020`.
+            // What a word is, for the words a gap log names: `koinevm decode 5e104020`.
             for hex in &args[1..] {
                 let w = u32::from_str_radix(hex.trim_start_matches("0x"), 16)
                     .map_err(|_| format!("bad word {hex}"))?;

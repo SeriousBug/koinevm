@@ -9,7 +9,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-rootfs=${ARMJIT_ROOTFS:-rootfs/debian}
+rootfs=${KOINEVM_ROOTFS:-rootfs/debian}
 deb=${DEB:-target/tmp/debs/hello_2.10-3_arm64.deb}
 
 if [ ! -f "$deb" ]; then
@@ -38,7 +38,7 @@ done
 
 fail=0
 
-ARMJIT_ROOTFS="$work/ours" timeout "${GUEST_TIMEOUT:-600}" \
+KOINEVM_ROOTFS="$work/ours" timeout "${GUEST_TIMEOUT:-600}" \
     bash tools/run-rootfs.sh /usr/bin/dpkg -i /tmp/pkg.deb > "$work/ours.out" 2>&1
 ours=$?
 timeout "${GUEST_TIMEOUT:-600}" docker run --rm -v "$work/native:/r" debian:bookworm \

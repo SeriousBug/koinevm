@@ -1089,7 +1089,7 @@ pub fn translate(
         pte_base: plan.pte_base,
     };
 
-    if std::env::var("ARMJIT_DUMP_REGIONS").is_ok() {
+    if std::env::var("KOINEVM_DUMP_REGIONS").is_ok() {
         for (i, r) in regions.iter().enumerate() {
             eprintln!("region {i} entry 0x{:x}", r.blocks[0].addr);
             for (bi, b) in r.blocks.iter().enumerate() {

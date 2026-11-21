@@ -18,7 +18,7 @@ if [ "${1:-}" = "--rank" ]; then
     status=0
 else
     log=${SWEEP_LOG:-target/tmp/gaps-run.log}
-    ARMJIT_LOG_GAPS=1 tools/run-rootfs.sh "$@" 2>"$log"
+    KOINEVM_LOG_GAPS=1 tools/run-rootfs.sh "$@" 2>"$log"
     status=$?
 fi
 

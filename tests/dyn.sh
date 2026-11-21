@@ -14,7 +14,7 @@ trap 'rm -rf "$work"' EXIT
 fail=0
 for mode in $MODES; do
     wasm="$work/hello_pie.$mode.wasm"
-    if ! ./target/release/armjit translate tests/guest/hello_pie.elf -o "$wasm" \
+    if ! ./target/release/koinevm translate tests/guest/hello_pie.elf -o "$wasm" \
             --interp=tests/guest/interp.elf --bounds="$mode" > "$work/translate.log" 2>&1; then
         echo "FAIL hello_pie bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi

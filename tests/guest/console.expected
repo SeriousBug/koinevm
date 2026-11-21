@@ -1,31 +1,31 @@
-root@armjit:/# echo one
+root@koinevm:/# echo one
 one
-root@armjit:/# read x
-root@armjit:/# echo "read:$x"
+root@koinevm:/# read x
+root@koinevm:/# echo "read:$x"
 read:hello there
-root@armjit:/# read -u 2 y; echo "e:$y"
+root@koinevm:/# read -u 2 y; echo "e:$y"
 e:stderr there
-root@armjit:/# [ -t 0 ] && echo console-0 || echo pipe-0
+root@koinevm:/# [ -t 0 ] && echo console-0 || echo pipe-0
 console-0
-root@armjit:/# [ -t 1 ] && echo console-1 || echo pipe-1
+root@koinevm:/# [ -t 1 ] && echo console-1 || echo pipe-1
 console-1
-root@armjit:/# printf x | { read -r y; [ -t 0 ] || echo not-a-tty; }
+root@koinevm:/# printf x | { read -r y; [ -t 0 ] || echo not-a-tty; }
 not-a-tty
-root@armjit:/# dd iflag=nonblock bs=1 count=1 2>&1 | head -1
+root@koinevm:/# dd iflag=nonblock bs=1 count=1 2>&1 | head -1
 dd: error reading 'standard input': Resource temporarily unavailable
-root@armjit:/# printf "%s\n" a b c | wc -l
+root@koinevm:/# printf "%s\n" a b c | wc -l
 3
-root@armjit:/# nosuchcommand 2>/dev/null || echo "status:$?"
+root@koinevm:/# nosuchcommand 2>/dev/null || echo "status:$?"
 status:127
-root@armjit:/# sleep 30
+root@koinevm:/# sleep 30
 
 
-root@armjit:/# echo "status:$?"
+root@koinevm:/# echo "status:$?"
 status:130
-root@armjit:/# dash -c 'trap "echo caught" INT; sleep 30'
+root@koinevm:/# dash -c 'trap "echo caught" INT; sleep 30'
 caught
 
-root@armjit:/# echo "status:$?"
+root@koinevm:/# echo "status:$?"
 status:130
-root@armjit:/# exit
+root@koinevm:/# exit
 exit

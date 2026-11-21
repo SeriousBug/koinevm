@@ -93,7 +93,7 @@ export class Translator {
   async image(path, argv, envp) {
     const hex = (bytes) => (bytes.length ? Buffer.from(bytes).toString("hex") : "-");
     const args = [...argv.map(hex), String(envp.length), ...envp.map(hex)].join(" ");
-    const out = join(tmpdir(), `armjit-image-${process.pid}-${(imageSerial += 1)}.wasm`);
+    const out = join(tmpdir(), `koinevm-image-${process.pid}-${(imageSerial += 1)}.wasm`);
     const answer = await this.ask(`image ${path} ${out} ${argv.length} ${args}`);
     if (!answer.ok) return answer;
     try {
@@ -207,7 +207,7 @@ export class Mach {
     if (tag === BigInt(want)) return; // another page already claimed this address
     this.view.setUint32(addr, (((slot + 1) << BLOCK_BITS) | block) >>> 0, true);
     this.view.setBigUint64(addr + 8, BigInt(want), true);
-    if (process.env.ARMJIT_DISPATCH_PC && pc === Number(process.env.ARMJIT_DISPATCH_PC)) {
+    if (process.env.KOINEVM_DISPATCH_PC && pc === Number(process.env.KOINEVM_DISPATCH_PC)) {
       console.error(`dispatch 0x${pc.toString(16)} -> slot 0x${slot.toString(16)} block ${block}`);
     }
   }
@@ -348,14 +348,14 @@ export class Mach {
       page = { module, regions: answer.regions, unsupported: answer.unsupported };
       if (!patched) pageModules.set(key, page);
       // A refusal costs an instruction, so a guest that meets one traps there and the run stops.
-      // What the log is for is knowing which are met at all: `ARMJIT_LOG_GAPS=1` leaves the pages
+      // What the log is for is knowing which are met at all: `KOINEVM_LOG_GAPS=1` leaves the pages
       // out and prints the refusals alone.
-      if (page.unsupported.length && process.env.ARMJIT_LOG_GAPS && !process.env.ARMJIT_TRACE_PAGES) {
+      if (page.unsupported.length && process.env.KOINEVM_LOG_GAPS && !process.env.KOINEVM_TRACE_PAGES) {
         for (const [at, word, why] of page.unsupported) {
           console.error(`gap at ${where(at)} (${word}): ${why}`);
         }
       }
-      if (process.env.ARMJIT_TRACE_PAGES) {
+      if (process.env.KOINEVM_TRACE_PAGES) {
         console.error(
           `page ${where(pc)}: ${page.regions.length} regions, ${answer.wasm.length / 2} bytes wasm` +
             (page.unsupported.length ? `, ${page.unsupported.length} gaps` : ""),
@@ -363,7 +363,7 @@ export class Mach {
         for (const [at, word, why] of page.unsupported) {
           console.error(`  gap at ${where(at)} (${word}): ${why}`);
         }
-        if (process.env.ARMJIT_TRACE_REGIONS) {
+        if (process.env.KOINEVM_TRACE_REGIONS) {
           for (const region of page.regions) {
             const blocks = region.blocks.map((b) => b.toString(16)).join(" ");
             console.error(`  region 0x${region.entry.toString(16)}: ${blocks}`);
@@ -408,7 +408,7 @@ export class Mach {
     }
     const out = this.kernel.usage.run(() => this.instance.exports.run(0n, 0n, 1));
     T.push(performance.now());
-    if (process.env.ARMJIT_TRACE_PAGES)
+    if (process.env.KOINEVM_TRACE_PAGES)
       console.error(`  phases ${T.slice(1).map((t, i) => (t - T[i]).toFixed(1)).join(" ")} status ${out}`);
     return out;
   }

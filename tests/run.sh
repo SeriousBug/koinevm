@@ -43,7 +43,7 @@ for opt in $OPTS; do
         for mode in $MODES; do
             label="$g $opt bounds=$mode"
             wasm="$work/$g.$opt.$mode.wasm"
-            if ! ./target/release/armjit translate "$elf" -o "$wasm" --bounds="$mode" \
+            if ! ./target/release/koinevm translate "$elf" -o "$wasm" --bounds="$mode" \
                     > "$work/translate.log" 2>&1; then
                 report_fail "$label" "translate:" $(cat "$work/translate.log")
                 continue

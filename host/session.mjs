@@ -64,8 +64,8 @@ export class Session {
     this.nextPid = 1;
     this.root = null;
     /// The host's name service, behind the address the guest's own resolver file names.
-    /// `ARMJIT_DNS=raw` leaves the guest's file and the guest's servers alone.
-    this.resolver = process.env.ARMJIT_DNS === "raw" ? null : new Resolver();
+    /// `KOINEVM_DNS=raw` leaves the guest's file and the guest's servers alone.
+    this.resolver = process.env.KOINEVM_DNS === "raw" ? null : new Resolver();
     /// The sockets of the session, shared by every process in it: a fork's descriptors point at
     /// the same descriptions, and the host object behind one is the one the fork shares too.
     this.net = new Net({ wake: () => this.poll(), resolver: this.resolver });
@@ -219,7 +219,7 @@ export class Session {
 
   /// Run until the process that started the session exits.
   async run() {
-    const after = process.env.ARMJIT_WATCHDOG ? Number(process.env.ARMJIT_WATCHDOG) * 1000 : 0;
+    const after = process.env.KOINEVM_WATCHDOG ? Number(process.env.KOINEVM_WATCHDOG) * 1000 : 0;
     const startedAt = Date.now();
     for (;;) {
       if (this.root.state === "exited") return this.root.signal ? 128 + this.root.signal : this.root.code;
@@ -299,7 +299,7 @@ export class Session {
   async step(proc, thread) {
     this.switchTo(proc, thread);
     proc.usage.thread = thread.usage;
-    if (process.env.ARMJIT_TRACE_STEPS) {
+    if (process.env.KOINEVM_TRACE_STEPS) {
       const v = new DataView(proc.memory.buffer);
       console.error(
         `step: ${proc.pid}/${thread.tid} entry=${thread.entry} pc=0x${v.getBigUint64(SHADOW_PC, true).toString(16)}` +
@@ -360,7 +360,7 @@ export class Session {
     }
     if (status === 1) return this.charged(proc, () => this.serve(proc, thread));
     if (status === 0) return this.exitedBySyscall(proc, thread, proc.kernel.exited ?? 0);
-    console.error(`armjit: pid ${proc.pid} stopped with status ${status}`);
+    console.error(`koinevm: pid ${proc.pid} stopped with status ${status}`);
     return 1;
   }
 
@@ -391,7 +391,7 @@ export class Session {
     kernel.pending = null;
     if (kernel.exited !== null) return this.exitedBySyscall(proc, thread, kernel.exited);
     if (!request) {
-      console.error(`armjit: pid ${proc.pid} returned from a syscall with no request`);
+      console.error(`koinevm: pid ${proc.pid} returned from a syscall with no request`);
       return 1;
     }
     return this.answer(proc, thread, request);
@@ -452,7 +452,7 @@ export class Session {
       case "sigreturn":
         return this.sigreturn(proc, thread, request);
       default:
-        console.error(`armjit: pid ${proc.pid} asked for an unknown host action ${request.kind}`);
+        console.error(`koinevm: pid ${proc.pid} asked for an unknown host action ${request.kind}`);
         return 1;
     }
   }
@@ -461,7 +461,7 @@ export class Session {
   /// made it, and the process ends the way a kernel ends one whose page fault it cannot answer:
   /// with the signal, which is what its parent's wait status reports.
   faulted(proc, thread, fault) {
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       const img = proc.kernel.space.imageOf(fault.at);
       const where = img
         ? `${img.host.split("/").pop()}+0x${(fault.at - img.base).toString(16)}`
@@ -562,7 +562,7 @@ export class Session {
     view.setBigUint64(0x108, BigInt(handler), true);
     const bit = 1n << BigInt(entry.sig - 1);
     kernel.sigblock = BigInt.asUintN(64, kernel.sigblock | BigInt.asUintN(64, act.mask) | bit);
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       console.error(`signal: ${proc.pid} runs the handler for ${entry.sig} at 0x${handler.toString(16)}`);
     }
     return true;
@@ -717,7 +717,7 @@ export class Session {
   /// because a syscall ends the block it is in.
   resume(proc, thread, value) {
     const view = new DataView(proc.memory.buffer);
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       console.error(
         `resume: ${proc.pid} x0=${value} at 0x${view.getBigUint64(SHADOW_RESUME, true).toString(16)}`,
       );
@@ -765,19 +765,19 @@ export class Session {
       parent.kernel.put32(request.ptid, child.pid);
     }
     this.processes.push(child);
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       console.error(
         `fork: ${parent.pid} -> ${child.pid} at 0x${from.getBigUint64(SHADOW_RESUME, true).toString(16)}` +
           ` sp=0x${from.getBigUint64(0xf8, true).toString(16)}`,
       );
     }
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       console.error(`fork: ${parent.pid} keeps ${this.describeFds(parent)}`);
     }
     const verdict = this.resume(parent, parentThread, child.pid);
     // vfork suspends the parent until the child execs or exits, and the child runs on the stack the
     // parent is using, so it must not get a turn while it is still inside the fork.
-    if (request.flags & CLONE_VFORK && !process.env.ARMJIT_NO_WAIT_VFORK) this.block(parentThread, child.pid);
+    if (request.flags & CLONE_VFORK && !process.env.KOINEVM_NO_WAIT_VFORK) this.block(parentThread, child.pid);
     return verdict;
   }
 
@@ -807,7 +807,7 @@ export class Session {
     proc.threads.push(child);
     if (request.flags & CLONE_PARENT_SETTID && request.ptid) proc.kernel.put32(request.ptid, tid);
     if (request.flags & CLONE_CHILD_SETTID && request.ctid) proc.kernel.put32(request.ctid, tid);
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       const view = new DataView(proc.memory.buffer);
       const at = (a) => (a ? view.getUint32(a, true) : "none");
       console.error(
@@ -1059,7 +1059,7 @@ export class Session {
         if (!st.isFile()) return this.resume(proc, thread, -EACCES);
         fs.accessSync(at, fs.constants.X_OK);
       } catch (e) {
-        if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${program}: ${e.code}`);
+        if (process.env.KOINEVM_TRACE_PROCESSES) console.error(`exec ${program}: ${e.code}`);
         return this.resume(proc, thread, -(e.code === "ENOENT" ? ENOENT : EACCES));
       }
       const script = this.shebang(at);
@@ -1082,12 +1082,12 @@ export class Session {
       try {
         return await this.translator.image(host, argv, request.envp);
       } catch (e) {
-        if (process.env.ARMJIT_TRACE_PROCESSES) console.error(`exec ${program}: ${e.message}`);
+        if (process.env.KOINEVM_TRACE_PROCESSES) console.error(`exec ${program}: ${e.message}`);
         return { ok: false, error: e.message };
       }
     });
     if (!answer.ok) {
-      console.error(`armjit: cannot run ${program}: ${answer.error}`);
+      console.error(`koinevm: cannot run ${program}: ${answer.error}`);
       return this.resume(proc, thread, -ENOEXEC);
     }
     const meta = answer.meta;
@@ -1124,7 +1124,7 @@ export class Session {
     thread.state = "runnable";
     thread.regs.fill(0);
     thread.vecs.fill(0);
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       console.error(`exec: ${proc.pid} ${argv.map((a) => a.toString()).join(" ")} at 0x${meta.entry.toString(16)}`);
       for (const [fd, entry] of [...files.map].sort((a, b) => a[0] - b[0])) {
         const what = entry.kind === "pipe" ? `pipe ${entry.desc.id} ${entry.end}` : entry.host ?? entry.kind;
@@ -1158,7 +1158,7 @@ export class Session {
     thread.state = "blocked";
     thread.blockedOn = on;
     thread.waitingFor = waitingFor;
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       const what = this.reason(thread);
       console.error(`block: thread ${thread.tid} waits for ${what}`);
     }
@@ -1244,7 +1244,7 @@ export class Session {
       thread.state = "runnable";
       woken++;
     }
-    if (woken && process.env.ARMJIT_TRACE_PROCESSES) {
+    if (woken && process.env.KOINEVM_TRACE_PROCESSES) {
       console.error(`futex wake 0x${addr.toString(16)}: ${woken} thread(s)`);
     }
     return woken;
@@ -1269,7 +1269,7 @@ export class Session {
         break;
       }
     }
-    if ((woken || moved) && process.env.ARMJIT_TRACE_PROCESSES) {
+    if ((woken || moved) && process.env.KOINEVM_TRACE_PROCESSES) {
       console.error(`futex requeue 0x${addr.toString(16)} -> 0x${addr2.toString(16)}: ${woken} woken, ${moved} moved`);
     }
     return woken + moved;
@@ -1296,7 +1296,7 @@ export class Session {
     parent.usage.childUser += child.usage.user + child.usage.childUser;
     parent.usage.childSys += child.usage.sys + child.usage.childSys;
     child.reaped = true;
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       const view = new DataView(parent.memory.buffer);
       console.error(
         `reap: ${child.pid} code ${child.code}, status word at 0x${request.wstatus.toString(16)}` +
@@ -1321,7 +1321,7 @@ export class Session {
       proc.kernel.put32(thread.clearTid, 0);
       this.futexWake(proc, thread.clearTid, -1);
     }
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       console.error(
         `exit: thread ${thread.tid} of ${proc.pid} status ${thread.code} clearTid=0x${thread.clearTid.toString(16)}`,
       );
@@ -1339,7 +1339,7 @@ export class Session {
     proc.signal = signal & 0x7f;
     for (const t of proc.threads) t.state = "exited";
     proc.kernel.files.closeAll();
-    if (process.env.ARMJIT_TRACE_PROCESSES) {
+    if (process.env.KOINEVM_TRACE_PROCESSES) {
       console.error(`exit: ${proc.pid} ${proc.signal ? `signal ${proc.signal}` : `status ${proc.code}`}`);
     }
     // The parent hears about the child that ended. Without this a program that never calls `wait4`
@@ -1365,7 +1365,7 @@ export class Session {
     const blocked = this.processes.flatMap((p) =>
       p.threads.filter((t) => t.state === "blocked").map((t) => ({ p, t })),
     );
-    console.error(`armjit: nothing left to run but ${blocked.length} blocked thread(s)`);
+    console.error(`koinevm: nothing left to run but ${blocked.length} blocked thread(s)`);
     for (const { p, t } of blocked) {
       console.error(`  pid ${p.pid} thread ${t.tid} waits for ${this.reason(t)}`);
     }

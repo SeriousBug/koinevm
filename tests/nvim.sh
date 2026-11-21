@@ -22,13 +22,13 @@ fi
 fail=0
 for mode in $MODES; do
     wasm="$work/nvim.$mode.wasm"
-    if ! ./target/release/armjit translate rootfs/debian/usr/bin/nvim -o "$wasm" \
+    if ! ./target/release/koinevm translate rootfs/debian/usr/bin/nvim -o "$wasm" \
             --rootfs=rootfs/debian --argv="/usr/bin/nvim,--headless,-i,NONE,--version" \
             --env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,HOME=/root" \
             --bounds="$mode" > "$work/translate.log" 2>&1; then
         echo "FAIL nvim bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi
-    ARMJIT_ROOTFS=rootfs/debian timeout 300 node run.mjs "$wasm" > "$work/version" 2>&1
+    KOINEVM_ROOTFS=rootfs/debian timeout 300 node run.mjs "$wasm" > "$work/version" 2>&1
     code=$?
     if ! grep -q "^NVIM v" "$work/version"; then
         echo "FAIL nvim bounds=$mode: no version line"; head -10 "$work/version"; fail=1; continue
@@ -39,14 +39,14 @@ for mode in $MODES; do
 
     # The same binary, writing a file it had to open, fill and close, and then exiting on its own.
     rm -f "$out"
-    if ! ./target/release/armjit translate rootfs/debian/usr/bin/nvim -o "$work/write.$mode.wasm" \
+    if ! ./target/release/koinevm translate rootfs/debian/usr/bin/nvim -o "$work/write.$mode.wasm" \
             --rootfs=rootfs/debian \
             --argv="/usr/bin/nvim,--headless,-i,NONE,-c,put ='nvim wrote this',-c,write /tmp/nvim-check.txt,-c,quit" \
             --env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,HOME=/root" \
             --bounds="$mode" > "$work/translate.log" 2>&1; then
         echo "FAIL nvim bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi
-    ARMJIT_ROOTFS=rootfs/debian timeout 300 node run.mjs "$work/write.$mode.wasm" > "$work/write" 2>&1
+    KOINEVM_ROOTFS=rootfs/debian timeout 300 node run.mjs "$work/write.$mode.wasm" > "$work/write" 2>&1
     code=$?
     want="nvim wrote this"
     got=$(head -1 "$out" 2>/dev/null)

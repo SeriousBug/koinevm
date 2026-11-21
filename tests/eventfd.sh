@@ -12,7 +12,7 @@ trap 'rm -rf "$work"' EXIT
 fail=0
 for mode in $MODES; do
     wasm="$work/eventfd.$mode.wasm"
-    if ! ./target/release/armjit translate tests/guest/eventfd.elf -o "$wasm" --bounds="$mode" \
+    if ! ./target/release/koinevm translate tests/guest/eventfd.elf -o "$wasm" --bounds="$mode" \
             > "$work/translate.log" 2>&1; then
         echo "FAIL eventfd bounds=$mode, translate:"
         cat "$work/translate.log"

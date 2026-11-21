@@ -260,7 +260,7 @@ static long stat_field(const char *s, long n, int want) {
 int main(void) {
     long n = slurp("/proc/version");
     check(n > 0 && starts_with(buf, "Linux version "), "/proc/version says Linux", n);
-    check(n > 0 && contains(buf, n, "6.1.0-armjit"), "/proc/version has the release", n);
+    check(n > 0 && contains(buf, n, "6.1.0-koinevm"), "/proc/version has the release", n);
 
     n = slurp("/proc/cpuinfo");
     check(n > 0 && lines_with(buf, n, "processor") == 1, "/proc/cpuinfo lists one processor", n);

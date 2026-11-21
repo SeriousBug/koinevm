@@ -32,12 +32,12 @@ while IFS= read -r script; do
 
     for mode in $MODES; do
         wasm="$work/dash.$mode.wasm"
-        if ! ./target/release/armjit translate "$dash" -o "$wasm" --rootfs="$rootfs" \
+        if ! ./target/release/koinevm translate "$dash" -o "$wasm" --rootfs="$rootfs" \
                 --bounds="$mode" --argv=/bin/dash,-c,"$script" > "$work/translate.log" 2>&1; then
             echo "FAIL [$script] bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
         fi
 
-        ARMJIT_ROOTFS=$rootfs node run.mjs "$wasm" > "$work/out" 2> "$work/err" &
+        KOINEVM_ROOTFS=$rootfs node run.mjs "$wasm" > "$work/out" 2> "$work/err" &
         pid=$!
         {
             sleep "$LIMIT"

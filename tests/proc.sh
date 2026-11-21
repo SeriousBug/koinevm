@@ -16,7 +16,7 @@ trap 'rm -rf "$work"' EXIT
 fail=0
 for mode in $MODES; do
     # The name the process is given is the name `/proc/self/stat` shows, so a run names it.
-    if ! ./target/release/armjit translate tests/guest/proc.elf -o "$work/proc.$mode.wasm" \
+    if ! ./target/release/koinevm translate tests/guest/proc.elf -o "$work/proc.$mode.wasm" \
             --bounds="$mode" --argv=proc > "$work/translate.log" 2>&1; then
         echo "FAIL proc bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi

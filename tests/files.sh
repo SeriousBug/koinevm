@@ -16,11 +16,11 @@ ln -s data.txt "$root/link"
 
 fail=0
 for mode in $MODES; do
-    if ! ./target/release/armjit translate tests/guest/files.elf -o "$work/files.$mode.wasm" \
+    if ! ./target/release/koinevm translate tests/guest/files.elf -o "$work/files.$mode.wasm" \
             --bounds="$mode" > "$work/translate.log" 2>&1; then
         echo "FAIL files bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi
-    ARMJIT_ROOTFS="$root" node run.mjs "$work/files.$mode.wasm" > "$work/out" 2> "$work/err"
+    KOINEVM_ROOTFS="$root" node run.mjs "$work/files.$mode.wasm" > "$work/out" 2> "$work/err"
     code=$?
     if grep -q '^FAIL' "$work/out"; then
         echo "FAIL files bounds=$mode:"; grep '^FAIL' "$work/out"; cat "$work/err"; fail=1; continue

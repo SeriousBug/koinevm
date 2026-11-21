@@ -33,14 +33,14 @@ fi
 
 for mode in $MODES; do
     wasm="$work/dns.$mode.wasm"
-    if ! ./target/release/armjit translate tests/guest/dns.elf -o "$wasm" --bounds="$mode" \
+    if ! ./target/release/koinevm translate tests/guest/dns.elf -o "$wasm" --bounds="$mode" \
             > "$work/translate.log" 2>&1; then
         echo "FAIL dns bounds=$mode, translate:"
         cat "$work/translate.log"
         fail=1
         continue
     fi
-    ARMJIT_ROOTFS="$root" timeout 120 node run.mjs "$wasm" > "$work/out" 2> "$work/err"
+    KOINEVM_ROOTFS="$root" timeout 120 node run.mjs "$wasm" > "$work/out" 2> "$work/err"
     code=$?
     if grep -q '^FAIL' "$work/out"; then
         echo "FAIL dns bounds=$mode:"

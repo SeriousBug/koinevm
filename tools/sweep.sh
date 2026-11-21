@@ -12,12 +12,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-armjit=target/release/armjit
+koinevm=target/release/koinevm
 root=rootfs/debian
 ROOTS=${ROOTS:-"bin sbin usr/bin usr/sbin lib usr/lib"}
 JOBS=${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}
 
-[ -x "$armjit" ] || { echo "build $armjit first" >&2; exit 1; }
+[ -x "$koinevm" ] || { echo "build $koinevm first" >&2; exit 1; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -38,7 +38,7 @@ echo "sweeping $total ELF files with $JOBS jobs" >&2
 one() {
     local guest=$1 out err
     err=$(mktemp)
-    if ! out=$("$armjit" gaps "$root/$1" --rootfs="$root" --tsv 2>"$err"); then
+    if ! out=$("$koinevm" gaps "$root/$1" --rootfs="$root" --tsv 2>"$err"); then
         printf '%s\t-\t0\t0\t%s\t-\n' "$guest" "$(head -1 "$err")"
         rm -f "$err"
         return 0
@@ -52,7 +52,7 @@ one() {
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$guest" "$word" "$n" "$at" "$why" "$decoded"
     done <<<"$out"
 }
-export armjit root
+export koinevm root
 export -f one
 
 xargs -P "$JOBS" -I{} bash -c 'one "$@"' _ {} <"$work/list" >"$work/rows"

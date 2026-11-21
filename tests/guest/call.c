@@ -1,4 +1,4 @@
-/* Freestanding guest for the armjit PoC: calls, recursion, a function pointer, division.
+/* Freestanding guest for the koinevm PoC: calls, recursion, a function pointer, division.
  *
  * Built twice from the same source: as a static aarch64 Linux executable (translated to wasm) and
  * as a native macOS arm64 program (the oracle). Only the write/exit shim differs. */

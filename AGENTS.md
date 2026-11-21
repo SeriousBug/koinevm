@@ -1,4 +1,4 @@
-# armjit
+# KoineVM
 
 This is a project to build an arm64/aarch64 to wasm JIT compiler plus a host environment providing Linux 
 to run it in.

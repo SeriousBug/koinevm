@@ -209,7 +209,7 @@ export function errnoOf(error) {
 }
 
 function trace(text) {
-  if (process.env.ARMJIT_TRACE_SOCKETS) console.error(`sockets: ${text}`);
+  if (process.env.KOINEVM_TRACE_SOCKETS) console.error(`sockets: ${text}`);
 }
 
 /// The sockets of one session: a fork shares this, because a socket description is shared between

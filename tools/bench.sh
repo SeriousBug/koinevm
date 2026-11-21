@@ -32,9 +32,9 @@ EOF
 
 run_wasm() {
     local mode=$1 pages=$2
-    ./target/release/armjit translate "$work/bench.elf" -o "$work/bench.$mode.wasm" \
+    ./target/release/koinevm translate "$work/bench.elf" -o "$work/bench.$mode.wasm" \
         --bounds="$mode" --mem-pages="$pages" > /dev/null
-    ARMJIT_TIME=1 node run.mjs "$work/bench.$mode.wasm" 2>&1 > /dev/null \
+    KOINEVM_TIME=1 node run.mjs "$work/bench.$mode.wasm" 2>&1 > /dev/null \
         | sed -n 's/^guest run \(.*\) ms$/\1/p' | head -1
 }
 

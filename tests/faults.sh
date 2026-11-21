@@ -15,7 +15,7 @@ trap 'rm -rf "$work"' EXIT
 
 fail=0
 for mode in $MODES; do
-    if ! ./target/release/armjit translate tests/guest/faults.elf -o "$work/faults.$mode.wasm" \
+    if ! ./target/release/koinevm translate tests/guest/faults.elf -o "$work/faults.$mode.wasm" \
             --bounds="$mode" > "$work/translate.log" 2>&1; then
         echo "FAIL faults bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi

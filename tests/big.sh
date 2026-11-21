@@ -15,7 +15,7 @@ trap 'rm -rf "$work"' EXIT
 
 fail=0
 for mode in $MODES; do
-    if ! ./target/release/armjit translate tests/guest/big.elf -o "$work/big.$mode.wasm" \
+    if ! ./target/release/koinevm translate tests/guest/big.elf -o "$work/big.$mode.wasm" \
             --bounds="$mode" --mem-pages="$PAGES" > "$work/translate.log" 2>&1; then
         echo "FAIL big bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi

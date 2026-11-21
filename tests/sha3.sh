@@ -13,7 +13,7 @@ trap 'rm -rf "$work"' EXIT
 
 fail=0
 for mode in $MODES; do
-    if ! ./target/release/armjit translate tests/guest/sha3.elf -o "$work/sha3.$mode.wasm" \
+    if ! ./target/release/koinevm translate tests/guest/sha3.elf -o "$work/sha3.$mode.wasm" \
             --bounds="$mode" > "$work/translate.log" 2>&1; then
         echo "FAIL sha3 bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi

@@ -9,8 +9,8 @@ const PAGE = 4096;
 const STACK_BYTES = 8 * 1024 * 1024;
 /// The release and the other words of `uname`, which a program is entitled to find in the same
 /// spelling in both places.
-const SYSNODE = "armjit";
-const RELEASE = "6.1.0-armjit";
+const SYSNODE = "koinevm";
+const RELEASE = "6.1.0-koinevm";
 const VERSION = "#1";
 /// The features the guest is told about in `AT_HWCAP`, as `/proc/cpuinfo` lists them.
 const FEATURES = "fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp";
@@ -238,7 +238,7 @@ function cpuinfo() {
     "CPU part\t: 0x000",
     "CPU revision\t: 0",
     "",
-    "model name\t: aarch64 (armjit)",
+    "model name\t: aarch64 (koinevm)",
     "",
   ].join("\n");
 }
@@ -317,7 +317,7 @@ const MACHINE = {
   "/proc/stat": statCPU,
   "/proc/meminfo": meminfo,
   "/proc/uptime": () => `${process.uptime().toFixed(2)} ${Math.round(process.uptime() * 100)}.00\n`,
-  "/proc/version": () => `Linux version ${RELEASE} (armjit@localhost) (gcc (Debian 12.2.0-14) 12.2.0) ${VERSION} SMP\n`,
+  "/proc/version": () => `Linux version ${RELEASE} (koinevm@localhost) (gcc (Debian 12.2.0-14) 12.2.0) ${VERSION} SMP\n`,
   "/proc/loadavg": (kernel) => `0.00 0.00 0.00 ${threads()}/${threads()} ${kernel.pid}\n`,
   "/proc/sys/kernel/ostype": () => "Linux\n",
   "/proc/sys/kernel/osrelease": () => `${RELEASE}\n`,

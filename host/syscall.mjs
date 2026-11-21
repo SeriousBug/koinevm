@@ -311,7 +311,7 @@ export class Kernel {
   }
 
   call(nr, a0, a1, a2, a3, a4, a5) {
-    if (process.env.ARMJIT_TRACE_SYSCALLS) {
+    if (process.env.KOINEVM_TRACE_SYSCALLS) {
       // An argument that points at a printable string is shown as one, because a path is what
       // makes a trace of a program like `dpkg` readable.
       const args = [a0, a1, a2, a3, a4, a5]
@@ -328,14 +328,14 @@ export class Kernel {
       const n = Number(nr);
       if (!this.missing.has(n)) {
         this.missing.add(n);
-        if (process.env.ARMJIT_SYSCALLS) console.error(`unimplemented syscall ${n}`);
+        if (process.env.KOINEVM_SYSCALLS) console.error(`unimplemented syscall ${n}`);
       }
       return this.fail(ENOSYS);
     }
     const answer = fn(this, a0, a1, a2, a3, a4, a5);
     if (!Array.isArray(answer)) return answer;
     // A read or a write would drown the trace, and its answer is the count it already reported.
-    if (process.env.ARMJIT_TRACE_SYSCALLS && Number(nr) !== 63 && Number(nr) !== 64) {
+    if (process.env.KOINEVM_TRACE_SYSCALLS && Number(nr) !== 63 && Number(nr) !== 64) {
       console.error(`  -> ${BigInt.asIntN(64, answer[0])}`);
     }
     return answer;
@@ -376,7 +376,7 @@ export class Kernel {
         flags: Number(flags),
         contents,
       });
-      if (process.env.ARMJIT_TRACE_SYSCALLS)
+      if (process.env.KOINEVM_TRACE_SYSCALLS)
         console.error(
           `  mmap at=0x${BigInt(at).toString(16)} len=0x${Number(len).toString(16)} prot=${Number(prot)} ` +
             `flags=0x${Number(flags).toString(16)} fd=${Number(fd)} off=0x${Number(off).toString(16)} ` +
@@ -554,7 +554,7 @@ export class Kernel {
 
   registerFiles() {
     this.on(56, (k, dirfd, path, flags, mode) => {
-      if (process.env.ARMJIT_TRACE_SYSCALLS) console.error(`  openat ${k.str(path)}`);
+      if (process.env.KOINEVM_TRACE_SYSCALLS) console.error(`  openat ${k.str(path)}`);
       const fd = k.files.open(k.str(path), Number(flags), Number(mode), Number(dirfd));
       return [BigInt(fd), 0];
     });
@@ -683,10 +683,10 @@ export class Kernel {
         return k.done(k.recvInto(Number(fd), k.addr(buf), Number(count), 0, 0, 0));
       }
       const n = Math.min(Number(count), 0x7ffff000);
-      if (process.env.ARMJIT_TRACE_SYSCALLS)
+      if (process.env.KOINEVM_TRACE_SYSCALLS)
         console.error(`  read fd=${Number(fd)} at 0x${BigInt.asUintN(64, buf).toString(16)} n=${n}`);
       const { ask, answer } = k.readInto(Number(fd), [{ at: k.addr(buf), len: n }]);
-      if (process.env.ARMJIT_TRACE_SYSCALLS) console.error(`  read fd=${Number(fd)} n=${n} -> ${answer}`);
+      if (process.env.KOINEVM_TRACE_SYSCALLS) console.error(`  read fd=${Number(fd)} n=${n} -> ${answer}`);
       return ask ? k.ask(ask) : k.done(answer);
     });
 
@@ -763,11 +763,11 @@ export class Kernel {
         const len = Number(k.u64(entry + 8));
         const bytes = k.read(at, len);
         if (bytes === null) {
-          if (process.env.ARMJIT_TRACE_SYSCALLS)
+          if (process.env.KOINEVM_TRACE_SYSCALLS)
             console.error(`  writev fd=${Number(fd)} iov[${i}] at=0x${at.toString(16)} len=${len} unreachable`);
           return k.fail(EFAULT);
         }
-        if (process.env.ARMJIT_TRACE_SYSCALLS)
+        if (process.env.KOINEVM_TRACE_SYSCALLS)
           console.error(`  writev fd=${Number(fd)} ${JSON.stringify(Buffer.from(bytes).toString("latin1"))}`);
         const wrote = writeBytes(k, Number(fd), Buffer.from(bytes));
         if (typeof wrote === "number" && wrote < 0) return [BigInt(wrote), 0];
@@ -892,7 +892,7 @@ export class Kernel {
       const cloexec = (Number(flags) & 0x80000) !== 0;
       const [read, write] = k.files.pipe(cloexec);
       const ok = k.put32(fds, read) && k.put32(k.addr(fds) + 4, write);
-      if (process.env.ARMJIT_TRACE_SYSCALLS) console.error(`  pipe2 fds=${read},${write} ok=${ok}`);
+      if (process.env.KOINEVM_TRACE_SYSCALLS) console.error(`  pipe2 fds=${read},${write} ok=${ok}`);
       if (!ok) return k.fail(EFAULT);
       return [0n, 0];
     });
@@ -1722,7 +1722,7 @@ export class Kernel {
       const timeout = k.timespecMs(tmo);
       if (timeout === null) return k.fail(EINVAL);
       const ready = k.pollOnce(at, n);
-      if (process.env.ARMJIT_TRACE_SOCKETS) {
+      if (process.env.KOINEVM_TRACE_SOCKETS) {
         console.error(`sockets: poll n=${n} timeout=${timeout} ready=${ready}`);
       }
       if (ready > 0) return [BigInt(ready), 0];
@@ -1930,8 +1930,8 @@ export class Kernel {
       };
       const uts = Buffer.concat([
         field("Linux"),
-        field("armjit"),
-        field("6.1.0-armjit"),
+        field("koinevm"),
+        field("6.1.0-koinevm"),
         field("#1"),
         field("aarch64"),
         field("(none)"),
@@ -2234,7 +2234,7 @@ export class Kernel {
 export { EFAULT, ENOMEM, EINVAL };
 
 function trace(text) {
-  if (process.env.ARMJIT_TRACE_SOCKETS) console.error(`sockets: ${text}`);
+  if (process.env.KOINEVM_TRACE_SOCKETS) console.error(`sockets: ${text}`);
 }
 
 /// A guest `char *const argv[]`: every string up to the null terminator.

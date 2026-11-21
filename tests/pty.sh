@@ -22,13 +22,13 @@ script -q -c "/usr/bin/stty size" /dev/null'
 
 fail=0
 for mode in $MODES; do
-    if ! ./target/release/armjit translate rootfs/debian/bin/bash -o "$work/bash.$mode.wasm" \
+    if ! ./target/release/koinevm translate rootfs/debian/bin/bash -o "$work/bash.$mode.wasm" \
             --rootfs=rootfs/debian --argv="/bin/bash,-c,$events" \
             --env="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin,HOME=/root" \
             --bounds="$mode" > "$work/translate.log" 2>&1; then
         echo "FAIL pty bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi
-    ARMJIT_ROOTFS=rootfs/debian timeout 120 node run.mjs "$work/bash.$mode.wasm" \
+    KOINEVM_ROOTFS=rootfs/debian timeout 120 node run.mjs "$work/bash.$mode.wasm" \
         > "$work/out" 2>&1
     code=$?
     if ! diff -q tests/guest/pty.expected "$work/out" > /dev/null; then

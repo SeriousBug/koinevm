@@ -20,11 +20,11 @@ mkdir -p "$root/dev/shm"
 
 fail=0
 for mode in $MODES; do
-    if ! ./target/release/armjit translate tests/guest/dev.elf -o "$work/dev.$mode.wasm" \
+    if ! ./target/release/koinevm translate tests/guest/dev.elf -o "$work/dev.$mode.wasm" \
             --bounds="$mode" > "$work/translate.log" 2>&1; then
         echo "FAIL dev bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi
-    ARMJIT_ROOTFS="$root" timeout 120 node run.mjs "$work/dev.$mode.wasm" > "$work/out" 2> "$work/err"
+    KOINEVM_ROOTFS="$root" timeout 120 node run.mjs "$work/dev.$mode.wasm" > "$work/out" 2> "$work/err"
     code=$?
     if grep -q '^FAIL' "$work/out"; then
         echo "FAIL dev bounds=$mode:"; grep '^FAIL' "$work/out"; cat "$work/err"; fail=1; continue
