@@ -32,10 +32,10 @@ shift
 argv=$prog
 for a in "$@"; do argv="$argv,$a"; done
 
-# How much address space the guest is given, in 64 KiB pages: a property of the run, because the
-# module declares its memories and the page table that covers them.
-pages=${KOINEVM_MEM_PAGES:-}
-key=$(printf '%s_' "$prog" "$@" "$env" "$pages" | tr -c 'A-Za-z0-9_.-' '_')${KOINEVM_TRACE:+_trace}${KOINEVM_TRACE_LOOPS:+_loops}
+# How much address space the guest is given, in bytes with an optional unit like `8GiB`: a property
+# of the run, because the module declares its memories and the page table that covers them.
+limit=${KOINEVM_MEM_LIMIT:-}
+key=$(printf '%s_' "$prog" "$@" "$env" "$limit" | tr -c 'A-Za-z0-9_.-' '_')${KOINEVM_TRACE:+_trace}${KOINEVM_TRACE_LOOPS:+_loops}
 wasm="target/tmp/rootfs_$key.wasm"
 mkdir -p target/tmp
 
@@ -53,7 +53,7 @@ fi
 if [[ ! -f $wasm || -n ${KOINEVM_RETRANSLATE:-} ]]; then
     if ! ./target/release/koinevm translate "$rootfs$prog" -o "$wasm" --rootfs="$rootfs" \
             --argv="$argv" --env="$env" ${KOINEVM_TRACE:+--trace} ${KOINEVM_TRACE_LOOPS:+--trace-loops} \
-            ${pages:+--mem-pages=$pages} \
+            ${limit:+--mem-limit=$limit} \
             > "target/tmp/rootfs_$key.log" 2>&1; then
         echo "translate failed:" >&2
         tail -20 "target/tmp/rootfs_$key.log" >&2

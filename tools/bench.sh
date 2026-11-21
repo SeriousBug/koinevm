@@ -31,18 +31,21 @@ EOF
 }
 
 run_wasm() {
-    local mode=$1 pages=$2
+    local mode=$1 mem=$2
     ./target/release/koinevm translate "$work/bench.elf" -o "$work/bench.$mode.wasm" \
-        --bounds="$mode" --mem-pages="$pages" > /dev/null
+        --bounds="$mode" --mem-limit="$mem" > /dev/null
     KOINEVM_TIME=1 node run.mjs "$work/bench.$mode.wasm" 2>&1 > /dev/null \
         | sed -n 's/^guest run \(.*\) ms$/\1/p' | head -1
 }
 
 native=$(run_native)
 echo "native arm64: ${native} ms"
-for spec in "trust 65535" "check 65535" "check 16384"; do
+# 4 GiB less a page is one wasm memory, and the address space every access below the boundary uses;
+# 1 GiB is the same code with less to reserve.
+for spec in "trust 4294901760" "check 4294901760" "check 1073741824"; do
     set -- $spec
     ms=$(run_wasm "$1" "$2")
     ratio=$(python3 -c "print(f'{$ms / $native:.2f}')")
-    echo "wasm bounds=$1 mem=$(( $2 / 16 )) MiB: ${ms} ms (${ratio}x)"
+    mib=$(python3 -c "print(f'{$2 / 1048576:g}')")
+    echo "wasm bounds=$1 mem=${mib} MiB: ${ms} ms (${ratio}x)"
 done

@@ -18,7 +18,7 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> String {
-    "usage: koinevm translate <elf> -o <out.wasm> [--bounds=check|trust] [--mem-pages=N] [--trace]\n       \
+    "usage: koinevm translate <elf> -o <out.wasm> [--bounds=check|trust] [--mem-limit=<size>] [--trace]\n       \
      [--argv=a,b] [--env=k=v,...] [--rootfs=<dir>] [--interp=<elf>] [--interp-base=0xADDR]\n       \
      koinevm page      (a request per line on stdin, a module back on stdout)\n       \
      koinevm gaps <elf> [--rootfs=<dir>] [--tsv]\n       \
@@ -226,6 +226,41 @@ fn place(
     Ok(Placed { interp_entry: interp.as_ref().map(|i| i.entry), output: res, meta })
 }
 
+/// A wasm page, which is the unit the address space is a count of.
+const PAGE_BYTES: u64 = 1 << 16;
+
+/// A memory limit: bytes, with an optional unit as `4GB` or `8GiB` writes it. A module declares its
+/// memories in 64 KiB pages, so a limit that is not a whole number of them rounds up to the page
+/// above, and all of the bytes asked for are addressable.
+fn mem_pages_of(text: &str) -> Result<u32, String> {
+    let bad = || {
+        format!(
+            "bad memory limit {text}: want bytes with an optional B, KB, KiB, MB, MiB, GB, GiB, TB or TiB"
+        )
+    };
+    let end = text.find(|c: char| !c.is_ascii_digit()).unwrap_or(text.len());
+    let (n, unit) = text.split_at(end);
+    let n: u128 = n.parse().map_err(|_| bad())?;
+    let scale: u128 = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1000,
+        "kib" => 1 << 10,
+        "mb" => 1000 * 1000,
+        "mib" => 1 << 20,
+        "gb" => 1000 * 1000 * 1000,
+        "gib" => 1 << 30,
+        "tb" => 1000 * 1000 * 1000 * 1000,
+        "tib" => 1 << 40,
+        _ => return Err(bad()),
+    };
+    let bytes = n.checked_mul(scale).ok_or_else(bad)?;
+    let pages = bytes.div_ceil(PAGE_BYTES as u128);
+    if pages == 0 {
+        return Err(format!("memory limit {text} is no page at all"));
+    }
+    u32::try_from(pages).map_err(|_| format!("memory limit {text} is {pages} pages"))
+}
+
 /// Hex to bytes, for the arguments an image is translated with.
 fn unhex(text: &str) -> Result<Vec<u8>, String> {
     if text == "-" {
@@ -272,8 +307,8 @@ fn run(args: &[String]) -> Result<(), String> {
                 if a == "-o" {
                     out = Some(args.get(i + 1).ok_or("missing path after -o")?.clone());
                     i += 2;
-                } else if let Some(v) = a.strip_prefix("--mem-pages=") {
-                    mem_pages = v.parse().map_err(|_| format!("bad page count {v}"))?;
+                } else if let Some(v) = a.strip_prefix("--mem-limit=") {
+                    mem_pages = mem_pages_of(v)?;
                     i += 1;
                 } else if a == "--trace" {
                     trace = true;

@@ -9,14 +9,14 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 MODES=${MODES:-"check trust"}
-PAGES=${PAGES:-262144}
+LIMIT=${LIMIT:-16GiB}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 fail=0
 for mode in $MODES; do
     if ! ./target/release/koinevm translate tests/guest/big.elf -o "$work/big.$mode.wasm" \
-            --bounds="$mode" --mem-pages="$PAGES" > "$work/translate.log" 2>&1; then
+            --bounds="$mode" --mem-limit="$LIMIT" > "$work/translate.log" 2>&1; then
         echo "FAIL big bounds=$mode, translate:"; cat "$work/translate.log"; fail=1; continue
     fi
     node run.mjs "$work/big.$mode.wasm" > "$work/out" 2> "$work/err"
