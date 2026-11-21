@@ -685,8 +685,15 @@ export class Session {
       if (how !== "default") {
         proc.kernel.queueSignal(sig, { code: SI_USER, pid: from, uid: 0 });
         // A thread parked on a syscall has to wake up to see the signal, and the call it was in
-        // answers EINTR: that is the whole point of a handler.
-        const parked = thread ?? proc.threads.find((t) => t.state !== "exited");
+        // answers EINTR: that is the whole point of a handler. Only a thread that may take it is
+        // woken, because a mask is the thread's: one that blocked the signal is no more the one a
+        // kernel would interrupt than a thread that is not there.
+        const bit = 1n << BigInt(sig - 1);
+        // The thread that is in the instance has its mask in the kernel; the ones that gave the CPU
+        // back had theirs saved away with their registers.
+        const mask = (t) => (t === proc.current ? proc.kernel.sigblock : t.sigblock);
+        const parked =
+          thread ?? proc.threads.find((t) => t.state === "blocked" && (mask(t) & bit) === 0n);
         if (parked && parked.state === "blocked") {
           parked.state = "runnable";
           parked.blockedOn = 0;
