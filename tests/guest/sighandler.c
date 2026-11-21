@@ -112,6 +112,52 @@ static unsigned long current_mask(void) {
 /// The bit of a signal in a `sigset_t`.
 static unsigned long bit_of(long sig) { return 1ul << (sig - 1); }
 
+#define SIG_SETMASK 2
+
+#define CLONE_VM 0x00000100
+#define CLONE_FS 0x00000200
+#define CLONE_FILES 0x00000400
+#define CLONE_SIGHAND 0x00000800
+#define CLONE_THREAD 0x00010000
+#define CLONE_SYSVSEM 0x00040000
+
+/// A second thread of this process, started on a stack of its own at `fn`. The child comes back
+/// from the `svc` with zero in x0 and the one that made the call with the new thread's id, so the
+/// branch after it is what tells the two apart.
+static long clone_thread(void (*fn)(void)) {
+    static unsigned char stack[16384] __attribute__((aligned(16)));
+    register long x8 __asm__("x8") = 220;
+    register long x0 __asm__("x0") =
+        CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
+    register long x1 __asm__("x1") = (long)(stack + sizeof stack);
+    register long x2 __asm__("x2") = 0;
+    register long x3 __asm__("x3") = 0;
+    register long x4 __asm__("x4") = 0;
+    register long x9 __asm__("x9") = (long)fn;
+    __asm__ volatile("svc #0\n\tcbnz x0, 1f\n\tblr x9\n1:"
+                     : "+r"(x0)
+                     : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x9)
+                     : "memory");
+    return x0;
+}
+
+static volatile unsigned long child_mask;
+static volatile int child_done;
+
+static void blocks_everything(void) {
+    unsigned long all = ~0ul;
+    sigprocmask_(SIG_SETMASK, &all, 0);
+    child_mask = current_mask();
+    child_done = 1;
+    guest_exit(0);
+}
+
+/// The guest gives the CPU back at a poll, so spinning here is how one thread waits for another.
+static void join_child(void) {
+    while (!child_done) {
+    }
+}
+
 void run(unsigned long *sp) {
     (void)sp;
     struct sigaction act;
@@ -162,6 +208,18 @@ void run(unsigned long *sp) {
     check(ran == 1, "the three-argument handler ran");
     check(got_signo == SIGUSR2, "with the signal number");
     check(got_from == getpid_(), "and the sender it came from");
+
+    // A mask belongs to the thread that set it, which is what `pthread_sigmask` is for. A library
+    // blocks every signal around a `clone` and unblocks in the thread that made the call, so a
+    // thread that blocks them all for itself must not leave the process deaf to them.
+    unsigned long mine = current_mask();
+    check(clone_thread(blocks_everything) > 0, "a second thread is started");
+    join_child();
+    check((child_mask & bit_of(SIGUSR1)) != 0, "which has the signal blocked for itself");
+    check(current_mask() == mine, "and this thread's mask is as it was");
+    ran = 0;
+    check(kill_(getpid_(), SIGUSR1) == 0, "the signal still reaches this thread");
+    check(ran == 1, "and the handler runs");
 
     put(failures ? "sighandler: FAILURES\n" : "sighandler: all checks passed\n");
     guest_exit(failures ? 1 : 0);

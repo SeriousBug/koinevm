@@ -191,8 +191,9 @@ export class Kernel {
     /// Signal dispositions this process installed: `ignore`, or the handler, flags, restorer and
     /// mask a guest asked for. A signal with no entry takes its default action.
     this.signals = new Map();
-    /// `rt_sigprocmask`'s mask, as many bits as there are signals. A signal that is blocked waits
-    /// rather than being dropped.
+    /// `rt_sigprocmask`'s mask as the running thread holds it, as many bits as there are signals: a
+    /// signal that is blocked waits rather than being dropped. The mask belongs to the thread, and
+    /// the session saves it away with the thread's registers when another thread takes the CPU.
     this.sigblock = 0n;
     /// Signals raised and not yet handed over. One entry per signal: everything below the realtime
     /// range coalesces, which is what a kernel does and what a program assumes.

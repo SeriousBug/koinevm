@@ -17,4 +17,9 @@ ok   a signal reaches it
 ok   the three-argument handler ran
 ok   with the signal number
 ok   and the sender it came from
+ok   a second thread is started
+ok   which has the signal blocked for itself
+ok   and this thread's mask is as it was
+ok   the signal still reaches this thread
+ok   and the handler runs
 sighandler: all checks passed

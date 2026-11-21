@@ -111,25 +111,31 @@ export class Session {
       pending: null,
       regs: new Uint8Array(THREAD_STATE),
       vecs: new Uint8Array(16 * NVEC),
+      /// The signals this thread has blocked. A mask belongs to a thread rather than a process -
+      /// that is what `pthread_sigmask` is for - and a library that blocks them all around a `clone`
+      /// would otherwise leave every other thread of the process deaf to them.
+      sigblock: 0n,
       /// A thread's own CPU time, which `RUSAGE_THREAD` asks for. The process's is the sum, since
       /// only one thread runs at a time here.
       usage: { user: 0n, sys: 0n },
     };
   }
 
-  /// The registers of the thread that is in the wasm instance are the control block's, so a thread
-  /// switch is a copy of them out and the next one's in. A resumed run reads all of it back, which
-  /// is the same path a page translation resumes through.
+  /// The registers of the thread that is in the wasm instance are the control block's, and its
+  /// signal mask is the kernel's, so a thread switch is a copy of them out and the next one's in. A
+  /// resumed run reads all of it back, which is the same path a page translation resumes through.
   saveThread(proc, t) {
     const bytes = new Uint8Array(proc.memory.buffer);
     t.regs.set(bytes.subarray(0, THREAD_STATE));
     t.vecs.set(bytes.subarray(SHADOW_V0, SHADOW_V0 + 16 * NVEC));
+    t.sigblock = proc.kernel.sigblock;
   }
 
   loadThread(proc, t) {
     const bytes = new Uint8Array(proc.memory.buffer);
     bytes.set(t.regs, 0);
     bytes.set(t.vecs, SHADOW_V0);
+    proc.kernel.sigblock = t.sigblock;
   }
 
   /// Make `t` the thread whose registers the instance holds, saving the one that had them. The
@@ -744,6 +750,7 @@ export class Session {
     view.setBigInt64(SHADOW, 0n, true);
     view.setBigUint64(SHADOW_PC, view.getBigUint64(SHADOW_RESUME, true), true);
     childThread.regs.set(new Uint8Array(child.memory.buffer).subarray(0, THREAD_STATE));
+    childThread.sigblock = child.kernel.sigblock;
     if (request.flags & CLONE_CHILD_SETTID && request.ctid) {
       child.kernel.put32(request.ctid, child.pid);
     }
@@ -782,6 +789,7 @@ export class Session {
     this.saveThread(proc, thread);
     child.regs.set(thread.regs);
     child.vecs.set(thread.vecs);
+    child.sigblock = thread.sigblock;
     // The new thread starts on the stack `clone` was given, at the instruction after the svc, with
     // zero as its answer: that is what the function `pthread_create` hands to it reads.
     const regs = new DataView(child.regs.buffer);
@@ -1084,6 +1092,9 @@ export class Session {
     const ids = proc.kernel.ids;
     // A caught signal is back to its default after an exec, and an ignored one stays ignored.
     const ignored = new Map([...proc.kernel.signals].filter(([, how]) => how === "ignore"));
+    // The mask a thread blocked is the thread's, so the image that replaces the program does not
+    // unblock it.
+    const sigblock = proc.kernel.sigblock;
     proc.usage.suspend(() => {
       proc.module = new WebAssembly.Module(answer.wasm);
       proc.meta = meta;
@@ -1092,6 +1103,8 @@ export class Session {
     this.seedRandom(proc);
     proc.kernel.ids = ids;
     proc.kernel.signals = ignored;
+    proc.kernel.sigblock = sigblock;
+    thread.sigblock = sigblock;
     // An exec leaves one thread behind: the one that called it, with the others gone with the
     // address space they were in.
     proc.threads.forEach((t) => {
