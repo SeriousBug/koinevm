@@ -264,7 +264,25 @@ static void setup(void) {
     X(ins_h7, "ins v2.h[7], v1.h[1]", "mov v2.16b, v0.16b\n mov v2.h[7], v1.h[1]")            \
     X(ushr_d_then_ins, "ushr d #8 then ins",                                                     \
       "ushr d2, d0, #8\n mov v3.16b, v0.16b\n mov v3.b[14], v2.b[0]\n mov v2.16b, v3.16b")  \
-    X(dup_d0, "dup d2, v0.d[0]", "dup d2, v0.d[0]")
+    X(dup_d0, "dup d2, v0.d[0]", "dup d2, v0.d[0]")                                            \
+    /* The conversions between floating point and fixed point: two lanes of a register, and the */\
+    /* scalar form of one, which is the shape a runtime scales by a power of two with. */      \
+    X(ucvtf_2s_20, "ucvtf 2s #20", "ucvtf v2.2s, v0.2s, #20")                                 \
+    X(scvtf_2s_20, "scvtf 2s #20", "scvtf v2.2s, v0.2s, #20")                                 \
+    X(ucvtf_2s_32, "ucvtf 2s #32", "ucvtf v2.2s, v0.2s, #32")                                 \
+    X(scvtf_2s_1, "scvtf 2s #1", "scvtf v2.2s, v0.2s, #1")                                    \
+    X(ucvtf_2d_20, "ucvtf 2d #20", "ucvtf v2.2d, v0.2d, #20")                                 \
+    X(scvtf_2d_20, "scvtf 2d #20", "scvtf v2.2d, v0.2d, #20")                                 \
+    X(ucvtf_2d_64, "ucvtf 2d #64", "ucvtf v2.2d, v0.2d, #64")                                 \
+    X(fcvtzs_2d_20, "fcvtzs 2d #20", "fcvtzs v2.2d, v0.2d, #20")                              \
+    X(fcvtzu_2d_20, "fcvtzu 2d #20", "fcvtzu v2.2d, v0.2d, #20")                              \
+    X(fcvtzs_2s_7, "fcvtzs 2s #7", "fcvtzs v2.2s, v0.2s, #7")                                 \
+    X(fcvtzu_2s_20, "fcvtzu 2s #20", "fcvtzu v2.2s, v0.2s, #20")                              \
+    X(ucvtf_d_20, "ucvtf d #20", "ucvtf d2, d0, #20")                                        \
+    X(scvtf_d_20, "scvtf d #20", "scvtf d2, d0, #20")                                         \
+    X(ucvtf_s_20, "ucvtf s #20", "ucvtf s2, s0, #20")                                         \
+    X(fcvtzs_d_20, "fcvtzs d #20", "fcvtzs d2, d0, #20")                                      \
+    X(fcvtzu_d_20, "fcvtzu d #20", "fcvtzu d2, d0, #20")
 
 #define U_CASES(X)                                                                              \
     /* three-same integer */                                                                    \

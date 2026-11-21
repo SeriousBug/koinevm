@@ -166,6 +166,9 @@ pub enum Insn {
     FpToGprFixed { sf: bool, unsigned: bool, size: u32, fbits: u32, rn: u32, rd: u32 },
     /// `scvtf`/`ucvtf` with a fraction-bit count, the other direction of the same conversion.
     FpFromIntFixed { sf: bool, unsigned: bool, size: u32, fbits: u32, rn: u32, rd: u32 },
+    /// The same pair of conversions between the vector file and itself: two lanes of a register, or
+    /// one in the scalar `d` form. `size` is 0 for single and 1 for double precision.
+    VecFixed { to_float: bool, unsigned: bool, size: u32, lanes: u32, fbits: u32, rn: u32, rd: u32 },
     /// Scalar FP arithmetic on one register: `fmov`, `fabs`, `fneg`, `fsqrt`, `fcvt`, ...
     FpOneSource { size: u32, opcode: u32, rn: u32, rd: u32 },
     /// Scalar FP arithmetic on two registers: `fadd`, `fdiv`, `fmax`, ...
@@ -894,6 +897,29 @@ fn decode_simd_dp(w: u32) -> Insn {
     let bit10 = (w >> 10) & 1;
     let bit21 = (w >> 21) & 1;
 
+    // The conversions between floating point and fixed point share the shifts' bits 28:24 and are
+    // told apart by bits 15:10: 111001 is the pair that converts to a float and 111111 the pair that
+    // truncates to an integer, and no shift has either. Bits 21:16 are 64 minus the count and bits
+    // 23:22 the width, as in the scalar forms of the same four instructions.
+    if (w >> 24) & 0x1f == 0b01111 {
+        let fixed = (w >> 10) & 0x3f;
+        let fbits = 64 - ((w >> 16) & 0x3f);
+        // A single-precision conversion counts at most 32 fraction bits, which is what tells it
+        // apart from a shift that happens to have the same opcode bits: the undef forms are the
+        // ones this would otherwise claim.
+        if (fixed == 0b111001 || fixed == 0b111111) && (size == 1 || fbits <= 32) {
+            return Insn::VecFixed {
+                to_float: fixed == 0b111001,
+                unsigned: u,
+                size,
+                lanes: 2,
+                fbits,
+                rn,
+                rd,
+            };
+        }
+    }
+
     // `movi`/`mvni` and the shift-by-immediate group share bits 28:24, told apart by whether an
     // element width is present.
     // Bits 28:24 are 01111 for both groups, and bit 10 is what separates them: a shift by
@@ -1031,6 +1057,26 @@ fn crypto(w: u32) -> Option<Insn> {
 }
 
 fn decode_scalar_fp(w: u32) -> Insn {
+    // The conversions between floating point and fixed point of the vector file's low lane, which
+    // share the scalar shifts' bits 31:24 and are told apart by the same pair of opcodes the vector
+    // forms use: 111001 to a float, 111111 to an integer.
+    if (w >> 24) & 0x1f == 0b11111 && (w >> 30) & 1 == 1 && w >> 31 == 0 {
+        let fixed = (w >> 10) & 0x3f;
+        let size = (w >> 22) & 3;
+        let fbits = 64 - ((w >> 16) & 0x3f);
+        if (fixed == 0b111001 || fixed == 0b111111) && size <= 1 && (size == 1 || fbits <= 32) {
+            return Insn::VecFixed {
+                to_float: fixed == 0b111001,
+                unsigned: (w >> 29) & 1 == 1,
+                size,
+                lanes: 1,
+                fbits,
+                rn: (w >> 5) & 31,
+                rd: w & 31,
+            };
+        }
+    }
+
     // The scalar shift by immediate, which shares the vector shifts' encoding with bit 28 set. The
     // opcode is bits 15:10 and the count is seven bits at 22:16, counted from twice the lane width
     // for a right shift and from the width itself for a left one. `sha512` writes a length into a

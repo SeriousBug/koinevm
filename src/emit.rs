@@ -7642,6 +7642,59 @@ impl<'a> RegionEmitter<'a> {
                 self.fp_from_int(sf, !unsigned, double, fbits);
                 self.fp_put(rd, double);
             }
+            Insn::VecFixed { to_float, unsigned, size, lanes, fbits, rn, rd } => {
+                let double = size == 1;
+                if size > 1 || fbits == 0 || fbits > if double { 64 } else { 32 } {
+                    return self.refuse(format!("fixed-point conversion at 0x{addr:x}"));
+                }
+                // Scaling by a power of two is exact, so the one rounding is the conversion's: to a
+                // float it is the integer's own rounding, which `fp_from_int` does in the mode FPCR
+                // holds, and to an integer it is the truncation a saturating conversion does.
+                let scale: u64 = if double {
+                    ((1023 + fbits) as u64) << 52
+                } else {
+                    (((127 + fbits) as u32) << 23) as u64
+                };
+                let trunc = if double {
+                    if unsigned {
+                        sat::I64_TRUNC_SAT_F64_U
+                    } else {
+                        sat::I64_TRUNC_SAT_F64_S
+                    }
+                } else if unsigned {
+                    sat::I32_TRUNC_SAT_F32_U
+                } else {
+                    sat::I32_TRUNC_SAT_F32_S
+                };
+                self.fp_base();
+                for lane in 0..lanes {
+                    self.getv(rn);
+                    if to_float {
+                        self.f.simd_lane(
+                            if double { simd::I64X2_EXTRACT_LANE } else { simd::I32X4_EXTRACT_LANE },
+                            lane as u8,
+                        );
+                        self.fp_from_int(double, !unsigned, double, fbits);
+                        self.f.simd_lane(
+                            if double { simd::F64X2_REPLACE_LANE } else { simd::F32X4_REPLACE_LANE },
+                            lane as u8,
+                        );
+                    } else {
+                        self.f.simd_lane(
+                            if double { simd::F64X2_EXTRACT_LANE } else { simd::F32X4_EXTRACT_LANE },
+                            lane as u8,
+                        );
+                        self.fp_const(scale, double);
+                        self.f.op(if double { F64_MUL } else { F32_MUL });
+                        self.f.sat(trunc);
+                        self.f.simd_lane(
+                            if double { simd::I64X2_REPLACE_LANE } else { simd::I32X4_REPLACE_LANE },
+                            lane as u8,
+                        );
+                    }
+                }
+                self.setv(rd);
+            }
             Insn::FpToInt { double, unsigned, rmode, rn, rd } => {
                 // The scalar becomes an integer in the same register, saturating at the ends of the
                 // range for a value out of it, which is what the instruction does with those and
