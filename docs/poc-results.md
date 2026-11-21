@@ -285,6 +285,10 @@ Two things follow.
   result that lands in the denormal range can be a step out. One known inexactness: wasm has no
   fused multiply-add, so `fmadd` and its siblings round twice and can differ from the instruction in
   the last bit.
+- **Node runs, and what it runs.** A REPL, timers, promises, `fs`, `zlib`, `crypto` (including the
+  SHA-3 digest the Keccak instructions now translate), TLS through `fetch` against the host's
+  network, an HTTP server and a client on top of it, `worker_threads` with message passing,
+  `child_process`, `WebAssembly` of its own, and V8 tiering a JavaScript function up to Turbofan.
 - **Instruction coverage of a big library.** The parts of libc that nothing reaches (a page of
   `strlen` variants, the MTE paths in `malloc`) report `undecoded instruction`, and the words are SVE
   and MTE: the loader does not pick them because `ID_AA64PFR0` and `ID_AA64ISAR0` are a baseline
