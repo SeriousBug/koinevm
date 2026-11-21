@@ -801,6 +801,7 @@ export class Session {
     if (request.flags & CLONE_PARENT_SETTID && request.ptid) proc.kernel.put32(request.ptid, tid);
     if (request.flags & CLONE_CHILD_SETTID && request.ctid) proc.kernel.put32(request.ctid, tid);
     if (process.env.ARMJIT_TRACE_PROCESSES) {
+      const view = new DataView(proc.memory.buffer);
       const at = (a) => (a ? view.getUint32(a, true) : "none");
       console.error(
         `clone: ${proc.pid} thread ${tid} on stack 0x${request.stack.toString(16)} flags=0x${request.flags.toString(16)}` +
@@ -1289,6 +1290,7 @@ export class Session {
     parent.usage.childSys += child.usage.sys + child.usage.childSys;
     child.reaped = true;
     if (process.env.ARMJIT_TRACE_PROCESSES) {
+      const view = new DataView(parent.memory.buffer);
       console.error(
         `reap: ${child.pid} code ${child.code}, status word at 0x${request.wstatus.toString(16)}` +
           ` = ${request.wstatus ? view.getInt32(request.wstatus, true) : "none"}`,
