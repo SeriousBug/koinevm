@@ -31,6 +31,9 @@ pub fn sleb(out: &mut Vec<u8>, mut v: i64) {
     }
 }
 
+/// The spec's opcode table, whole: a name to look up should not depend on which instructions the
+/// translator happens to emit today.
+#[allow(dead_code)]
 pub mod op {
     pub const UNREACHABLE: u8 = 0x00;
     pub const BLOCK: u8 = 0x02;
@@ -211,7 +214,9 @@ pub mod sat {
     pub const I64_TRUNC_SAT_F64_U: u32 = 0x07;
 }
 
-/// WebAssembly SIMD opcodes (`0xfd` prefix), as numbered by the SIMD proposal's binary format.
+/// WebAssembly SIMD opcodes (`0xfd` prefix), as numbered by the SIMD proposal's binary format,
+/// whole, for the same reason as `op`.
+#[allow(dead_code)]
 pub mod simd {
     pub const V128_LOAD: u32 = 0x00;
     pub const V128_LOAD8X8_S: u32 = 0x01;
@@ -500,15 +505,6 @@ impl Func {
         self.body.push(0x40);
         self
     }
-    pub fn if_(&mut self) -> &mut Self {
-        self.body.push(op::IF);
-        self.body.push(0x40);
-        self
-    }
-    pub fn else_(&mut self) -> &mut Self {
-        self.body.push(op::ELSE);
-        self
-    }
     pub fn end(&mut self) -> &mut Self {
         self.body.push(op::END);
         self
@@ -563,9 +559,6 @@ impl Func {
         self.simd(op);
         self.memarg(memory, align_log2, offset);
         self
-    }
-    pub fn simd_mem_lane(&mut self, op: u32, align_log2: u32, offset: u64, lane: u8) -> &mut Self {
-        self.simd_mem_lane_at(0, op, align_log2, offset, lane)
     }
     pub fn simd_mem_lane_at(
         &mut self,

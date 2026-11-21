@@ -96,9 +96,6 @@ pub const DCZID_EL0_VALUE: u64 = 0x10;
 pub const MIDR_EL1_VALUE: u64 = 0x410f_d034;
 pub const ID_AA64PFR0_VALUE: u64 = 0x0000_0000_00ff_0011;
 pub const ID_AA64ISAR0_VALUE: u64 = 0;
-/// End of the control block. Everything below IMAGE_BASE is engine memory the guest never sees.
-pub const ENGINE_HI: u64 = 0x1000;
-
 // Address space plan. The guest's whole map is the linear memory, so the layout is fixed and the
 // same for every process: control block, soft page table, dispatch table, images, heap, stack.
 //
@@ -109,7 +106,6 @@ pub const ENGINE_HI: u64 = 0x1000;
 //   ...         heap grows up from the end of the images, mmap areas grow down from the stack
 //   mem_size - stack reserve - 4 KiB   stack, growing down
 /// One PTE byte per 4 KiB page.
-pub const PTE_BASE: u64 = ENGINE_HI;
 pub const PTE_PAGES: u64 = 1 << 20;
 /// Halfway up the address space, in the gap between the loader and the arena `mmap` fills: the
 /// table is twice the size of the largest image, and where the images go is the toolchain's to
@@ -150,10 +146,9 @@ pub mod pte {
     /// The page holds at least one translated block, so `mprotect` or a write has something to drop.
     pub const TRANSLATED: u8 = 8;
     pub const READABLE: u8 = 16;
-    /// What a load, a store and an instruction fetch each need a page to allow.
+    /// What a load and a store each need a page to allow.
     pub const LOAD: u8 = MAPPED | READABLE;
     pub const STORE: u8 = MAPPED | WRITABLE;
-    pub const FETCH: u8 = MAPPED | EXECUTABLE;
 }
 
 /// What a trap was about. A fault is the guest's own doing and names the address it touched, which
@@ -169,8 +164,6 @@ pub mod trap {
     pub const READ: i32 = 4;
     /// A store to a page that is not mapped, or not writable.
     pub const WRITE: i32 = 5;
-    /// Execution of a page that is not mapped, or not executable.
-    pub const EXEC: i32 = 6;
 }
 
 /// Four 4 GiB memories. A program that reserves a region of its own needs one of them for its own
@@ -441,7 +434,7 @@ fn page_table(images: &[&Elf], stack_floor: u64, stack_top: u64, chunks: u32) ->
     for image in images {
         for s in &image.segments {
             let mut bits = pte::LOAD;
-            if s.flags & crate::elf::PF_W != 0 {
+            if s.flags & PF_W != 0 {
                 bits |= pte::WRITABLE;
             }
             if s.flags & crate::elf::PF_X != 0 {
@@ -944,11 +937,10 @@ fn prelude(m: &mut Module, cfg: &Config, plan: &Plan, import_helpers: bool) -> P
     }
     let umulh_id = emit_umulh(m, ty_ii_i64);
     let smulh_id = emit_smulh(m, ty_ii_i64, umulh_id);
-    let (mut into_scratch, mut out_of_scratch) = (0u32, 0u32);
     if plan.chunks > 1 && !import_helpers {
         let ty_copy = m.ty(vec![I64, I32], vec![]);
-        into_scratch = emit_straddle(m, ty_copy, true, plan.chunks);
-        out_of_scratch = emit_straddle(m, ty_copy, false, plan.chunks);
+        let into_scratch = emit_straddle(m, ty_copy, true, plan.chunks);
+        let out_of_scratch = emit_straddle(m, ty_copy, false, plan.chunks);
         for acc in ACCESS_SHAPES {
             let shape = acc.shape();
             let ty = if shape.store {
@@ -1079,10 +1071,8 @@ pub fn translate(
     // mask, so the region bodies are emitted with a placeholder.
     let layout = Layout {
         table_mask: 0,
-        stack_floor,
         bounds_check: cfg.bounds_check,
         trace: cfg.trace,
-        trace_loops: cfg.trace_loops,
         allow_undefined: cfg.allow_undefined,
         mem_size,
         chunks: plan.chunks,
@@ -1180,10 +1170,8 @@ pub fn translate(
 struct Layout {
     /// Slot count minus one for the open-addressed dispatch table: `slot = (pc >> 2) & table_mask`.
     table_mask: u32,
-    stack_floor: u64,
     bounds_check: bool,
     trace: bool,
-    trace_loops: bool,
     allow_undefined: bool,
     mem_size: u64,
     /// How many 4 GiB memories the guest's address space is carved into: one means every access is
@@ -2447,7 +2435,7 @@ fn region_body(
             unsupported.extend(first);
             Ok(body)
         }
-        Err(e) if !layout.allow_undefined => {
+        Err(_) if !layout.allow_undefined => {
             let lenient = Layout { allow_undefined: true, ..*layout };
             let mut second = Vec::new();
             match RegionEmitter::new(region, &lenient, ids, &mut second).emit() {
@@ -4168,31 +4156,6 @@ impl<'a> RegionEmitter<'a> {
             self.f.op(I32_EQZ);
         }
         self.f.op(I32_AND);
-    }
-
-    /// The NaN a binary operation hands back when it has one: the first signalling operand, made
-    /// quiet, else the first quiet one. Both widths, so both tests, and the order matters.
-    fn fp_process_nans(&mut self, rn: u32, rm: u32, double: bool) {
-        let scalar = if double { F64 } else { F32 };
-        self.fp_is_snan(rn, double);
-        self.f.op(IF);
-        self.f.body.push(scalar);
-        self.fp_quiet(rn, double);
-        self.f.op(ELSE);
-        self.fp_is_snan(rm, double);
-        self.f.op(IF);
-        self.f.body.push(scalar);
-        self.fp_quiet(rm, double);
-        self.f.op(ELSE);
-        self.fp_is_nan(rn, double);
-        self.f.op(IF);
-        self.f.body.push(scalar);
-        self.fp_get(rn, double);
-        self.f.op(ELSE);
-        self.fp_get(rm, double);
-        self.f.end();
-        self.f.end();
-        self.f.end();
     }
 
     /// `fmax`/`fmin` and their number forms. A signalling NaN wins over everything, quieted; a
@@ -6328,11 +6291,7 @@ impl<'a> RegionEmitter<'a> {
                         // fmla and fmls multiply into the destination rather than into a product of
                         // its own, so the rounding of the sum is the one place they differ from a
                         // separate multiply and add.
-                        let (mul, add) = if size & 1 == 1 {
-                            (simd::F64X2_MUL, simd::F64X2_ADD)
-                        } else {
-                            (simd::F32X4_MUL, simd::F32X4_ADD)
-                        };
+                        let add = if size & 1 == 1 { simd::F64X2_ADD } else { simd::F32X4_ADD };
                         let op = if size & 2 != 0 {
                             if size & 1 == 1 { simd::F64X2_SUB } else { simd::F32X4_SUB }
                         } else {
@@ -6932,7 +6891,7 @@ impl<'a> RegionEmitter<'a> {
                 let shr = if u { simd::I64X2_SHR_U } else { simd::I64X2_SHR_S };
                 // The shifted source, rounded first when the form asks for it: the bias is half a
                 // unit in the last place of the result.
-                let mut shift_in = |this: &mut Self, round: bool| {
+                let shift_in = |this: &mut Self, round: bool| {
                     this.getv(rn);
                     if round {
                         this.f.v128c(round_mask(64, 1u64 << (right - 1)));
@@ -7744,22 +7703,6 @@ impl<'a> RegionEmitter<'a> {
                 self.fp_const(bits, double);
                 self.fp_put(rd, double);
             }
-            Insn::MrsTpidr { rd } => {
-                if rd != 31 {
-                    self.f.i32c(SHADOW_TP as i32);
-                    self.f.mem(I64_LOAD, 3, 0);
-                    self.f.ls(rd);
-                }
-            }
-            Insn::MsrTpidr { rn } => {
-                self.f.i32c(SHADOW_TP as i32);
-                if rn == 31 {
-                    self.f.i64c(0);
-                } else {
-                    self.f.lg(rn);
-                }
-                self.f.mem(I64_STORE, 3, 0);
-            }
             Insn::B { .. }
             | Insn::Bl { .. }
             | Insn::BCond { .. }
@@ -7870,10 +7813,8 @@ pub fn translate_page(
     let Prelude { ids, ty_region } = prelude(&mut m, cfg, &plan, true);
     let layout = Layout {
         table_mask: 0,
-        stack_floor: plan.stack_floor,
         bounds_check: cfg.bounds_check,
         trace: cfg.trace,
-        trace_loops: cfg.trace_loops,
         allow_undefined: cfg.allow_undefined,
         mem_size: plan.mem_size,
         chunks: plan.chunks,

@@ -6,7 +6,6 @@ pub const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 pub const EM_AARCH64: u16 = 183;
 pub const PF_X: u32 = 1;
 pub const PF_W: u32 = 2;
-pub const PF_R: u32 = 4;
 pub const SHF_EXECINSTR: u64 = 0x4;
 
 #[derive(Debug, Clone)]
@@ -26,9 +25,7 @@ impl Segment {
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
-    pub name: String,
     pub value: u64,
-    pub size: u64,
     pub is_func: bool,
     pub shndx: u16,
 }
@@ -163,24 +160,16 @@ impl Elf {
                     }
                 }
                 if sh_type == 2 {
-                    symtab = Some((u64at(&image, o + 24)?, u64at(&image, o + 32)?, u32at(&image, o + 40)?));
+                    symtab = Some((u64at(&image, o + 24)?, u64at(&image, o + 32)?));
                 }
             }
-            if let Some((off, size, link)) = symtab {
-                let stro = shoff as usize + link as usize * shentsize;
-                let str_off = u64at(&image, stro + 24)? as usize;
-                let str_size = u64at(&image, stro + 32)? as usize;
-                let strtab = image.get(str_off..str_off + str_size).unwrap_or(&[]);
+            if let Some((off, size)) = symtab {
                 let mut o = off as usize;
                 while o + 24 <= off as usize + size as usize {
-                    let name_off = u32at(&image, o)? as usize;
                     let info = image[o + 4];
                     let shndx = u16at(&image, o + 6)?;
                     let value = u64at(&image, o + 8)?;
-                    let size = u64at(&image, o + 16)?;
-                    let end = strtab.iter().skip(name_off).position(|&c| c == 0).map(|p| p + name_off).unwrap_or(strtab.len());
-                    let name = String::from_utf8_lossy(strtab.get(name_off..end).unwrap_or(&[])).into_owned();
-                    symbols.push(Symbol { name, value, size, is_func: info & 0xf == 2 && shndx != 0, shndx });
+                    symbols.push(Symbol { value, is_func: info & 0xf == 2 && shndx != 0, shndx });
                     o += 24;
                 }
             }
@@ -267,18 +256,6 @@ impl Elf {
         None
     }
 
-    pub fn code_range(&self) -> Option<(u64, u64)> {
-        let mut lo = u64::MAX;
-        let mut hi = 0;
-        for s in &self.segments {
-            if s.flags & PF_X != 0 {
-                lo = lo.min(s.vaddr);
-                hi = hi.max(s.end());
-            }
-        }
-        if lo == u64::MAX { None } else { Some((lo, hi)) }
-    }
-
     /// Where this image's instructions are, section by section. Falls back to the executable
     /// segments when there is no section table, which is the best an image without one allows.
     pub fn instruction_ranges(&self) -> Vec<(u64, u64)> {
@@ -296,9 +273,5 @@ impl Elf {
 
     pub fn image_end(&self) -> u64 {
         self.segments.iter().map(|s| s.end()).max().unwrap_or(0)
-    }
-
-    pub fn data_limit(&self) -> u64 {
-        self.segments.iter().filter(|s| s.flags & PF_W != 0).map(|s| s.end()).max().unwrap_or(self.image_end())
     }
 }

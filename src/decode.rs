@@ -222,8 +222,6 @@ pub enum Insn {
     Blr { rn: u32 },
     Ret { rn: u32 },
     Svc,
-    MrsTpidr { rd: u32 },
-    MsrTpidr { rn: u32 },
     Hint,
     /// The crypto extensions: `sha1`/`sha256`/`aes` and friends. Nothing here advertises them, so
     /// the guest never reaches one, but a translator that calls them a floating point operation
@@ -700,7 +698,6 @@ fn decode_simd_loadstore(w: u32) -> Insn {
     let q = (w >> 30) & 1 != 0;
     let rn = (w >> 5) & 31;
     let rt = w & 31;
-    let rm = (w >> 16) & 31;
 
     if (w >> 27) & 7 == 0b101 {
         // Pair: `opc 101 V 01 L imm7 Rt2 Rn Rt`, with bits 24:23 picking the addressing form.
@@ -1109,7 +1106,6 @@ fn decode_scalar_fp(w: u32) -> Insn {
     let rd = w & 31;
     let rm = (w >> 16) & 31;
     let rmode = (w >> 19) & 3;
-    let opcode = (w >> 12) & 0x3f;
 
     // Between FP and the general registers. Bit 21 is set, bits 15:10 are zero, and bits 20:16 name
     // the operation: 6 and 24..31 take their result from an FP register, 7 and 2..3 from a general
